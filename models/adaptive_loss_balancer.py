@@ -103,13 +103,13 @@ class AdaptiveLossBalancer(nn.Module):
             if self.modality_names else None
         )
         
-        # Track training dynamics
-        self.register_buffer('step_count', torch.tensor(0))
-        self.register_buffer('epoch_count', torch.tensor(0))
+        # Track training dynamics (buffers will be moved to device with .to(device))
+        self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('epoch_count', torch.tensor(0, dtype=torch.long))
         
         # Track initial loss values for normalization
-        self.register_buffer('initial_losses', torch.zeros(len(task_names)))
-        self.register_buffer('initial_losses_set', torch.tensor(False))
+        self.register_buffer('initial_losses', torch.zeros(len(task_names), dtype=torch.float32))
+        self.register_buffer('initial_losses_set', torch.tensor(False, dtype=torch.bool))
         
         # Track loss history for adaptive adjustment
         self.loss_history = {name: [] for name in task_names}
@@ -308,12 +308,15 @@ class AdaptiveLossBalancer(nn.Module):
                 # Increase weight if task is training slower
                 weight_update = -self.learning_rate * (rel_grad - target_rel)
                 
+                # Clip weight update to prevent explosion
+                weight_update = torch.clamp(weight_update, -1.0, 1.0)
+                
                 # Update in log space for stability
                 self.log_weights[name].data += weight_update
                 
-                # Clamp to reasonable range
-                max_log_weight = torch.log(torch.tensor(self.max_weight))
-                min_log_weight = torch.log(torch.tensor(self.min_weight))
+                # Clamp to reasonable range to prevent NaN from exp()
+                max_log_weight = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
+                min_log_weight = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
                 self.log_weights[name].data.clamp_(min_log_weight, max_log_weight)
         
         # Log current weights
@@ -325,7 +328,7 @@ class AdaptiveLossBalancer(nn.Module):
     
     def set_epoch(self, epoch: int):
         """Set current epoch for warmup tracking."""
-        self.epoch_count = torch.tensor(epoch)
+        self.epoch_count = torch.tensor(epoch, dtype=torch.long, device=self.epoch_count.device)
     
     def get_weights(self) -> Dict[str, float]:
         """Get current weights as dictionary."""

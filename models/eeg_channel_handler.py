@@ -73,20 +73,23 @@ class ChannelActivityMonitor:
         self.activity_threshold = activity_threshold
         self.update_frequency = update_frequency
         
-        # Initialize metric buffers
-        self.snr_buffer = torch.zeros(num_channels)
-        self.variance_buffer = torch.zeros(num_channels)
-        self.gradient_buffer = torch.zeros(num_channels)
-        self.activity_buffer = torch.zeros(num_channels)
-        self.error_buffer = torch.zeros(num_channels)
+        # Initialize metric buffers (will be moved to device on first update)
+        self.snr_buffer = torch.zeros(num_channels, dtype=torch.float32)
+        self.variance_buffer = torch.zeros(num_channels, dtype=torch.float32)
+        self.gradient_buffer = torch.zeros(num_channels, dtype=torch.float32)
+        self.activity_buffer = torch.zeros(num_channels, dtype=torch.float32)
+        self.error_buffer = torch.zeros(num_channels, dtype=torch.float32)
         
         # Track update count
         self.update_count = 0
         self.step_count = 0
         
         # Channel health status
-        self.channel_health = torch.ones(num_channels)  # 1.0 = healthy, 0.0 = dead
-        self.channel_importance = torch.ones(num_channels)  # Relative importance weights
+        self.channel_health = torch.ones(num_channels, dtype=torch.float32)  # 1.0 = healthy, 0.0 = dead
+        self.channel_importance = torch.ones(num_channels, dtype=torch.float32)  # Relative importance weights
+        
+        # Device tracking (will be set on first update)
+        self._device = None
     
     def update(
         self,
@@ -107,6 +110,17 @@ class ChannelActivityMonitor:
         if self.step_count % self.update_frequency != 0:
             return
         
+        # Move all buffers to signals device if needed
+        if self._device != signals.device:
+            self._device = signals.device
+            self.snr_buffer = self.snr_buffer.to(signals.device)
+            self.variance_buffer = self.variance_buffer.to(signals.device)
+            self.gradient_buffer = self.gradient_buffer.to(signals.device)
+            self.activity_buffer = self.activity_buffer.to(signals.device)
+            self.error_buffer = self.error_buffer.to(signals.device)
+            self.channel_health = self.channel_health.to(signals.device)
+            self.channel_importance = self.channel_importance.to(signals.device)
+        
         # Ensure 2D: [time, channels]
         if signals.dim() == 3:
             signals = signals.reshape(-1, signals.shape[-1])
@@ -122,27 +136,28 @@ class ChannelActivityMonitor:
         signal_power = signals_cpu.var(dim=0)
         noise_estimate = (signals_cpu[1:] - signals_cpu[:-1]).var(dim=0)  # High-freq noise
         snr = signal_power / (noise_estimate + 1e-10)
-        self.snr_buffer = 0.9 * self.snr_buffer + 0.1 * snr
+        # Move snr to device before updating buffer
+        self.snr_buffer = 0.9 * self.snr_buffer + 0.1 * snr.to(self._device)
         
         # 2. Compute temporal variance
         variance = signals_cpu.var(dim=0)
-        self.variance_buffer = 0.9 * self.variance_buffer + 0.1 * variance
+        self.variance_buffer = 0.9 * self.variance_buffer + 0.1 * variance.to(self._device)
         
         # 3. Compute gradient magnitude
         if gradients is not None:
             grad_mag = gradients.detach().cpu().abs().mean(dim=0)
-            self.gradient_buffer = 0.9 * self.gradient_buffer + 0.1 * grad_mag
+            self.gradient_buffer = 0.9 * self.gradient_buffer + 0.1 * grad_mag.to(self._device)
         
         # 4. Compute activity ratio (proportion of non-near-zero values)
         threshold = signals_cpu.abs().mean() * 0.01  # 1% of mean absolute value
         activity = (signals_cpu.abs() > threshold).float().mean(dim=0)
-        self.activity_buffer = 0.9 * self.activity_buffer + 0.1 * activity
+        self.activity_buffer = 0.9 * self.activity_buffer + 0.1 * activity.to(self._device)
         
         # 5. Compute reconstruction error
         if reconstructions is not None:
             recon_cpu = reconstructions.detach().cpu()
             error = (signals_cpu - recon_cpu).pow(2).mean(dim=0)
-            self.error_buffer = 0.9 * self.error_buffer + 0.1 * error
+            self.error_buffer = 0.9 * self.error_buffer + 0.1 * error.to(self._device)
         
         # Update health status
         self._update_channel_health()
@@ -338,8 +353,8 @@ class ChannelAttention(nn.Module):
         self.num_heads = num_heads
         self.use_temporal_context = use_temporal_context
         
-        # Channel embedding
-        self.channel_embed = nn.Parameter(torch.randn(num_channels, hidden_dim))
+        # Channel embedding (will be moved to device with module.to(device))
+        self.channel_embed = nn.Parameter(torch.randn(num_channels, hidden_dim, dtype=torch.float32))
         
         # Attention computation
         if use_temporal_context:

@@ -34,13 +34,14 @@ class PositionalEncoding(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         
         # Compute positional encodings
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        position = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
         
-        pe = torch.zeros(max_len, d_model)
+        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         
+        # Register as buffer (will be moved to device with module.to(device))
         self.register_buffer('pe', pe)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -455,8 +456,8 @@ class StratifiedWindowSampler:
                     importance = importance_weights[start:end].mean().item()
                     window_importance.append(importance)
                 
-                # Sample windows proportional to importance
-                window_importance = torch.tensor(window_importance)
+                # Sample windows proportional to importance (ensure same device as sequence)
+                window_importance = torch.tensor(window_importance, dtype=torch.float32, device=sequence.device)
                 probs = F.softmax(window_importance, dim=0)
                 start_indices = torch.multinomial(probs, self.num_windows, replacement=False).tolist()
         

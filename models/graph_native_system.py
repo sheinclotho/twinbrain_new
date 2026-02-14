@@ -462,7 +462,7 @@ class GraphNativeTrainer:
         return avg_loss
     
     def save_checkpoint(self, path: Path, epoch: int):
-        """Save training checkpoint."""
+        """Save training checkpoint with atomic write for safety."""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -473,8 +473,22 @@ class GraphNativeTrainer:
         if self.use_adaptive_loss:
             checkpoint['loss_balancer_state'] = self.loss_balancer.state_dict()
         
-        torch.save(checkpoint, path)
-        logger.info(f"Saved checkpoint to {path}")
+        # Atomic save: write to temp file then rename
+        temp_path = path.parent / f"{path.name}.tmp"
+        
+        try:
+            torch.save(checkpoint, temp_path)
+            # Atomic rename (on most filesystems)
+            temp_path.replace(path)
+            logger.info(f"Saved checkpoint to {path}")
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except:
+                    pass
+            raise RuntimeError(f"Checkpoint save failed: {e}")
     
     def load_checkpoint(self, path: Path):
         """Load training checkpoint."""
