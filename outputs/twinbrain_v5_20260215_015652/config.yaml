@@ -1,0 +1,72 @@
+data:
+  atlas:
+    file: atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz
+    label_file: atlases/schaefer200_mask_ready.json
+    name: schaefer200
+  max_subjects: null
+  modalities:
+  - eeg
+  - fmri
+  root_dir: F:/twinbrain_v3/test_file3
+  task: null
+device:
+  gpu_memory: 8GB
+  type: cuda
+  use_amp: true
+graph:
+  add_self_loops: true
+  connectivity_threshold: 0.3
+  cross_modal_distance_threshold: 30.0
+  k_nearest: 20
+  make_undirected: true
+model:
+  dropout: 0.1
+  hidden_channels: 128
+  num_decoder_layers: 3
+  num_encoder_layers: 4
+  prediction_steps: 10
+  type: v5_optimized
+  use_prediction: true
+output:
+  experiment_name: twinbrain_v5
+  log_level: INFO
+  output_dir: outputs\twinbrain_v5_20260215_015652
+  save_graphs: true
+  save_predictions: true
+training:
+  batch_size: 1
+  early_stopping_patience: 20
+  learning_rate: 0.0001
+  max_grad_norm: 1.0
+  num_epochs: 100
+  save_frequency: 10
+  use_adaptive_loss: true
+  use_eeg_enhancement: true
+  val_frequency: 5
+  weight_decay: 1.0e-05
+v5_optimization:
+  adaptive_loss:
+    alpha: 1.5
+    learning_rate: 0.025
+    modality_energy_ratios:
+      eeg: 0.02
+      fmri: 1.0
+    update_frequency: 10
+    warmup_epochs: 5
+  advanced_prediction:
+    num_scales: 3
+    num_windows: 3
+    sampling_strategy: uniform
+    use_hierarchical: true
+    use_transformer: true
+    use_uncertainty: true
+  eeg_enhancement:
+    activity_weight: 0.01
+    attention_hidden_dim: 64
+    diversity_weight: 0.01
+    dropout_rate: 0.1
+    enable_attention: true
+    enable_dropout: true
+    enable_monitoring: true
+    enable_regularization: true
+    entropy_weight: 0.01

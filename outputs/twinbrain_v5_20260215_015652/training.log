@@ -1,0 +1,36 @@
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - TwinBrain V5 - 图原生数字孪生脑训练系统
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - 配置文件: configs/default.yaml
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - 输出目录: outputs\twinbrain_v5_20260215_015652
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - 设备: cuda
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - 随机种子: 42
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - 步骤 1/4: 加载数据
+2026-02-15 01:56:52 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - 成功加载 1 个被试数据
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - 步骤 2/4: 构建图结构
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - 成功构建 1 个图
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - 步骤 3/4: 创建模型
+2026-02-15 01:57:47 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:48 - twinbrain_v5 - INFO - 模型参数量: 6,606,938
+2026-02-15 01:57:48 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:48 - twinbrain_v5 - INFO - 步骤 4/4: 训练模型
+2026-02-15 01:57:48 - twinbrain_v5 - INFO - ============================================================
+2026-02-15 01:57:48 - twinbrain_v5 - INFO - 训练集: 0 个样本
+2026-02-15 01:57:48 - twinbrain_v5 - INFO - 验证集: 1 个样本
+2026-02-15 01:57:49 - twinbrain_v5 - ERROR - ❌ 运行失败: float division by zero
+Traceback (most recent call last):
+  File "F:\twinbrain_v3\main.py", line 299, in main
+    train_model(model, graphs, config, logger)
+  File "F:\twinbrain_v3\main.py", line 194, in train_model
+    train_loss = trainer.train_epoch(train_graphs)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "F:\twinbrain_v3\models\graph_native_system.py", line 427, in train_epoch
+    avg_loss = total_loss / len(data_list)
+               ~~~~~~~~~~~^~~~~~~~~~~~~~~~
+ZeroDivisionError: float division by zero
