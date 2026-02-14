@@ -308,12 +308,15 @@ class AdaptiveLossBalancer(nn.Module):
                 # Increase weight if task is training slower
                 weight_update = -self.learning_rate * (rel_grad - target_rel)
                 
+                # Clip weight update to prevent explosion
+                weight_update = torch.clamp(weight_update, -1.0, 1.0)
+                
                 # Update in log space for stability
                 self.log_weights[name].data += weight_update
                 
-                # Clamp to reasonable range
-                max_log_weight = torch.log(torch.tensor(self.max_weight))
-                min_log_weight = torch.log(torch.tensor(self.min_weight))
+                # Clamp to reasonable range to prevent NaN from exp()
+                max_log_weight = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
+                min_log_weight = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
                 self.log_weights[name].data.clamp_(min_log_weight, max_log_weight)
         
         # Log current weights

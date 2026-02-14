@@ -18,6 +18,7 @@ from pathlib import Path
 import yaml
 import torch
 import numpy as np
+from torch_geometric.data import HeteroData
 
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -91,32 +92,89 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             # 这里简化处理，实际需要用atlas提取
             if fmri_data.ndim == 4:  # 4D fMRI
                 n_volumes = fmri_data.shape[-1]
+                if n_volumes < 10:
+                    logger.warning(f"fMRI has too few volumes: {n_volumes}, skipping")
+                    continue
                 # 简化: 使用平均
                 fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
+                # Z-normalize to prevent scale issues
+                fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
                 fmri_ts = fmri_ts.reshape(1, -1)  # [1, T]
+            elif fmri_data.ndim == 3:
+                # 3D case (already ROI timeseries)
+                n_volumes = fmri_data.shape[-1]
+                if n_volumes < 10:
+                    logger.warning(f"fMRI has too few volumes: {n_volumes}, skipping")
+                    continue
+                fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
+                fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
+                fmri_ts = fmri_ts.reshape(1, -1)
+            else:
+                logger.warning(f"Unsupported fMRI shape: {fmri_data.shape}, skipping")
+                continue
             
             fmri_graph = mapper.map_fmri_to_graph(
                 timeseries=fmri_ts,
                 connectivity_matrix=None,  # 自动计算
             )
-            graph_list.append(fmri_graph)
+            graph_list.append(('fmri', fmri_graph))
         
         # EEG图
         if 'eeg' in subject_data:
             eeg_data = subject_data['eeg']['data']  # [n_channels, n_times]
             eeg_ch_names = subject_data['eeg']['ch_names']
             
+            # Validate EEG data
+            if eeg_data.shape[0] < 8:
+                logger.warning(f"EEG has too few channels: {eeg_data.shape[0]}, skipping")
+                continue
+            if eeg_data.shape[1] < 100:
+                logger.warning(f"EEG has too few timepoints: {eeg_data.shape[1]}, skipping")
+                continue
+            if np.isnan(eeg_data).any() or np.isinf(eeg_data).any():
+                logger.warning("EEG contains NaN or Inf values, skipping")
+                continue
+            
             eeg_graph = mapper.map_eeg_to_graph(
                 timeseries=eeg_data,
                 channel_names=eeg_ch_names,
             )
-            graph_list.append(eeg_graph)
+            graph_list.append(('eeg', eeg_graph))
         
-        # 合并图
+        # 合并图 - FIX: Properly merge multi-modal graphs
         if len(graph_list) > 0:
-            # 简化处理: 只取第一个图
-            # 实际应该合并为异构图
-            graphs.append(graph_list[0])
+            if len(graph_list) == 1:
+                # Single modality: use as-is
+                graphs.append(graph_list[0][1])
+            else:
+                # Multi-modal: merge into heterograph
+                merged_graph = HeteroData()
+                for modality, graph in graph_list:
+                    # Copy node features and structure
+                    for key in graph.node_types:
+                        merged_graph[key].x = graph[key].x
+                        if hasattr(graph[key], 'num_nodes'):
+                            merged_graph[key].num_nodes = graph[key].num_nodes
+                        if hasattr(graph[key], 'pos'):
+                            merged_graph[key].pos = graph[key].pos
+                    
+                    # Copy edge structure
+                    for edge_type in graph.edge_types:
+                        merged_graph[edge_type].edge_index = graph[edge_type].edge_index
+                        if hasattr(graph[edge_type], 'edge_attr'):
+                            merged_graph[edge_type].edge_attr = graph[edge_type].edge_attr
+                
+                # Add cross-modal edges if we have both modalities
+                if 'fmri' in merged_graph.node_types and 'eeg' in merged_graph.node_types:
+                    # Create simple cross-modal connections (can be improved with atlas mapping)
+                    cross_edges = mapper.create_cross_modal_edges(merged_graph)
+                    if cross_edges is not None:
+                        merged_graph['fmri', 'projects_to', 'eeg'].edge_index = cross_edges
+                
+                graphs.append(merged_graph)
+    
+    if len(graphs) == 0:
+        raise ValueError("No valid graphs constructed. Check data quality and preprocessing.")
     
     logger.info(f"成功构建 {len(graphs)} 个图")
     
@@ -167,8 +225,13 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("步骤 4/4: 训练模型")
     logger.info("=" * 60)
     
-    # 划分训练/验证集
-    n_train = int(len(graphs) * 0.8)
+    # 划分训练/验证集 - FIX: Ensure at least 1 validation sample
+    if len(graphs) < 2:
+        raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个")
+    
+    # Use at least 10% or 1 sample for validation
+    min_val_samples = max(1, len(graphs) // 10)
+    n_train = max(1, len(graphs) - min_val_samples)
     train_graphs = graphs[:n_train]
     val_graphs = graphs[n_train:]
     
@@ -189,19 +252,41 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     # 训练循环
     best_val_loss = float('inf')
     patience_counter = 0
+    no_improvement_warning_shown = False
     
     for epoch in range(1, config['training']['num_epochs'] + 1):
         # 训练
         train_loss = trainer.train_epoch(train_graphs)
         
+        # Memory monitoring every 10 epochs
+        if epoch % 10 == 0 and torch.cuda.is_available():
+            allocated_gb = torch.cuda.memory_allocated() / 1e9
+            reserved_gb = torch.cuda.memory_reserved() / 1e9
+            logger.info(f"GPU Memory: allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
+        
+        # Check for NaN loss
+        if np.isnan(train_loss) or np.isinf(train_loss):
+            logger.error(f"Training loss is NaN/Inf at epoch {epoch}. Stopping training.")
+            raise ValueError("Training diverged: loss is NaN or Inf")
+        
         # 验证
         if epoch % config['training']['val_frequency'] == 0:
             val_loss = trainer.validate(val_graphs)
+            
+            # Check for NaN validation loss
+            if np.isnan(val_loss) or np.isinf(val_loss):
+                logger.error(f"Validation loss is NaN/Inf at epoch {epoch}. Stopping training.")
+                raise ValueError("Validation diverged: loss is NaN or Inf")
             
             logger.info(
                 f"Epoch {epoch}/{config['training']['num_epochs']}: "
                 f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
             )
+            
+            # Warn if no improvement after many epochs
+            if epoch >= 50 and best_val_loss == float('inf') and not no_improvement_warning_shown:
+                logger.warning("No improvement in validation loss after 50 epochs. Check data quality and hyperparameters.")
+                no_improvement_warning_shown = True
             
             # 保存最佳模型
             if val_loss < best_val_loss:
