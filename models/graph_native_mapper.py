@@ -394,23 +394,24 @@ class GraphNativeBrainMapper:
         
         return data
     
-    def create_cross_modal_edges(
+    def create_simple_cross_modal_edges(
         self,
         merged_data: HeteroData,
         connection_ratio: float = 0.1,
     ) -> Optional[torch.Tensor]:
         """
-        Create simple cross-modal edges for merged heterograph.
+        Create simple cross-modal edges for merged heterograph using random connections.
         
-        This is a simplified version that creates random connections
-        between modalities when no explicit mapping is available.
+        This is a simplified helper that creates random connections when no 
+        explicit mapping is available. For more sophisticated distance-based
+        connections, use add_cross_modal_edges() instead.
         
         Args:
             merged_data: HeteroData with 'eeg' and 'fmri' nodes
             connection_ratio: Fraction of possible edges to create
             
         Returns:
-            edge_index tensor [2, E] or None if modalities not present
+            edge_index tensor [2, E] with edges from EEG to fMRI, or None if modalities not present
         """
         if 'eeg' not in merged_data.node_types or 'fmri' not in merged_data.node_types:
             return None

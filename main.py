@@ -72,6 +72,23 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
     logger.info("步骤 2/4: 构建图结构")
     logger.info("=" * 60)
     
+    def process_fmri_timeseries(fmri_data, min_volumes=10):
+        """Helper to extract and normalize fMRI timeseries."""
+        if fmri_data.ndim == 4:  # 4D fMRI
+            n_volumes = fmri_data.shape[-1]
+        elif fmri_data.ndim == 3:  # 3D (already ROI timeseries)
+            n_volumes = fmri_data.shape[-1]
+        else:
+            return None, f"Unsupported fMRI shape: {fmri_data.shape}"
+        
+        if n_volumes < min_volumes:
+            return None, f"Too few volumes: {n_volumes} < {min_volumes}"
+        
+        # Average and normalize
+        fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
+        fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
+        return fmri_ts.reshape(1, -1), None
+    
     # 初始化图映射器
     mapper = GraphNativeBrainMapper(
         atlas_name=config['data']['atlas']['name'],
@@ -88,29 +105,10 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         # fMRI图
         if 'fmri' in subject_data:
             fmri_data = subject_data['fmri']['data']
-            # 提取ROI时序 (需要atlas)
-            # 这里简化处理，实际需要用atlas提取
-            if fmri_data.ndim == 4:  # 4D fMRI
-                n_volumes = fmri_data.shape[-1]
-                if n_volumes < 10:
-                    logger.warning(f"fMRI has too few volumes: {n_volumes}, skipping")
-                    continue
-                # 简化: 使用平均
-                fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
-                # Z-normalize to prevent scale issues
-                fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
-                fmri_ts = fmri_ts.reshape(1, -1)  # [1, T]
-            elif fmri_data.ndim == 3:
-                # 3D case (already ROI timeseries)
-                n_volumes = fmri_data.shape[-1]
-                if n_volumes < 10:
-                    logger.warning(f"fMRI has too few volumes: {n_volumes}, skipping")
-                    continue
-                fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
-                fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
-                fmri_ts = fmri_ts.reshape(1, -1)
-            else:
-                logger.warning(f"Unsupported fMRI shape: {fmri_data.shape}, skipping")
+            fmri_ts, error = process_fmri_timeseries(fmri_data)
+            
+            if error:
+                logger.warning(f"fMRI processing failed: {error}, skipping")
                 continue
             
             fmri_graph = mapper.map_fmri_to_graph(
@@ -167,9 +165,11 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 # Add cross-modal edges if we have both modalities
                 if 'fmri' in merged_graph.node_types and 'eeg' in merged_graph.node_types:
                     # Create simple cross-modal connections (can be improved with atlas mapping)
-                    cross_edges = mapper.create_cross_modal_edges(merged_graph)
+                    # Returns edges from EEG to fMRI [eeg_idx, fmri_idx]
+                    cross_edges = mapper.create_simple_cross_modal_edges(merged_graph)
                     if cross_edges is not None:
-                        merged_graph['fmri', 'projects_to', 'eeg'].edge_index = cross_edges
+                        # Edge direction: EEG -> fMRI
+                        merged_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
                 
                 graphs.append(merged_graph)
     
