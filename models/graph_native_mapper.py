@@ -43,6 +43,7 @@ class GraphNativeBrainMapper:
         preserve_temporal: bool = True,
         add_self_loops: bool = True,
         make_undirected: bool = True,
+        device: Optional[str] = None,
     ):
         """
         Initialize graph-native mapper.
@@ -52,11 +53,18 @@ class GraphNativeBrainMapper:
             preserve_temporal: Keep temporal dimension in node features
             add_self_loops: Add self-connections to graph
             make_undirected: Symmetrize edge connections
+            device: Device to create tensors on ('cpu', 'cuda', or None for auto-detect)
         """
         self.atlas_name = atlas_name
         self.preserve_temporal = preserve_temporal
         self.add_self_loops_flag = add_self_loops
         self.make_undirected_flag = make_undirected
+        
+        # Device management
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
         
         # Graph structure (built once, reused)
         self.base_graph_structure = None
@@ -102,18 +110,19 @@ class GraphNativeBrainMapper:
                         edge_index_list.append([i, j])
                         edge_attr_list.append(weights[j])
             
-            edge_index = torch.tensor(edge_index_list, dtype=torch.long).t()
-            edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32).unsqueeze(-1)
+            edge_index = torch.tensor(edge_index_list, dtype=torch.long, device=self.device).t()
+            edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32, device=self.device).unsqueeze(-1)
         
         else:
             # Threshold-based
             adj = connectivity_matrix > threshold
             np.fill_diagonal(adj, False)  # No self-loops initially
             
-            edge_index = torch.tensor(np.array(np.where(adj)), dtype=torch.long)
+            edge_index = torch.tensor(np.array(np.where(adj)), dtype=torch.long, device=self.device)
             edge_attr = torch.tensor(
                 connectivity_matrix[adj],
-                dtype=torch.float32
+                dtype=torch.float32,
+                device=self.device
             ).unsqueeze(-1)
         
         # Make undirected (brain connections are symmetric)
@@ -181,7 +190,7 @@ class GraphNativeBrainMapper:
         
         # Node features: KEEP temporal dimension
         # Shape: [N, T, 1] - one feature channel (fMRI signal)
-        x = torch.tensor(timeseries, dtype=torch.float32).unsqueeze(-1)  # [N, T, 1]
+        x = torch.tensor(timeseries, dtype=torch.float32, device=self.device).unsqueeze(-1)  # [N, T, 1]
         
         # Create HeteroData
         data = HeteroData()
@@ -196,7 +205,7 @@ class GraphNativeBrainMapper:
         
         # Metadata
         if node_positions is not None:
-            data['fmri'].pos = torch.tensor(node_positions, dtype=torch.float32)
+            data['fmri'].pos = torch.tensor(node_positions, dtype=torch.float32, device=self.device)
         
         if node_labels is not None:
             data['fmri'].labels = node_labels
@@ -259,7 +268,7 @@ class GraphNativeBrainMapper:
         
         # Node features: temporal EEG signals
         # Shape: [N, T, 1]
-        x = torch.tensor(timeseries, dtype=torch.float32).unsqueeze(-1)
+        x = torch.tensor(timeseries, dtype=torch.float32, device=self.device).unsqueeze(-1)
         
         # Create HeteroData
         data = HeteroData()
@@ -274,7 +283,7 @@ class GraphNativeBrainMapper:
         
         # Metadata
         if channel_positions is not None:
-            data['eeg'].pos = torch.tensor(channel_positions, dtype=torch.float32)
+            data['eeg'].pos = torch.tensor(channel_positions, dtype=torch.float32, device=self.device)
         
         data['eeg'].labels = channel_names
         data['eeg'].temporal_length = T_time
@@ -347,7 +356,7 @@ class GraphNativeBrainMapper:
                     edge_list.append([eeg_idx, fmri_idx])
             
             if edge_list:
-                edge_index = torch.tensor(edge_list, dtype=torch.long).t()
+                edge_index = torch.tensor(edge_list, dtype=torch.long, device=self.device).t()
                 
                 # Bidirectional connections
                 data['eeg', 'projects_to', 'fmri'].edge_index = edge_index

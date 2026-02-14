@@ -76,6 +76,7 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         atlas_name=config['data']['atlas']['name'],
         add_self_loops=config['graph']['add_self_loops'],
         make_undirected=config['graph']['make_undirected'],
+        device=config['device']['type'],
     )
     
     # 为每个被试构建图
