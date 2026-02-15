@@ -8,7 +8,7 @@
 import numpy as np
 import torch
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 import mne
 import nibabel as nib
@@ -57,7 +57,7 @@ class BrainDataLoader:
         self,
         subject_id: str,
         task: Optional[str] = None,
-    ) -> Dict[str, any]:
+    ) -> Dict[str, Any]:
         """
         加载单个被试数据
         
@@ -88,7 +88,7 @@ class BrainDataLoader:
         self,
         subject_id: str,
         task: Optional[str] = None,
-    ) -> Optional[Dict[str, any]]:
+    ) -> Optional[Dict[str, Any]]:
         """加载EEG数据"""
         try:
             # 查找EEG文件
@@ -129,7 +129,7 @@ class BrainDataLoader:
         self,
         subject_id: str,
         task: Optional[str] = None,
-    ) -> Optional[Dict[str, any]]:
+    ) -> Optional[Dict[str, Any]]:
         """加载fMRI数据"""
         try:
             # 查找fMRI文件
@@ -164,7 +164,7 @@ class BrainDataLoader:
         self,
         task: Optional[str] = None,
         max_subjects: Optional[int] = None,
-    ) -> List[Dict[str, any]]:
+    ) -> List[Dict[str, Any]]:
         """
         加载所有被试数据
         
