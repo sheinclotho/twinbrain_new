@@ -142,18 +142,28 @@ class GraphNativeBrainMapper:
             
             # Vectorized top-k: [N, N] -> [N, k_nearest]
             # torch.topk is O(N log k) per row, parallelized across all N rows
-            top_values, top_indices = torch.topk(conn_gpu, min(k_nearest, N), dim=1)
+            k_actual = min(k_nearest, N)
+            top_values, top_indices = torch.topk(conn_gpu, k_actual, dim=1)
             
             # Filter by threshold
             mask = top_values > threshold
             
             # Build edge lists efficiently
             # Create row indices for all entries
-            row_idx = torch.arange(N, device=self.device).unsqueeze(1).expand(-1, min(k_nearest, N))
+            row_idx = torch.arange(N, device=self.device).unsqueeze(1).expand(-1, k_actual)
             
             # Filter out self-loops and below-threshold edges
             self_loop_mask = row_idx != top_indices
             valid_mask = mask & self_loop_mask
+            
+            # Check for nodes with no edges (edge case warning)
+            edges_per_node = valid_mask.sum(dim=1)
+            if edges_per_node.min() == 0:
+                logger.warning(
+                    f"Some nodes have 0 edges after filtering "
+                    f"(k_nearest={k_nearest}, threshold={threshold}). "
+                    f"Consider lowering threshold or increasing k_nearest."
+                )
             
             edge_index = torch.stack([
                 row_idx[valid_mask],

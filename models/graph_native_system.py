@@ -359,6 +359,12 @@ class GraphNativeTrainer:
         self.device = device
         self.node_types = node_types
         
+        # Verify CUDA availability
+        if device.startswith('cuda') and not torch.cuda.is_available():
+            logger.warning(f"CUDA requested but not available. Falling back to CPU.")
+            self.device = 'cpu'
+            self.model = self.model.to('cpu')
+        
         # torch.compile() for PyTorch 2.0+ (20-40% speedup)
         if use_torch_compile and hasattr(torch, 'compile'):
             logger.info(f"Enabling torch.compile() with mode={compile_mode}")
@@ -449,14 +455,22 @@ class GraphNativeTrainer:
         # EEG enhancement
         self.use_eeg_enhancement = use_eeg_enhancement
         if use_eeg_enhancement and 'eeg' in node_types:
-            # Get EEG channel count from model
-            eeg_channels = model.encoder.input_proj['eeg'].in_features
-            self.eeg_handler = EnhancedEEGHandler(
-                num_channels=eeg_channels,
-                enable_monitoring=True,
-                enable_attention=True,
-                enable_regularization=True,
-            )
+            try:
+                # Get EEG channel count from model (with safety checks)
+                if hasattr(model.encoder, 'input_proj') and 'eeg' in model.encoder.input_proj:
+                    eeg_channels = model.encoder.input_proj['eeg'].in_features
+                    self.eeg_handler = EnhancedEEGHandler(
+                        num_channels=eeg_channels,
+                        enable_monitoring=True,
+                        enable_attention=True,
+                        enable_regularization=True,
+                    )
+                else:
+                    logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
+                    self.use_eeg_enhancement = False
+            except (AttributeError, KeyError) as e:
+                logger.warning(f"Failed to initialize EEG handler: {e}. Disabling EEG enhancement.")
+                self.use_eeg_enhancement = False
         
         # Training history
         self.history = {

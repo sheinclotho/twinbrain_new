@@ -225,8 +225,8 @@ class TemporalAttention(nn.Module):
         """
         Apply temporal attention with Flash Attention optimization.
         
-        Uses PyTorch's scaled_dot_product_attention for 2-4x speedup
-        and 50% memory reduction compared to standard attention.
+        Uses PyTorch's scaled_dot_product_attention (2.0+) for 2-4x speedup
+        and 50% memory reduction. Falls back to standard attention for older versions.
         
         Args:
             x: Node features [N, T, H]
@@ -247,14 +247,23 @@ class TemporalAttention(nn.Module):
         K = K.view(N, T, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(N, T, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Use Flash Attention (PyTorch 2.0+ scaled_dot_product_attention)
-        # Automatically uses optimal kernel based on hardware (Flash Attention on A100/H100)
-        attended = F.scaled_dot_product_attention(
-            Q, K, V,
-            attn_mask=mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=False,  # Not causal masking for temporal attention
-        )
+        # Try Flash Attention (PyTorch 2.0+), fallback to standard attention
+        if hasattr(F, 'scaled_dot_product_attention'):
+            # Use Flash Attention - automatically uses optimal kernel based on hardware
+            attended = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False,
+            )
+        else:
+            # Standard attention fallback for PyTorch < 2.0
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+            if mask is not None:
+                scores = scores.masked_fill(mask == 0, float('-inf'))
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attended = torch.matmul(attn_weights, V)
         
         # Reshape back: [N, num_heads, T, head_dim] -> [N, T, H]
         attended = attended.transpose(1, 2).contiguous().view(N, T, H)
