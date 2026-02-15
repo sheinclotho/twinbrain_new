@@ -58,16 +58,16 @@ training:
   # 权重衰减
   weight_decay: 0.00001
   
-  # 是否使用自适应损失平衡
+  # Use adaptive loss balancing
   use_adaptive_loss: true
   
-  # 是否使用EEG增强
+  # Use EEG enhancement
   use_eeg_enhancement: true
   
-  # 是否使用梯度检查点（节省内存）
+  # Use gradient checkpointing (saves memory)
   use_gradient_checkpointing: false
   
-  # 梯度裁剪
+  # Gradient clipping
   max_grad_norm: 1.0
   
   # 验证频率 (每N个epoch)

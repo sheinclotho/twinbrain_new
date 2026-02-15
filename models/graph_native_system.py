@@ -19,6 +19,15 @@ from typing import Dict, List, Optional, Tuple
 import logging
 from pathlib import Path
 
+# Import AMP components if available (for mixed precision training)
+try:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_AVAILABLE = True
+except ImportError:
+    AMP_AVAILABLE = False
+    autocast = None
+    GradScaler = None
+
 from .graph_native_mapper import GraphNativeBrainMapper, TemporalGraphFeatureExtractor
 from .graph_native_encoder import GraphNativeEncoder, SpatialTemporalGraphConv
 from .adaptive_loss_balancer import AdaptiveLossBalancer
@@ -208,13 +217,16 @@ class GraphNativeBrainModel(nn.Module):
             reconstructed: Reconstructed signals per modality
             predictions: Future predictions (if return_prediction=True)
         """
-        # Input validation
+        # Input validation (use explicit checks, not assertions)
         for node_type in self.node_types:
             if node_type in data.node_types and hasattr(data[node_type], 'x'):
                 x = data[node_type].x
-                assert x.ndim == 3, f"Expected [N, T, C] for {node_type}, got {x.shape}"
-                assert not torch.isnan(x).any(), f"NaN detected in {node_type} input"
-                assert not torch.isinf(x).any(), f"Inf detected in {node_type} input"
+                if x.ndim != 3:
+                    raise ValueError(f"Expected [N, T, C] for {node_type}, got {x.shape}")
+                if torch.isnan(x).any():
+                    raise ValueError(f"NaN detected in {node_type} input")
+                if torch.isinf(x).any():
+                    raise ValueError(f"Inf detected in {node_type} input")
         
         # 1. Encode: Graph-native spatial-temporal encoding
         encoded_data = self.encoder(data)
@@ -328,11 +340,12 @@ class GraphNativeTrainer:
         self.node_types = node_types
         
         # Mixed precision training
-        self.use_amp = use_amp and device != 'cpu'
+        self.use_amp = use_amp and device != 'cpu' and AMP_AVAILABLE
         if self.use_amp:
-            from torch.cuda.amp import autocast, GradScaler
             self.scaler = GradScaler()
             logger.info("Mixed precision training (AMP) enabled")
+        elif use_amp and not AMP_AVAILABLE:
+            logger.warning("AMP requested but not available. Training without mixed precision.")
         
         # Gradient checkpointing
         if use_gradient_checkpointing:
@@ -408,8 +421,6 @@ class GraphNativeTrainer:
         
         # Forward and backward pass with optional mixed precision
         if self.use_amp:
-            from torch.cuda.amp import autocast
-            
             with autocast():
                 # Forward pass
                 reconstructed, predictions = self.model(
