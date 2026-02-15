@@ -401,7 +401,7 @@ class GraphNativeTrainer:
                 else:
                     # torch.device object has .type attribute
                     device_type = self.device.type
-                self.scaler = GradScaler(device_type)
+                self.scaler = GradScaler(device=device_type)
             else:
                 # Old API doesn't take device parameter
                 self.scaler = GradScaler()
