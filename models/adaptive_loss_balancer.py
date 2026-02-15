@@ -143,7 +143,7 @@ class AdaptiveLossBalancer(nn.Module):
                 losses.get(name, torch.tensor(0.0)).detach().item()
                 for name in self.task_names
             ], device=self.initial_losses.device)
-            self.initial_losses_set = torch.tensor(True)
+            self.initial_losses_set = torch.tensor(True, device=self.initial_losses_set.device)
         
         # Compute weighted losses
         weighted_losses = {}

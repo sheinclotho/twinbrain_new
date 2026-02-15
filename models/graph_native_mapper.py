@@ -356,7 +356,9 @@ class GraphNativeBrainMapper:
                     edge_list.append([eeg_idx, fmri_idx])
             
             if edge_list:
-                edge_index = torch.tensor(edge_list, dtype=torch.long, device=self.device).t()
+                # Use device from existing graph data
+                target_device = data['eeg'].x.device if hasattr(data['eeg'], 'x') else self.device
+                edge_index = torch.tensor(edge_list, dtype=torch.long, device=target_device).t()
                 
                 # Bidirectional connections
                 data['eeg', 'projects_to', 'fmri'].edge_index = edge_index
@@ -419,12 +421,16 @@ class GraphNativeBrainMapper:
         N_eeg = merged_data['eeg'].num_nodes
         N_fmri = merged_data['fmri'].num_nodes
         
+        # Determine device from existing graph data
+        # Use device from EEG node features if available
+        target_device = merged_data['eeg'].x.device if hasattr(merged_data['eeg'], 'x') else self.device
+        
         # Create random connections (can be improved with anatomical mapping)
         num_edges = max(1, int(N_eeg * N_fmri * connection_ratio))
         
-        # Random pairs
-        eeg_indices = torch.randint(0, N_eeg, (num_edges,), device=self.device)
-        fmri_indices = torch.randint(0, N_fmri, (num_edges,), device=self.device)
+        # Random pairs - use target device to match existing graph
+        eeg_indices = torch.randint(0, N_eeg, (num_edges,), device=target_device)
+        fmri_indices = torch.randint(0, N_fmri, (num_edges,), device=target_device)
         
         edge_index = torch.stack([eeg_indices, fmri_indices], dim=0)
         
