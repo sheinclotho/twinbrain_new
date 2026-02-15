@@ -114,11 +114,17 @@ v5_optimization:
 
 # 图配置
 graph:
-  # 连接性阈值
-  connectivity_threshold: 0.3
+  # fMRI连接性阈值
+  threshold_fmri: 0.3
   
-  # K近邻 (小世界网络)
-  k_nearest: 20
+  # EEG连接性阈值
+  threshold_eeg: 0.2
+  
+  # fMRI K近邻 (小世界网络)
+  k_nearest_fmri: 20
+  
+  # EEG K近邻 (更局部的连接)
+  k_nearest_eeg: 10
   
   # 是否添加自环
   add_self_loops: true

@@ -43,6 +43,10 @@ class GraphNativeBrainMapper:
         preserve_temporal: bool = True,
         add_self_loops: bool = True,
         make_undirected: bool = True,
+        k_nearest_fmri: int = 20,
+        k_nearest_eeg: int = 10,
+        threshold_fmri: float = 0.3,
+        threshold_eeg: float = 0.2,
         device: Optional[str] = None,
     ):
         """
@@ -53,12 +57,20 @@ class GraphNativeBrainMapper:
             preserve_temporal: Keep temporal dimension in node features
             add_self_loops: Add self-connections to graph
             make_undirected: Symmetrize edge connections
+            k_nearest_fmri: Number of nearest neighbors for fMRI graph (default: 20)
+            k_nearest_eeg: Number of nearest neighbors for EEG graph (default: 10)
+            threshold_fmri: Connectivity threshold for fMRI (default: 0.3)
+            threshold_eeg: Connectivity threshold for EEG (default: 0.2)
             device: Device to create tensors on ('cpu', 'cuda', or None for auto-detect)
         """
         self.atlas_name = atlas_name
         self.preserve_temporal = preserve_temporal
         self.add_self_loops_flag = add_self_loops
         self.make_undirected_flag = make_undirected
+        self.k_nearest_fmri = k_nearest_fmri
+        self.k_nearest_eeg = k_nearest_eeg
+        self.threshold_fmri = threshold_fmri
+        self.threshold_eeg = threshold_eeg
         
         # Device management
         if device is None:
@@ -184,8 +196,8 @@ class GraphNativeBrainMapper:
         
         edge_index, edge_attr = self.build_graph_structure(
             connectivity_matrix,
-            threshold=0.3,  # Keep strong connections
-            k_nearest=20,  # Small-world: ~20 neighbors per node
+            threshold=self.threshold_fmri,
+            k_nearest=self.k_nearest_fmri,
         )
         
         # Node features: KEEP temporal dimension
@@ -262,8 +274,8 @@ class GraphNativeBrainMapper:
         # Build graph structure
         edge_index, edge_attr = self.build_graph_structure(
             connectivity_matrix,
-            threshold=0.2,
-            k_nearest=10,  # EEG: fewer neighbors (more local)
+            threshold=self.threshold_eeg,
+            k_nearest=self.k_nearest_eeg,
         )
         
         # Node features: temporal EEG signals

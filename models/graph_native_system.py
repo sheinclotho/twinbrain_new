@@ -198,7 +198,7 @@ class GraphNativeBrainModel(nn.Module):
         return_prediction: bool = False,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
         """
-        Forward pass.
+        Forward pass with input validation.
         
         Args:
             data: Input HeteroData with temporal features
@@ -208,6 +208,14 @@ class GraphNativeBrainModel(nn.Module):
             reconstructed: Reconstructed signals per modality
             predictions: Future predictions (if return_prediction=True)
         """
+        # Input validation
+        for node_type in self.node_types:
+            if node_type in data.node_types and hasattr(data[node_type], 'x'):
+                x = data[node_type].x
+                assert x.ndim == 3, f"Expected [N, T, C] for {node_type}, got {x.shape}"
+                assert not torch.isnan(x).any(), f"NaN detected in {node_type} input"
+                assert not torch.isinf(x).any(), f"Inf detected in {node_type} input"
+        
         # 1. Encode: Graph-native spatial-temporal encoding
         encoded_data = self.encoder(data)
         

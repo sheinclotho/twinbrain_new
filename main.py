@@ -94,6 +94,10 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         atlas_name=config['data']['atlas']['name'],
         add_self_loops=config['graph']['add_self_loops'],
         make_undirected=config['graph']['make_undirected'],
+        k_nearest_fmri=config['graph'].get('k_nearest_fmri', 20),
+        k_nearest_eeg=config['graph'].get('k_nearest_eeg', 10),
+        threshold_fmri=config['graph'].get('threshold_fmri', 0.3),
+        threshold_eeg=config['graph'].get('threshold_eeg', 0.2),
         device=config['device']['type'],
     )
     
