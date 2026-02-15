@@ -527,41 +527,29 @@ class GraphNativeTrainer:
         
         # Forward and backward pass with optional mixed precision
         if self.use_amp:
-            # Use appropriate autocast API based on what's available
+            # Use appropriate autocast context manager based on API version
             if USE_NEW_AMP_API:
                 # New API: torch.amp.autocast() requires device_type
-                with autocast(device_type=self.device_type):
-                    # Forward pass
-                    reconstructed, predictions = self.model(
-                        data,
-                        return_prediction=self.model.use_prediction,
-                    )
-                    
-                    # Compute losses
-                    losses = self.model.compute_loss(data, reconstructed, predictions)
-                    
-                    # Adaptive loss balancing
-                    if self.use_adaptive_loss:
-                        total_loss, weights = self.loss_balancer(losses)
-                    else:
-                        total_loss = sum(losses.values())
+                amp_context = autocast(device_type=self.device_type)
             else:
                 # Old API: torch.cuda.amp.autocast() doesn't require device_type
-                with autocast():
-                    # Forward pass
-                    reconstructed, predictions = self.model(
-                        data,
-                        return_prediction=self.model.use_prediction,
-                    )
-                    
-                    # Compute losses
-                    losses = self.model.compute_loss(data, reconstructed, predictions)
-                    
-                    # Adaptive loss balancing
-                    if self.use_adaptive_loss:
-                        total_loss, weights = self.loss_balancer(losses)
-                    else:
-                        total_loss = sum(losses.values())
+                amp_context = autocast()
+            
+            with amp_context:
+                # Forward pass
+                reconstructed, predictions = self.model(
+                    data,
+                    return_prediction=self.model.use_prediction,
+                )
+                
+                # Compute losses
+                losses = self.model.compute_loss(data, reconstructed, predictions)
+                
+                # Adaptive loss balancing
+                if self.use_adaptive_loss:
+                    total_loss, weights = self.loss_balancer(losses)
+                else:
+                    total_loss = sum(losses.values())
             
             # Backward pass with gradient scaling
             self.scaler.scale(total_loss).backward()
