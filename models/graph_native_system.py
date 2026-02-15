@@ -682,8 +682,8 @@ class GraphNativeTrainer:
             if temp_path.exists():
                 try:
                     temp_path.unlink()
-                except:
-                    pass
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean up temp file: {cleanup_error}")
             raise RuntimeError(f"Checkpoint save failed: {e}")
     
     def load_checkpoint(self, path: Path):
