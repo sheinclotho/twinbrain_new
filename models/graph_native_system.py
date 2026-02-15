@@ -397,9 +397,11 @@ class GraphNativeTrainer:
                 # New API expects device type as string (e.g., 'cuda', not 'cuda:0')
                 # Extract device type: handle both string and torch.device inputs
                 device_type = getattr(self.device, 'type', str(self.device).split(':')[0])
+                self.device_type = device_type  # Store for use with autocast()
                 self.scaler = GradScaler(device=device_type)
             else:
                 # Old API doesn't take device parameter
+                self.device_type = 'cuda'  # Old API only supports CUDA
                 self.scaler = GradScaler()
             logger.info("Mixed precision training (AMP) enabled")
         elif use_amp and not AMP_AVAILABLE:
@@ -519,21 +521,41 @@ class GraphNativeTrainer:
         
         # Forward and backward pass with optional mixed precision
         if self.use_amp:
-            with autocast():
-                # Forward pass
-                reconstructed, predictions = self.model(
-                    data,
-                    return_prediction=self.model.use_prediction,
-                )
-                
-                # Compute losses
-                losses = self.model.compute_loss(data, reconstructed, predictions)
-                
-                # Adaptive loss balancing
-                if self.use_adaptive_loss:
-                    total_loss, weights = self.loss_balancer(losses)
-                else:
-                    total_loss = sum(losses.values())
+            # Use appropriate autocast API based on what's available
+            if USE_NEW_AMP_API:
+                # New API: torch.amp.autocast() requires device_type
+                with autocast(device_type=self.device_type):
+                    # Forward pass
+                    reconstructed, predictions = self.model(
+                        data,
+                        return_prediction=self.model.use_prediction,
+                    )
+                    
+                    # Compute losses
+                    losses = self.model.compute_loss(data, reconstructed, predictions)
+                    
+                    # Adaptive loss balancing
+                    if self.use_adaptive_loss:
+                        total_loss, weights = self.loss_balancer(losses)
+                    else:
+                        total_loss = sum(losses.values())
+            else:
+                # Old API: torch.cuda.amp.autocast() doesn't require device_type
+                with autocast():
+                    # Forward pass
+                    reconstructed, predictions = self.model(
+                        data,
+                        return_prediction=self.model.use_prediction,
+                    )
+                    
+                    # Compute losses
+                    losses = self.model.compute_loss(data, reconstructed, predictions)
+                    
+                    # Adaptive loss balancing
+                    if self.use_adaptive_loss:
+                        total_loss, weights = self.loss_balancer(losses)
+                    else:
+                        total_loss = sum(losses.values())
             
             # Backward pass with gradient scaling
             self.scaler.scale(total_loss).backward()
