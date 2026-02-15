@@ -230,20 +230,35 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("步骤 4/4: 训练模型")
     logger.info("=" * 60)
     
-    # 划分训练/验证集 - FIX: Ensure at least 1 validation sample
+    # 划分训练/验证集 - Ensure both train and validation have samples
     if len(graphs) < 2:
-        raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个")
+        logger.error(f"❌ 数据不足: 需要至少2个样本进行训练，但只有 {len(graphs)} 个样本")
+        logger.error("提示: 请增加数据量或调整 max_subjects 配置")
+        raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个。请检查数据配置。")
     
-    # Use at least 10% or 1 sample for validation
+    # Use at least 10% or 1 sample for validation, ensure both train and val have at least 1
     min_val_samples = max(1, len(graphs) // 10)
-    n_train = max(1, len(graphs) - min_val_samples)
+    n_train = len(graphs) - min_val_samples
+    
+    # Safety check: ensure both sets have at least 1 sample
+    if n_train < 1:
+        n_train = 1
+        min_val_samples = len(graphs) - 1
+    
     train_graphs = graphs[:n_train]
     val_graphs = graphs[n_train:]
     
     logger.info(f"训练集: {len(train_graphs)} 个样本")
     logger.info(f"验证集: {len(val_graphs)} 个样本")
     
+    if len(train_graphs) < 5:
+        logger.warning("⚠️ 训练样本较少，模型可能过拟合。建议使用更多数据。")
+    
     # 创建训练器
+    logger.info("正在初始化训练器...")
+    if config['device'].get('use_torch_compile', True):
+        logger.info("⚙️ torch.compile() 已启用，首次训练可能需要额外时间进行模型编译...")
+    
     trainer = GraphNativeTrainer(
         model=model,
         node_types=config['data']['modalities'],
@@ -259,25 +274,49 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         compile_mode=config['device'].get('compile_mode', 'reduce-overhead'),
         device=config['device']['type'],
     )
+    logger.info("✅ 训练器初始化完成")
+    logger.info("=" * 60)
+    logger.info("开始训练循环")
+    logger.info("=" * 60)
     
     # 训练循环
+    import time
     best_val_loss = float('inf')
     patience_counter = 0
     no_improvement_warning_shown = False
+    epoch_times = []
     
     for epoch in range(1, config['training']['num_epochs'] + 1):
+        epoch_start_time = time.time()
+        
         # 训练
-        train_loss = trainer.train_epoch(train_graphs)
+        train_loss = trainer.train_epoch(train_graphs, epoch=epoch, total_epochs=config['training']['num_epochs'])
+        
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
+        
+        # Estimate remaining time (after first few epochs)
+        if len(epoch_times) >= 3:
+            avg_epoch_time = sum(epoch_times[-5:]) / len(epoch_times[-5:])  # Use last 5 epochs
+            remaining_epochs = config['training']['num_epochs'] - epoch
+            eta_seconds = avg_epoch_time * remaining_epochs
+            eta_minutes = eta_seconds / 60
+            if eta_minutes < 60:
+                eta_str = f"{eta_minutes:.1f} 分钟"
+            else:
+                eta_str = f"{eta_minutes/60:.1f} 小时"
+        else:
+            eta_str = "计算中..."
         
         # Memory monitoring every 10 epochs
         if epoch % 10 == 0 and torch.cuda.is_available():
             allocated_gb = torch.cuda.memory_allocated() / 1e9
             reserved_gb = torch.cuda.memory_reserved() / 1e9
-            logger.info(f"GPU Memory: allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
+            logger.info(f"  💾 GPU Memory: allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
         
         # Check for NaN loss
         if np.isnan(train_loss) or np.isinf(train_loss):
-            logger.error(f"Training loss is NaN/Inf at epoch {epoch}. Stopping training.")
+            logger.error(f"❌ Training loss is NaN/Inf at epoch {epoch}. Stopping training.")
             raise ValueError("Training diverged: loss is NaN or Inf")
         
         # 验证
@@ -289,21 +328,23 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
             
             # Check for NaN validation loss
             if np.isnan(val_loss) or np.isinf(val_loss):
-                logger.error(f"Validation loss is NaN/Inf at epoch {epoch}. Stopping training.")
+                logger.error(f"❌ Validation loss is NaN/Inf at epoch {epoch}. Stopping training.")
                 raise ValueError("Validation diverged: loss is NaN or Inf")
             
             logger.info(
-                f"Epoch {epoch}/{config['training']['num_epochs']}: "
-                f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}"
+                f"✓ Epoch {epoch}/{config['training']['num_epochs']}: "
+                f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
+                f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
             
             # Warn if no improvement after many epochs
             if epoch >= 50 and best_val_loss == float('inf') and not no_improvement_warning_shown:
-                logger.warning("No improvement in validation loss after 50 epochs. Check data quality and hyperparameters.")
+                logger.warning("⚠️ No improvement in validation loss after 50 epochs. Check data quality and hyperparameters.")
                 no_improvement_warning_shown = True
             
             # 保存最佳模型
             if val_loss < best_val_loss:
+                improvement = (best_val_loss - val_loss) / best_val_loss * 100 if best_val_loss != float('inf') else 100
                 best_val_loss = val_loss
                 patience_counter = 0
                 
@@ -311,18 +352,21 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
                 output_dir = Path(config['output']['output_dir'])
                 checkpoint_path = output_dir / "best_model.pt"
                 trainer.save_checkpoint(checkpoint_path, epoch)
-                logger.info(f"保存最佳模型: val_loss={val_loss:.4f}")
+                if improvement != 100:
+                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f} (提升 {improvement:.1f}%)")
+                else:
+                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f}")
             else:
                 patience_counter += 1
             
             # 早停
             if patience_counter >= config['training']['early_stopping_patience']:
-                logger.info(f"早停触发: {patience_counter} 个epoch无改进")
+                logger.info(f"⏹️ 早停触发: {patience_counter} 个epoch无改进")
                 break
         else:
             logger.info(
-                f"Epoch {epoch}/{config['training']['num_epochs']}: "
-                f"train_loss={train_loss:.4f}"
+                f"✓ Epoch {epoch}/{config['training']['num_epochs']}: "
+                f"train_loss={train_loss:.4f}, time={epoch_time:.1f}s, ETA={eta_str}"
             )
         
         # 定期保存检查点
