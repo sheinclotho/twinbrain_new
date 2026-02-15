@@ -394,8 +394,11 @@ class GraphNativeTrainer:
         if self.use_amp:
             # Use new API if available (torch.amp.GradScaler), otherwise old API (torch.cuda.amp.GradScaler)
             if USE_NEW_AMP_API:
-                self.scaler = GradScaler(self.device)
+                # New API expects device type as string (e.g., 'cuda')
+                device_str = self.device if isinstance(self.device, str) else str(self.device)
+                self.scaler = GradScaler(device_str)
             else:
+                # Old API doesn't take device parameter
                 self.scaler = GradScaler()
             logger.info("Mixed precision training (AMP) enabled")
         elif use_amp and not AMP_AVAILABLE:
