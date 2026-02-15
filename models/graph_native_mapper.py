@@ -356,8 +356,17 @@ class GraphNativeBrainMapper:
                     edge_list.append([eeg_idx, fmri_idx])
             
             if edge_list:
-                # Use device from existing graph data
-                target_device = data['eeg'].x.device if hasattr(data['eeg'], 'x') else self.device
+                # Determine device from existing graph data
+                target_device = self.device  # fallback
+                if hasattr(data['eeg'], 'x') and data['eeg'].x is not None:
+                    target_device = data['eeg'].x.device
+                elif hasattr(data['fmri'], 'x') and data['fmri'].x is not None:
+                    target_device = data['fmri'].x.device
+                elif ('eeg', 'connects', 'eeg') in data.edge_types:
+                    target_device = data['eeg', 'connects', 'eeg'].edge_index.device
+                elif ('fmri', 'connects', 'fmri') in data.edge_types:
+                    target_device = data['fmri', 'connects', 'fmri'].edge_index.device
+                
                 edge_index = torch.tensor(edge_list, dtype=torch.long, device=target_device).t()
                 
                 # Bidirectional connections
@@ -422,8 +431,16 @@ class GraphNativeBrainMapper:
         N_fmri = merged_data['fmri'].num_nodes
         
         # Determine device from existing graph data
-        # Use device from EEG node features if available
-        target_device = merged_data['eeg'].x.device if hasattr(merged_data['eeg'], 'x') else self.device
+        # Try multiple sources to find the correct device
+        target_device = self.device  # fallback
+        if hasattr(merged_data['eeg'], 'x') and merged_data['eeg'].x is not None:
+            target_device = merged_data['eeg'].x.device
+        elif hasattr(merged_data['fmri'], 'x') and merged_data['fmri'].x is not None:
+            target_device = merged_data['fmri'].x.device
+        elif ('eeg', 'connects', 'eeg') in merged_data.edge_types:
+            target_device = merged_data['eeg', 'connects', 'eeg'].edge_index.device
+        elif ('fmri', 'connects', 'fmri') in merged_data.edge_types:
+            target_device = merged_data['fmri', 'connects', 'fmri'].edge_index.device
         
         # Create random connections (can be improved with anatomical mapping)
         num_edges = max(1, int(N_eeg * N_fmri * connection_ratio))
