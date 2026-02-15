@@ -395,15 +395,8 @@ class GraphNativeTrainer:
             # Use new API if available (torch.amp.GradScaler), otherwise old API (torch.cuda.amp.GradScaler)
             if USE_NEW_AMP_API:
                 # New API expects device type as string (e.g., 'cuda', not 'cuda:0')
-                if isinstance(self.device, str):
-                    # Extract device type from 'cuda:0' -> 'cuda'
-                    device_type = self.device.split(':')[0]
-                elif hasattr(self.device, 'type'):
-                    # torch.device object has .type attribute
-                    device_type = self.device.type
-                else:
-                    # Fallback to string conversion
-                    device_type = str(self.device).split(':')[0]
+                # Extract device type: handle both string and torch.device inputs
+                device_type = getattr(self.device, 'type', str(self.device).split(':')[0])
                 self.scaler = GradScaler(device=device_type)
             else:
                 # Old API doesn't take device parameter
