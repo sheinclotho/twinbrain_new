@@ -23,7 +23,13 @@ from pathlib import Path
 AMP_AVAILABLE = False
 USE_NEW_AMP_API = False
 try:
-    from torch.amp import autocast, GradScaler
+    # Try new API: autocast from torch.amp (requires device_type parameter)
+    from torch.amp import autocast
+    # GradScaler might still be in torch.cuda.amp in some PyTorch versions
+    try:
+        from torch.amp import GradScaler
+    except ImportError:
+        from torch.cuda.amp import GradScaler
     AMP_AVAILABLE = True
     USE_NEW_AMP_API = True
 except ImportError:
