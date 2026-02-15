@@ -464,7 +464,7 @@ class GraphNativeTrainer:
                         enable_monitoring=True,
                         enable_attention=True,
                         enable_regularization=True,
-                    )
+                    ).to(self.device)
                 else:
                     logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
                     self.use_eeg_enhancement = False
