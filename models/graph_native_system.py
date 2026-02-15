@@ -20,13 +20,22 @@ import logging
 from pathlib import Path
 
 # Import AMP components if available (for mixed precision training)
+AMP_AVAILABLE = False
+USE_NEW_AMP_API = False
 try:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import autocast, GradScaler
     AMP_AVAILABLE = True
+    USE_NEW_AMP_API = True
 except ImportError:
-    AMP_AVAILABLE = False
-    autocast = None
-    GradScaler = None
+    try:
+        # Fallback to old API if new one not available
+        from torch.cuda.amp import autocast, GradScaler
+        AMP_AVAILABLE = True
+        USE_NEW_AMP_API = False
+    except ImportError:
+        AMP_AVAILABLE = False
+        autocast = None
+        GradScaler = None
 
 from .graph_native_mapper import GraphNativeBrainMapper, TemporalGraphFeatureExtractor
 from .graph_native_encoder import GraphNativeEncoder, SpatialTemporalGraphConv
@@ -383,7 +392,15 @@ class GraphNativeTrainer:
         # Mixed precision training
         self.use_amp = use_amp and device != 'cpu' and AMP_AVAILABLE
         if self.use_amp:
-            self.scaler = GradScaler()
+            # Use new API if available (torch.amp.GradScaler), otherwise old API (torch.cuda.amp.GradScaler)
+            if USE_NEW_AMP_API:
+                # New API expects device type as string (e.g., 'cuda', not 'cuda:0')
+                # Extract device type: handle both string and torch.device inputs
+                device_type = getattr(self.device, 'type', str(self.device).split(':')[0])
+                self.scaler = GradScaler(device=device_type)
+            else:
+                # Old API doesn't take device parameter
+                self.scaler = GradScaler()
             logger.info("Mixed precision training (AMP) enabled")
         elif use_amp and not AMP_AVAILABLE:
             logger.warning("AMP requested but not available. Training without mixed precision.")
@@ -464,7 +481,7 @@ class GraphNativeTrainer:
                         enable_monitoring=True,
                         enable_attention=True,
                         enable_regularization=True,
-                    )
+                    ).to(self.device)  # Move to device to prevent device mismatch errors
                 else:
                     logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
                     self.use_eeg_enhancement = False
