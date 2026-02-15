@@ -383,7 +383,7 @@ class GraphNativeTrainer:
         # Mixed precision training
         self.use_amp = use_amp and device != 'cpu' and AMP_AVAILABLE
         if self.use_amp:
-            self.scaler = GradScaler('cuda')
+            self.scaler = GradScaler(self.device)
             logger.info("Mixed precision training (AMP) enabled")
         elif use_amp and not AMP_AVAILABLE:
             logger.warning("AMP requested but not available. Training without mixed precision.")
