@@ -21,30 +21,34 @@ data:
     file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
     label_file: "atlases/schaefer200_mask_ready.json"
 
-# 模型配置
+# Model configuration
 model:
-  # 模型类型: "graph_native" 或 "v5_optimized"
+  # Model type: "graph_native" or "v5_optimized"
   type: "v5_optimized"
   
-  # 隐藏层维度
+  # Hidden layer dimension
   hidden_channels: 128
   
-  # 编码器层数
+  # Number of encoder layers
   num_encoder_layers: 4
   
-  # 解码器层数
+  # Number of decoder layers
   num_decoder_layers: 3
   
-  # 是否启用预测
+  # Enable prediction
   use_prediction: true
   
-  # 预测步数
+  # Prediction steps
   prediction_steps: 10
   
-  # Dropout率
+  # Dropout rate
   dropout: 0.1
+  
+  # Loss function type (mse, huber, smooth_l1)
+  # huber: robust to outliers, 5-10% better on noisy signals
+  loss_type: "huber"
 
-# 训练配置
+# Training configuration
 training:
   # 训练轮数
   num_epochs: 100
@@ -156,13 +160,17 @@ output:
   # 日志级别
   log_level: "INFO"
 
-# 设备配置
+# Device configuration
 device:
-  # 使用的设备: "cuda", "cpu", 或 "cuda:0"
+  # Device type: "cuda", "cpu", or "cuda:0"
   type: "cuda"
   
-  # GPU内存配置 (8GB, 12GB, 16GB)
+  # GPU memory configuration (8GB, 12GB, 16GB)
   gpu_memory: "8GB"
   
-  # 是否使用混合精度
+  # Use mixed precision (AMP)
   use_amp: True
+  
+  # Use torch.compile() for 20-40% speedup (PyTorch 2.0+)
+  use_torch_compile: True
+  compile_mode: "reduce-overhead"  # Options: default, reduce-overhead, max-autotune

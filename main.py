@@ -216,6 +216,7 @@ def create_model(config: dict, logger: logging.Logger):
         use_prediction=config['model']['use_prediction'],
         prediction_steps=config['model']['prediction_steps'],
         dropout=config['model']['dropout'],
+        loss_type=config['model'].get('loss_type', 'mse'),
     )
     
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
@@ -254,6 +255,8 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
         use_scheduler=config['training'].get('use_scheduler', True),
         scheduler_type=config['training'].get('scheduler_type', 'cosine'),
+        use_torch_compile=config['device'].get('use_torch_compile', True),
+        compile_mode=config['device'].get('compile_mode', 'reduce-overhead'),
         device=config['device']['type'],
     )
     
