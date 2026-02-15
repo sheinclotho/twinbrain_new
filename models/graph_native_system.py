@@ -297,6 +297,8 @@ class GraphNativeTrainer:
         weight_decay: float = 1e-5,
         use_adaptive_loss: bool = True,
         use_eeg_enhancement: bool = True,
+        use_amp: bool = True,
+        use_gradient_checkpointing: bool = False,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
     ):
         """
@@ -309,11 +311,29 @@ class GraphNativeTrainer:
             weight_decay: Weight decay
             use_adaptive_loss: Use adaptive loss balancing
             use_eeg_enhancement: Use EEG channel enhancement
+            use_amp: Use automatic mixed precision (AMP) for 2-3x speedup
+            use_gradient_checkpointing: Use gradient checkpointing to save memory
             device: Device to train on
         """
         self.model = model.to(device)
         self.device = device
         self.node_types = node_types
+        
+        # Mixed precision training
+        self.use_amp = use_amp and device != 'cpu'
+        if self.use_amp:
+            from torch.cuda.amp import autocast, GradScaler
+            self.scaler = GradScaler()
+            logger.info("Mixed precision training (AMP) enabled")
+        
+        # Gradient checkpointing
+        if use_gradient_checkpointing:
+            # Enable checkpointing for encoder layers
+            if hasattr(model.encoder, 'stgcn_layers'):
+                for layer in model.encoder.stgcn_layers:
+                    if hasattr(layer, 'gradient_checkpointing_enable'):
+                        layer.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled")
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -358,7 +378,7 @@ class GraphNativeTrainer:
     
     def train_step(self, data: HeteroData) -> Dict[str, float]:
         """
-        Single training step.
+        Single training step with optional mixed precision.
         
         Args:
             data: Input HeteroData
@@ -378,25 +398,53 @@ class GraphNativeTrainer:
             eeg_x_enhanced, eeg_info = self.eeg_handler(eeg_x, training=True)
             data['eeg'].x = eeg_x_enhanced
         
-        # Forward pass
-        reconstructed, predictions = self.model(
-            data,
-            return_prediction=self.model.use_prediction,
-        )
-        
-        # Compute losses
-        losses = self.model.compute_loss(data, reconstructed, predictions)
-        
-        # Adaptive loss balancing
-        if self.use_adaptive_loss:
-            total_loss, weights = self.loss_balancer(losses)
+        # Forward and backward pass with optional mixed precision
+        if self.use_amp:
+            from torch.cuda.amp import autocast
+            
+            with autocast():
+                # Forward pass
+                reconstructed, predictions = self.model(
+                    data,
+                    return_prediction=self.model.use_prediction,
+                )
+                
+                # Compute losses
+                losses = self.model.compute_loss(data, reconstructed, predictions)
+                
+                # Adaptive loss balancing
+                if self.use_adaptive_loss:
+                    total_loss, weights = self.loss_balancer(losses)
+                else:
+                    total_loss = sum(losses.values())
+            
+            # Backward pass with gradient scaling
+            self.scaler.scale(total_loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
         else:
-            total_loss = sum(losses.values())
-        
-        # Backward pass
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-        self.optimizer.step()
+            # Standard training without AMP
+            # Forward pass
+            reconstructed, predictions = self.model(
+                data,
+                return_prediction=self.model.use_prediction,
+            )
+            
+            # Compute losses
+            losses = self.model.compute_loss(data, reconstructed, predictions)
+            
+            # Adaptive loss balancing
+            if self.use_adaptive_loss:
+                total_loss, weights = self.loss_balancer(losses)
+            else:
+                total_loss = sum(losses.values())
+            
+            # Backward pass
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
         
         # Update loss balancer
         if self.use_adaptive_loss:

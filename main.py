@@ -246,6 +246,8 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         weight_decay=config['training']['weight_decay'],
         use_adaptive_loss=config['training']['use_adaptive_loss'],
         use_eeg_enhancement=config['training']['use_eeg_enhancement'],
+        use_amp=config['device'].get('use_amp', True),
+        use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
         device=config['device']['type'],
     )
     

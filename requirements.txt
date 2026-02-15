@@ -1,0 +1,30 @@
+# TwinBrain V5 Requirements
+# Python >= 3.8
+
+# Core Dependencies
+torch>=2.0.0,<2.2.0
+torch-geometric>=2.3.0,<2.4.0
+torch-scatter>=2.1.0
+torch-sparse>=0.6.0
+
+# Data Processing
+numpy>=1.24.0,<1.27.0
+scipy>=1.10.0,<1.12.0
+nibabel>=5.0.0,<5.2.0
+pandas>=2.0.0,<2.2.0
+
+# Configuration & Utilities
+pyyaml>=6.0,<6.1
+tqdm>=4.65.0,<4.67.0
+
+# Logging & Monitoring
+tensorboard>=2.13.0,<2.15.0
+
+# Testing (optional)
+pytest>=7.4.0,<8.0.0
+pytest-cov>=4.1.0,<5.0.0
+
+# Development (optional)
+black>=23.0.0,<24.0.0
+flake8>=6.0.0,<7.0.0
+mypy>=1.4.0,<1.8.0
