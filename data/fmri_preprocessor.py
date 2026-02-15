@@ -83,7 +83,7 @@ class FMRI_Preprocessor:
             pbar.set_postfix_str("预处理完成 + clean_img 生成")
             pbar.update(1)
         
-        # Return both clean_img (NIfTI) and time series (numpy array)
+        # Return clean_img (NIfTI). Time series accessible via get_time_series()
         return self.clean_img
         
     def get_time_series(self):
