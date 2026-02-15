@@ -23,7 +23,13 @@ from pathlib import Path
 AMP_AVAILABLE = False
 USE_NEW_AMP_API = False
 try:
-    from torch.amp import autocast, GradScaler
+    # Try new API: autocast from torch.amp (requires device_type parameter)
+    from torch.amp import autocast
+    # GradScaler might still be in torch.cuda.amp in some PyTorch versions
+    try:
+        from torch.amp import GradScaler
+    except ImportError:
+        from torch.cuda.amp import GradScaler
     AMP_AVAILABLE = True
     USE_NEW_AMP_API = True
 except ImportError:
@@ -397,9 +403,11 @@ class GraphNativeTrainer:
                 # New API expects device type as string (e.g., 'cuda', not 'cuda:0')
                 # Extract device type: handle both string and torch.device inputs
                 device_type = getattr(self.device, 'type', str(self.device).split(':')[0])
+                self.device_type = device_type  # Store for use with autocast()
                 self.scaler = GradScaler(device=device_type)
             else:
                 # Old API doesn't take device parameter
+                self.device_type = 'cuda'  # Old API only supports CUDA
                 self.scaler = GradScaler()
             logger.info("Mixed precision training (AMP) enabled")
         elif use_amp and not AMP_AVAILABLE:
@@ -519,7 +527,15 @@ class GraphNativeTrainer:
         
         # Forward and backward pass with optional mixed precision
         if self.use_amp:
-            with autocast():
+            # Use appropriate autocast context manager based on API version
+            if USE_NEW_AMP_API:
+                # New API: torch.amp.autocast() requires device_type
+                amp_context = autocast(device_type=self.device_type)
+            else:
+                # Old API: torch.cuda.amp.autocast() doesn't require device_type
+                amp_context = autocast()
+            
+            with amp_context:
                 # Forward pass
                 reconstructed, predictions = self.model(
                     data,
