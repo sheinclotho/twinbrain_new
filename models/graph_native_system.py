@@ -398,9 +398,12 @@ class GraphNativeTrainer:
                 if isinstance(self.device, str):
                     # Extract device type from 'cuda:0' -> 'cuda'
                     device_type = self.device.split(':')[0]
-                else:
+                elif hasattr(self.device, 'type'):
                     # torch.device object has .type attribute
                     device_type = self.device.type
+                else:
+                    # Fallback to string conversion
+                    device_type = str(self.device).split(':')[0]
                 self.scaler = GradScaler(device=device_type)
             else:
                 # Old API doesn't take device parameter
@@ -485,7 +488,7 @@ class GraphNativeTrainer:
                         enable_monitoring=True,
                         enable_attention=True,
                         enable_regularization=True,
-                    ).to(self.device)
+                    ).to(self.device)  # Move to device to prevent device mismatch errors
                 else:
                     logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
                     self.use_eeg_enhancement = False
