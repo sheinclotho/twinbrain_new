@@ -20,13 +20,22 @@ import logging
 from pathlib import Path
 
 # Import AMP components if available (for mixed precision training)
+AMP_AVAILABLE = False
+USE_NEW_AMP_API = False
 try:
-    from torch.cuda.amp import autocast, GradScaler
+    from torch.amp import autocast, GradScaler
     AMP_AVAILABLE = True
+    USE_NEW_AMP_API = True
 except ImportError:
-    AMP_AVAILABLE = False
-    autocast = None
-    GradScaler = None
+    try:
+        # Fallback to old API if new one not available
+        from torch.cuda.amp import autocast, GradScaler
+        AMP_AVAILABLE = True
+        USE_NEW_AMP_API = False
+    except ImportError:
+        AMP_AVAILABLE = False
+        autocast = None
+        GradScaler = None
 
 from .graph_native_mapper import GraphNativeBrainMapper, TemporalGraphFeatureExtractor
 from .graph_native_encoder import GraphNativeEncoder, SpatialTemporalGraphConv
@@ -383,7 +392,11 @@ class GraphNativeTrainer:
         # Mixed precision training
         self.use_amp = use_amp and device != 'cpu' and AMP_AVAILABLE
         if self.use_amp:
-            self.scaler = GradScaler(self.device)
+            # Use new API if available (torch.amp.GradScaler), otherwise old API (torch.cuda.amp.GradScaler)
+            if USE_NEW_AMP_API:
+                self.scaler = GradScaler(self.device)
+            else:
+                self.scaler = GradScaler()
             logger.info("Mixed precision training (AMP) enabled")
         elif use_amp and not AMP_AVAILABLE:
             logger.warning("AMP requested but not available. Training without mixed precision.")
