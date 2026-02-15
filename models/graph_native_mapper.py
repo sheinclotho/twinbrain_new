@@ -323,6 +323,29 @@ class GraphNativeBrainMapper:
         
         return connectivity
     
+    def _get_graph_device(self, data: HeteroData) -> torch.device:
+        """
+        Determine the device of a HeteroData graph by checking multiple sources.
+        
+        Args:
+            data: HeteroData graph
+            
+        Returns:
+            Device of the graph (falls back to self.device if not determinable)
+        """
+        # Try to find device from node features first
+        for node_type in data.node_types:
+            if hasattr(data[node_type], 'x') and data[node_type].x is not None:
+                return data[node_type].x.device
+        
+        # Try to find device from edge indices
+        for edge_type in data.edge_types:
+            if hasattr(data[edge_type], 'edge_index') and data[edge_type].edge_index is not None:
+                return data[edge_type].edge_index.device
+        
+        # Fallback to mapper's default device
+        return self.device
+    
     def create_cross_modal_edges(
         self,
         data: HeteroData,
@@ -356,17 +379,8 @@ class GraphNativeBrainMapper:
                     edge_list.append([eeg_idx, fmri_idx])
             
             if edge_list:
-                # Determine device from existing graph data
-                target_device = self.device  # fallback
-                if hasattr(data['eeg'], 'x') and data['eeg'].x is not None:
-                    target_device = data['eeg'].x.device
-                elif hasattr(data['fmri'], 'x') and data['fmri'].x is not None:
-                    target_device = data['fmri'].x.device
-                elif ('eeg', 'connects', 'eeg') in data.edge_types:
-                    target_device = data['eeg', 'connects', 'eeg'].edge_index.device
-                elif ('fmri', 'connects', 'fmri') in data.edge_types:
-                    target_device = data['fmri', 'connects', 'fmri'].edge_index.device
-                
+                # Use helper method to determine device
+                target_device = self._get_graph_device(data)
                 edge_index = torch.tensor(edge_list, dtype=torch.long, device=target_device).t()
                 
                 # Bidirectional connections
@@ -430,17 +444,8 @@ class GraphNativeBrainMapper:
         N_eeg = merged_data['eeg'].num_nodes
         N_fmri = merged_data['fmri'].num_nodes
         
-        # Determine device from existing graph data
-        # Try multiple sources to find the correct device
-        target_device = self.device  # fallback
-        if hasattr(merged_data['eeg'], 'x') and merged_data['eeg'].x is not None:
-            target_device = merged_data['eeg'].x.device
-        elif hasattr(merged_data['fmri'], 'x') and merged_data['fmri'].x is not None:
-            target_device = merged_data['fmri'].x.device
-        elif ('eeg', 'connects', 'eeg') in merged_data.edge_types:
-            target_device = merged_data['eeg', 'connects', 'eeg'].edge_index.device
-        elif ('fmri', 'connects', 'fmri') in merged_data.edge_types:
-            target_device = merged_data['fmri', 'connects', 'fmri'].edge_index.device
+        # Use helper method to determine device
+        target_device = self._get_graph_device(merged_data)
         
         # Create random connections (can be improved with anatomical mapping)
         num_edges = max(1, int(N_eeg * N_fmri * connection_ratio))
