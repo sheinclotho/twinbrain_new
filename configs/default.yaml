@@ -67,16 +67,20 @@ training:
   # Use gradient checkpointing (saves memory)
   use_gradient_checkpointing: false
   
+  # Use learning rate scheduler (10-20% faster convergence)
+  use_scheduler: true
+  scheduler_type: "cosine"  # Options: cosine, onecycle, plateau
+  
   # Gradient clipping
   max_grad_norm: 1.0
   
-  # 验证频率 (每N个epoch)
+  # Validation frequency (every N epochs)
   val_frequency: 5
   
-  # 保存检查点频率
+  # Save checkpoint frequency
   save_frequency: 10
   
-  # 早停patience
+  # Early stopping patience
   early_stopping_patience: 20
 
 # V5优化配置

@@ -252,6 +252,8 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         use_eeg_enhancement=config['training']['use_eeg_enhancement'],
         use_amp=config['device'].get('use_amp', True),
         use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
+        use_scheduler=config['training'].get('use_scheduler', True),
+        scheduler_type=config['training'].get('scheduler_type', 'cosine'),
         device=config['device']['type'],
     )
     
@@ -278,6 +280,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         # 验证
         if epoch % config['training']['val_frequency'] == 0:
             val_loss = trainer.validate(val_graphs)
+            
+            # Step scheduler based on validation loss (for ReduceLROnPlateau)
+            trainer.step_scheduler_on_validation(val_loss)
             
             # Check for NaN validation loss
             if np.isnan(val_loss) or np.isinf(val_loss):
