@@ -589,21 +589,40 @@ class GraphNativeTrainer:
         
         return loss_dict
     
-    def train_epoch(self, data_list: List[HeteroData]) -> float:
+    def train_epoch(self, data_list: List[HeteroData], epoch: int = None, total_epochs: int = None) -> float:
         """
-        Train for one epoch with learning rate scheduling.
+        Train for one epoch with learning rate scheduling and progress logging.
         
         Args:
             data_list: List of training data
+            epoch: Current epoch number (for logging)
+            total_epochs: Total number of epochs (for logging)
             
         Returns:
             Average loss for epoch
         """
-        total_loss = 0.0
+        if len(data_list) == 0:
+            raise ValueError("Cannot train on empty data_list")
         
-        for data in data_list:
+        total_loss = 0.0
+        num_batches = len(data_list)
+        
+        # Log start of epoch
+        if epoch is not None:
+            if epoch == 1:
+                logger.info("🚀 开始训练... (首个epoch可能因模型编译而较慢)")
+            elif epoch <= 3:
+                logger.info(f"📊 Epoch {epoch}/{total_epochs or '?'} 训练中...")
+        
+        for i, data in enumerate(data_list):
             loss_dict = self.train_step(data)
             total_loss += loss_dict['total']
+            
+            # Log progress for longer training runs (every 10 batches or at 25%, 50%, 75%)
+            if num_batches > 10 and i > 0 and (i % 10 == 0 or i == num_batches // 4 or i == num_batches // 2 or i == 3 * num_batches // 4):
+                progress_pct = (i + 1) / num_batches * 100
+                avg_loss_so_far = total_loss / (i + 1)
+                logger.info(f"  进度: {i+1}/{num_batches} batches ({progress_pct:.0f}%) - 当前平均loss: {avg_loss_so_far:.4f}")
         
         avg_loss = total_loss / len(data_list)
         self.history['train_loss'].append(avg_loss)
