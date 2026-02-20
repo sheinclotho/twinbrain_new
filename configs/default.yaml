@@ -72,6 +72,13 @@ training:
   # Trades recomputation for memory: frees per-timestep activations in the
   # ST-GCN temporal loop so they don't accumulate and exhaust RAM.
   use_gradient_checkpointing: true
+
+  # Maximum sequence length per modality (timepoints).
+  # EEG at 250 Hz × 60 s = 15,000 pts → tensors of many GB per encoder layer.
+  # Truncate to this value BEFORE building graphs to prevent CUDA OOM.
+  # Increase for longer sequences if you have sufficient VRAM.
+  # Rule-of-thumb: 300 fits comfortably in 8 GB; use 600 for 16 GB.
+  max_seq_len: 300
   
   # Use learning rate scheduler (10-20% faster convergence)
   use_scheduler: true

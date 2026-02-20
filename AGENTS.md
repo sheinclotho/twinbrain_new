@@ -24,7 +24,25 @@
 
 > 每次发现重要 bug 或陷阱时，追加到此节。格式：`[日期] 问题摘要 → 根因 → 解决方案`
 
-### [2026-02-20] MemoryError in ST-GCN temporal loop
+### [2026-02-20] CUDA OOM during train_step (8 GB GPU)
+
+**症状**：训练时 `CUDA out of memory. Tried to allocate 2.31 GiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 8.96 GiB is allocated by PyTorch, and 3.39 GiB is reserved by PyTorch but unallocated.`，触发点在 `graph_native_system.py` 的 `train_step` 调用 `self.model(data, return_prediction=...)` 处。
+
+**根因**：两个独立问题叠加：
+1. **序列长度未限制**：EEG 以 250 Hz 采样，几分钟数据 T ≈ 10,000–75,000 个时间点。`GraphNativeEncoder` 将完整序列放入 `temporal_conv`，产生 `[N, T, 128]` 张量；4 层编码器下单次前向传播可达数 GB。
+2. **显存碎片化**：3.39 GB 已预留但未使用；新分配 2.31 GB 失败，因为连续块不足。PyTorch 错误信息直接建议设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
+
+**解决方案**：
+1. 在 `configs/default.yaml` 的 `training` 下新增 `max_seq_len: 300`，为 8 GB GPU 的安全阈值（fMRI 典型长度 ≈ 150–300，可按需调大）。
+2. 在 `main.py` 的 `build_graphs()` 中，向 mapper 传参前将 `fmri_ts` 和 `eeg_data` 截断到 `max_seq_len`，从根源消除大张量。
+3. 在 `main.py` 顶部 import 区设置 `os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')`，解决显存碎片化（`setdefault` 保留用户自定义值）。
+4. 在 `graph_native_system.py` 的 `train_epoch` 每个 epoch 结束时调用 `torch.cuda.empty_cache()`，将已释放的碎片块归还给分配器。
+
+**影响文件**：
+- `configs/default.yaml`
+- `main.py`
+- `models/graph_native_system.py`
+- `AGENTS.md`
 
 **症状**：训练时 `MemoryError`，traceback 在 `graph_native_encoder.py` 的 `SpatialTemporalGraphConv.forward()` 中，最终触发点是 spectral_norm 的 `_power_method`。
 
