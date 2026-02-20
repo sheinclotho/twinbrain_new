@@ -92,17 +92,24 @@ class GraphNativeDecoder(nn.Module):
             layers = []
             current_dim = hidden_channels
             
-            # Stack of transpose convolutions
+            # Stack of convolution layers
             for i in range(num_layers):
                 out_dim = hidden_channels // (2 ** i) if i < num_layers - 1 else out_channels_dict[node_type]
+                use_stride2 = bool(temporal_upsample and i == 0)
                 
-                layers.append(nn.ConvTranspose1d(
-                    current_dim,
-                    out_dim,
-                    kernel_size=4,
-                    stride=2 if temporal_upsample and i == 0 else 1,
-                    padding=1,
-                ))
+                if use_stride2:
+                    # Temporal upsampling: ConvTranspose1d doubles T (stride=2 is correct here)
+                    layers.append(nn.ConvTranspose1d(
+                        current_dim, out_dim, kernel_size=4, stride=2, padding=1,
+                    ))
+                else:
+                    # Feature transform at same temporal resolution.
+                    # Conv1d(kernel_size=3, padding=1) preserves T exactly.
+                    # ConvTranspose1d(kernel_size=4, stride=1, padding=1) silently adds 1
+                    # to T per layer — causing shape mismatch in compute_loss.
+                    layers.append(nn.Conv1d(
+                        current_dim, out_dim, kernel_size=3, padding=1,
+                    ))
                 
                 if i < num_layers - 1:
                     layers.append(nn.BatchNorm1d(out_dim))
@@ -262,16 +269,18 @@ class GraphNativeBrainModel(nn.Module):
             predictions = {}
             for node_type in self.node_types:
                 if node_type in encoded_data.node_types:
-                    # Get encoded features
                     h = encoded_data[node_type].x  # [N, T, H]
-                    
-                    # Predict future
-                    pred_mean, _, _ = self.predictor(
-                        h.unsqueeze(0),  # Add batch dim
-                        return_uncertainty=False,
-                    )
-                    
-                    predictions[node_type] = pred_mean.squeeze(0)  # Remove batch dim
+
+                    # Treat N nodes as the batch dimension.
+                    # EnhancedMultiStepPredictor.forward expects [batch, seq_len, dim].
+                    # h.unsqueeze(0) would produce [1, N, T, H] (4-D) → window sampler
+                    # would fail to unpack 3 dims.  Use h directly so nodes = batch.
+                    # Returns (predictions, targets, uncertainties):
+                    #   predictions: [num_windows, N, prediction_steps, H]
+                    pred_windows, _, _ = self.predictor(h, return_uncertainty=False)
+
+                    # Average across sampled windows → [N, prediction_steps, H]
+                    predictions[node_type] = pred_windows.mean(dim=0)
         
         return reconstructed, predictions
     
@@ -287,7 +296,7 @@ class GraphNativeBrainModel(nn.Module):
         Args:
             data: Original data
             reconstructed: Reconstructed signals
-            predictions: Predicted future signals
+            predictions: Predicted future signals (currently unused in loss)
             
         Returns:
             Dictionary of losses
@@ -298,31 +307,35 @@ class GraphNativeBrainModel(nn.Module):
         for node_type in self.node_types:
             if node_type in data.node_types and node_type in reconstructed:
                 target = data[node_type].x  # [N, T, C]
-                recon = reconstructed[node_type]
+                recon = reconstructed[node_type]  # [N, T', C_out]
                 
-                # Choose loss function based on loss_type
+                # Align temporal dimensions: the decoder may produce T' ≠ T when
+                # temporal_upsample is set, or (defensively) if any upstream change
+                # shifts T.  Truncate to the shorter of the two.
+                T_min = min(target.shape[1], recon.shape[1])
+                if target.shape[1] != recon.shape[1]:
+                    logger.warning(
+                        f"Decoder output T={recon.shape[1]} ≠ target T={target.shape[1]} "
+                        f"for {node_type}; truncating to T={T_min}."
+                    )
+                    recon = recon[:, :T_min, :]
+                    target = target[:, :T_min, :]
+                
+                # Choose loss function
                 if self.loss_type == 'huber':
-                    # Huber loss: robust to outliers (5-10% better on noisy signals)
                     recon_loss = F.huber_loss(recon, target, delta=1.0)
                 elif self.loss_type == 'smooth_l1':
-                    # Smooth L1 loss: similar to Huber
                     recon_loss = F.smooth_l1_loss(recon, target)
                 else:
-                    # Default: MSE loss
                     recon_loss = F.mse_loss(recon, target)
                 
                 losses[f'recon_{node_type}'] = recon_loss
         
-        # Prediction loss (if available)
-        if predictions is not None:
-            for node_type, pred in predictions.items():
-                if node_type in data.node_types:
-                    # Get future ground truth (shift by prediction_steps)
-                    target = data[node_type].x  # [N, T, C]
-                    
-                    # Simple prediction loss (last steps vs predicted)
-                    pred_loss = F.mse_loss(pred, target[:, -pred.shape[1]:, :])
-                    losses[f'pred_{node_type}'] = pred_loss
+        # Prediction loss: pred is in latent space H while data[node_type].x is in
+        # original space C.  Comparing them directly is undefined and produces
+        # meaningless gradients.  A proper prediction loss requires encoding the
+        # future window and comparing in latent space — implement as future work.
+        # For now, the predictor is used for inference only.
         
         return losses
 
@@ -538,14 +551,13 @@ class GraphNativeTrainer:
                 amp_context = autocast()
             
             with amp_context:
-                # Forward pass
-                reconstructed, predictions = self.model(
-                    data,
-                    return_prediction=self.model.use_prediction,
-                )
+                # Forward pass: skip prediction during training — the predictor
+                # operates in latent space and has no training loss (see compute_loss).
+                # This also saves the compute of running the full prediction head.
+                reconstructed, _ = self.model(data, return_prediction=False)
                 
                 # Compute losses
-                losses = self.model.compute_loss(data, reconstructed, predictions)
+                losses = self.model.compute_loss(data, reconstructed, None)
                 
                 # Adaptive loss balancing
                 if self.use_adaptive_loss:
@@ -561,14 +573,10 @@ class GraphNativeTrainer:
             self.scaler.update()
         else:
             # Standard training without AMP
-            # Forward pass
-            reconstructed, predictions = self.model(
-                data,
-                return_prediction=self.model.use_prediction,
-            )
+            reconstructed, _ = self.model(data, return_prediction=False)
             
             # Compute losses
-            losses = self.model.compute_loss(data, reconstructed, predictions)
+            losses = self.model.compute_loss(data, reconstructed, None)
             
             # Adaptive loss balancing
             if self.use_adaptive_loss:
@@ -608,6 +616,11 @@ class GraphNativeTrainer:
         
         total_loss = 0.0
         num_batches = len(data_list)
+        
+        # Advance epoch counter in the adaptive loss balancer so that the warmup
+        # period expires correctly and weight adaptation becomes active.
+        if self.use_adaptive_loss:
+            self.loss_balancer.set_epoch(epoch or 0)
         
         # Log start of epoch
         if epoch is not None:
@@ -671,14 +684,11 @@ class GraphNativeTrainer:
         for data in data_list:
             data = data.to(self.device)
             
-            # Forward pass
-            reconstructed, predictions = self.model(
-                data,
-                return_prediction=self.model.use_prediction,
-            )
+            # Forward pass: skip prediction (compute_loss doesn't use it)
+            reconstructed, _ = self.model(data, return_prediction=False)
             
             # Compute losses
-            losses = self.model.compute_loss(data, reconstructed, predictions)
+            losses = self.model.compute_loss(data, reconstructed, None)
             total_loss += sum(losses.values()).item()
         
         avg_loss = total_loss / len(data_list)

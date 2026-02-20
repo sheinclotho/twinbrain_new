@@ -76,6 +76,44 @@
 
 ---
 
+### [2026-02-21] 多个"声明了但从未真正工作"的功能
+
+**思维误区**：看到代码里有 `use_gradient_checkpointing`、`AdaptiveLossBalancer`、`update_weights` 等声明，就以为它们在工作。没有追溯"这个功能的调用链是否闭合"。
+
+**正确思路**：对每一个声称"已实现"的功能，问三个问题：
+1. 调用入口在哪里？（e.g. set_epoch 在 train_epoch 里有没有被调用？）
+2. 内部实现是否能执行？（e.g. autograd.grad 在 backward 后会崩溃吗？）
+3. 输入/输出形状是否与调用者匹配？（e.g. predictor 接收 4-D 还是 3-D？）**不要信任"看上去有的代码"，要信任"可以从头到尾追踪的执行路径"。**
+
+**具体例子**：
+- `AdaptiveLossBalancer.update_weights` 调用 `torch.autograd.grad(task_loss, ...)` 但 `backward()` 已经释放了计算图 → 崩溃
+- `set_epoch()` 从未在 `train_epoch` 里调用 → `epoch_count` 永远是 0 → warmup 永远不结束 → `update_weights` 实际上永远是 no-op（这个 bug 反而"保护"了上面的 bug）
+- `predictor(h.unsqueeze(0), ...)` 把 `[N, T, H]` 变成 `[1, N, T, H]`（4-D），但 window sampler 只能 unpack 3 维 → ValueError
+
+---
+
+### [2026-02-21] "架构上的空话"：fMRI 实际只有 1 个节点
+
+**思维误区**：看到"图原生"、"空间-时间联合建模"、"保持大脑拓扑"，就认为 fMRI 真的在图上建模了空间结构。没有检查 fMRI 节点数 N_fmri 到底是多少。
+
+**根因**：`process_fmri_timeseries` 把所有 fMRI 体素的时间序列 **mean 掉**（`fmri_data.reshape(-1, T).mean(axis=0)`），然后 `.reshape(1, -1)` → N_fmri = **1**。整个项目的"图卷积"对 fMRI 实际上只有 1 个节点，空间信息完全丢失。
+
+**正确思路**：在宣称"图原生"之前，先打印 `N_fmri` 和 `N_eeg` 看实际上有多少个节点。任何时候看到 `mean(axis=0)` 后接 `reshape(1, -1)`，都要警惕"这是把 N 维空间折叠成了 1 维"。
+
+**解决**：用 NiftiLabelsMasker（nilearn）应用 Schaefer200 图谱，提取 200 个 ROI 时间序列 `[200, T]`，每个 ROI 对应图上一个节点。atlas 文件已在 `configs/default.yaml` 配置，只是从未使用。
+
+---
+
+### [2026-02-21] Decoder 的 ConvTranspose1d 悄悄改变了时序长度
+
+**思维误区**：以为 `ConvTranspose1d(kernel_size=4, stride=1, padding=1)` 和 `Conv1d` 是对称的，输出长度不变。实际上 ConvTranspose1d 的输出公式是 `(T-1)*stride - 2*padding + kernel_size`，stride=1, padding=1, kernel_size=4 → `T+1`。3 层后 T+3。
+
+**正确思路**：ConvTranspose1d 的语义是"逆卷积/转置卷积"，设计用于**上采样**（stride>1 才有意义）。**stride=1 时应该用 Conv1d，不应该用 ConvTranspose1d。** 一旦用了 ConvTranspose1d(stride=1)，就要立刻验证输出尺寸公式。
+
+**解决**：对 stride=1 的层改用 `Conv1d(kernel_size=3, padding=1)`，精确保留 T。对 stride=2 的层（真正上采样）仍用 ConvTranspose1d。
+
+---
+
 ## 四、文档格式规范（必须遵守）
 
 **项目永远只保留以下四个 MD 文件，不得新增，不得删除，每次修改后同步更新：**
