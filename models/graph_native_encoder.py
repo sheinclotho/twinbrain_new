@@ -444,6 +444,19 @@ class GraphNativeEncoder(nn.Module):
                             # Apply ST-GCN
                             conv = stgcn.convs[edge_type]
                             msg = conv(x_src, edge_index, edge_attr)
+                            
+                            # Cross-modal edges may have different source T than
+                            # destination T (e.g. EEG T=190 vs fMRI T=300).
+                            # Resample temporally so all messages share dst's T.
+                            T_dst = x.shape[1]
+                            if msg.shape[1] != T_dst:
+                                msg = F.interpolate(
+                                    msg.permute(0, 2, 1),  # [N, H, T_src]
+                                    size=T_dst,
+                                    mode='linear',
+                                    align_corners=False,
+                                ).permute(0, 2, 1)  # [N, T_dst, H]
+                            
                             messages.append(msg)
                 
                 # Aggregate messages
