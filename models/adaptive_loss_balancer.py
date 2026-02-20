@@ -231,13 +231,18 @@ class AdaptiveLossBalancer(nn.Module):
         shared_params: Optional[List[nn.Parameter]] = None,
     ):
         """
-        Update loss weights based on gradient magnitudes (GradNorm).
-        
-        Args:
-            losses: Dictionary of task losses
-            model: Model to compute gradients on
-            shared_params: Shared parameters to compute gradient norms on
-                          (if None, uses all model parameters)
+        Update loss weights based on relative loss magnitudes.
+
+        Design note: the original GradNorm algorithm calls torch.autograd.grad()
+        per task to compute per-task gradient norms.  That requires the computation
+        graph to still be alive, but update_weights() is called AFTER backward()
+        has already consumed and freed the graph.  Calling autograd.grad() at that
+        point raises "Trying to backward through the graph a second time".
+
+        Instead we use loss magnitudes as a lightweight proxy: tasks whose loss is
+        larger than the group average are "harder" and receive a lower weight so
+        that all tasks converge at a comparable rate.  This is not GradNorm but is
+        stable and avoids the post-backward graph issue.
         """
         # Only update after warmup and at specified frequency
         if self.epoch_count < self.warmup_epochs:
@@ -249,83 +254,43 @@ class AdaptiveLossBalancer(nn.Module):
         
         self.step_count += 1
         
-        # Get shared parameters
-        if shared_params is None:
-            shared_params = [p for p in model.parameters() if p.requires_grad]
+        # Gather scalar loss values (graph already freed — use .item())
+        loss_values = {
+            name: losses[name].item()
+            for name in self.task_names
+            if name in losses
+        }
         
-        # Compute gradient norms for each task
-        grad_norms = {}
+        if not loss_values:
+            return
         
-        for name in self.task_names:
-            if name not in losses:
-                continue
-            
-            # Compute gradients for this task
-            task_loss = losses[name]
-            
-            # Get gradients
-            grads = torch.autograd.grad(
-                task_loss,
-                shared_params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True
-            )
-            
-            # Compute gradient norm
-            grad_norm = 0.0
-            for g in grads:
-                if g is not None:
-                    grad_norm += g.detach().norm(2).item() ** 2
-            grad_norm = grad_norm ** 0.5
-            
-            grad_norms[name] = grad_norm
-            self.grad_norm_history[name].append(grad_norm)
+        avg_loss = sum(loss_values.values()) / len(loss_values)
         
-        # Compute average gradient norm
-        avg_grad_norm = sum(grad_norms.values()) / max(len(grad_norms), 1)
-        
-        # Compute relative inverse training rates
-        # Tasks with smaller gradients are training slower, so increase their weight
         with torch.no_grad():
-            for name in self.task_names:
-                if name not in grad_norms or grad_norms[name] < 1e-8:
+            for name, loss_val in loss_values.items():
+                if loss_val < 1e-8:
                     continue
                 
-                # Relative gradient norm
-                rel_grad = grad_norms[name] / (avg_grad_norm + 1e-8)
+                # Relative loss: how much harder is this task than average?
+                rel_loss = loss_val / (avg_loss + 1e-8)
                 
-                # Target: balanced gradient norms (rel_grad ≈ 1.0)
-                # If rel_grad < 1: task is training slower, increase weight
-                # If rel_grad > 1: task is training faster, decrease weight
-                target_rel = 1.0
+                # Drive all task losses towards the group average.
+                # If task loss > avg (rel_loss > 1): task is harder → lower its weight
+                # If task loss < avg (rel_loss < 1): task is easier → raise its weight
+                weight_update = -self.learning_rate * (rel_loss - 1.0)
+                weight_update = max(-0.5, min(0.5, weight_update))  # clip
                 
-                # Compute gradient for weight update (GradNorm loss)
-                # L_grad = |G_i(t) / avg(G(t)) - r_i(t)|^α
-                # where r_i(t) is the relative inverse training rate
-                grad_loss = abs(rel_grad - target_rel) ** self.alpha
-                
-                # Update weight (gradient descent on grad_loss)
-                # Increase weight if task is training slower
-                weight_update = -self.learning_rate * (rel_grad - target_rel)
-                
-                # Clip weight update to prevent explosion
-                weight_update = torch.clamp(weight_update, -1.0, 1.0)
-                
-                # Update in log space for stability
                 self.log_weights[name].data += weight_update
                 
-                # Clamp to reasonable range to prevent NaN from exp()
-                max_log_weight = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
-                min_log_weight = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
-                self.log_weights[name].data.clamp_(min_log_weight, max_log_weight)
+                max_log = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
+                min_log = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
+                self.log_weights[name].data.clamp_(min_log, max_log)
         
-        # Log current weights
         if logger.isEnabledFor(logging.DEBUG):
-            weights = {name: torch.exp(self.log_weights[name]).item() 
-                      for name in self.task_names}
+            weights = {name: torch.exp(self.log_weights[name]).item()
+                       for name in self.task_names}
             logger.debug(f"Updated loss weights: {weights}")
-            logger.debug(f"Gradient norms: {grad_norms}")
+            logger.debug(f"Loss values used: {loss_values}")
     
     def set_epoch(self, epoch: int):
         """Set current epoch for warmup tracking."""

@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 import yaml
 import torch
 import numpy as np
@@ -88,23 +89,85 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
     logger.info("步骤 2/4: 构建图结构")
     logger.info("=" * 60)
     
-    def process_fmri_timeseries(fmri_data, min_volumes=10):
-        """Helper to extract and normalize fMRI timeseries."""
-        if fmri_data.ndim == 4:  # 4D fMRI
+    _MIN_VOLUMES = 10  # Shared threshold for minimum valid fMRI timepoints
+
+    def process_fmri_timeseries(fmri_data, min_volumes=_MIN_VOLUMES):
+        """Extract and normalize fMRI timeseries.
+
+        Handles all common input shapes:
+        - 4-D [X, Y, Z, T]: raw volumetric fMRI → averaged to [1, T]
+        - 3-D [N_rois, T, ?] or [X, Y, T]: reshaped → averaged to [1, T]
+        - 2-D [N_rois, T] or [T, N_rois]: pre-parcellated ROI data → ALL ROIs
+          kept as separate nodes [N_rois, T] (no averaging).
+
+        Returns (timeseries [N_rois, T], error_or_None).
+        """
+        if fmri_data.ndim == 4:
             n_volumes = fmri_data.shape[-1]
-        elif fmri_data.ndim == 3:  # 3D (already ROI timeseries)
+            if n_volumes < min_volumes:
+                return None, f"Too few volumes: {n_volumes} < {min_volumes}"
+            # Average all in-mask voxels — single timeseries
+            fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
+            fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
+            return fmri_ts.reshape(1, -1), None
+
+        elif fmri_data.ndim == 3:
             n_volumes = fmri_data.shape[-1]
+            if n_volumes < min_volumes:
+                return None, f"Too few volumes: {n_volumes} < {min_volumes}"
+            fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
+            fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
+            return fmri_ts.reshape(1, -1), None
+
+        elif fmri_data.ndim == 2:
+            # Already ROI timeseries — preserve all ROIs as separate graph nodes.
+            # Ensure layout is [N_rois, T].
+            if fmri_data.shape[0] > fmri_data.shape[1]:
+                fmri_data = fmri_data.T
+            N_rois, T = fmri_data.shape
+            if T < min_volumes:
+                return None, f"Too few timepoints: {T} < {min_volumes}"
+            # Normalise each ROI independently
+            mean = fmri_data.mean(axis=1, keepdims=True)
+            std = fmri_data.std(axis=1, keepdims=True) + 1e-8
+            return (fmri_data - mean) / std, None
+
         else:
             return None, f"Unsupported fMRI shape: {fmri_data.shape}"
-        
-        if n_volumes < min_volumes:
-            return None, f"Too few volumes: {n_volumes} < {min_volumes}"
-        
-        # Average and normalize
-        fmri_ts = fmri_data.reshape(-1, n_volumes).mean(axis=0)
-        fmri_ts = (fmri_ts - fmri_ts.mean()) / (fmri_ts.std() + 1e-8)
-        return fmri_ts.reshape(1, -1), None
-    
+
+    def _parcellate_fmri_with_atlas(fmri_img, atlas_path: Path) -> Optional[np.ndarray]:
+        """Apply atlas parcellation to extract per-ROI timeseries.
+
+        Uses nilearn NiftiLabelsMasker which handles resampling automatically.
+        Returns [N_rois, T] float32 array, or None on failure.
+
+        Why this matters: without parcellation fMRI is collapsed to a single node
+        ([1, T]), making graph convolution meaningless.  With the Schaefer200 atlas
+        we get 200 anatomically meaningful nodes — the actual design intent.
+        """
+        try:
+            from nilearn.input_data import NiftiLabelsMasker
+            masker = NiftiLabelsMasker(
+                labels_img=str(atlas_path),
+                standardize=True,
+                detrend=True,
+            )
+            roi_ts = masker.fit_transform(fmri_img)  # [T, N_rois]
+            if roi_ts.shape[0] < _MIN_VOLUMES:
+                logger.warning(
+                    f"Atlas parcellation produced only {roi_ts.shape[0]} timepoints; skipping."
+                )
+                return None
+            if roi_ts.shape[1] < 2:
+                logger.warning(
+                    f"Atlas parcellation produced only {roi_ts.shape[1]} ROIs; skipping."
+                )
+                return None
+            return roi_ts.T.astype(np.float32)  # [N_rois, T]
+        except Exception as e:
+            logger.warning(f"Atlas parcellation failed ({e}); falling back to single-node fMRI.")
+            return None
+
     # 初始化图映射器
     mapper = GraphNativeBrainMapper(
         atlas_name=config['data']['atlas']['name'],
@@ -116,6 +179,17 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         threshold_eeg=config['graph'].get('threshold_eeg', 0.2),
         device=config['device']['type'],
     )
+
+    # Resolve atlas file path once (relative to project root)
+    atlas_file = Path(__file__).parent / config['data']['atlas']['file']
+    if atlas_file.exists():
+        logger.info(
+            f"Atlas parcellation enabled: {atlas_file.name} → up to 200 fMRI ROI nodes"
+        )
+    else:
+        logger.warning(
+            f"Atlas file not found at {atlas_file}; fMRI will use single-node fallback."
+        )
     
     # 为每个被试构建图
     max_seq_len = config['training'].get('max_seq_len', None)
@@ -128,16 +202,25 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         # fMRI图
         if 'fmri' in subject_data:
             fmri_data = subject_data['fmri']['data']
-            fmri_ts, error = process_fmri_timeseries(fmri_data)
-            
-            if error:
-                logger.warning(f"fMRI processing failed: {error}, skipping")
-                continue
+            fmri_img = subject_data['fmri'].get('img')   # preprocessed NIfTI object
+
+            # Prefer atlas parcellation: gives [N_rois, T] (e.g. 200 ROI nodes).
+            # Fallback to spatial average → [1, T] when atlas unavailable.
+            fmri_ts = None
+            if atlas_file.exists() and fmri_img is not None:
+                fmri_ts = _parcellate_fmri_with_atlas(fmri_img, atlas_file)
+
+            if fmri_ts is None:
+                fmri_ts, error = process_fmri_timeseries(fmri_data)
+                if error:
+                    logger.warning(f"fMRI processing failed: {error}, skipping subject")
+                    continue
             
             # Truncate to max_seq_len to prevent CUDA OOM with long sequences
             if max_seq_len is not None:
                 fmri_ts = truncate_timeseries(fmri_ts, max_seq_len)
             
+            logger.debug(f"fMRI timeseries shape: {fmri_ts.shape} → {fmri_ts.shape[0]} nodes")
             fmri_graph = mapper.map_fmri_to_graph(
                 timeseries=fmri_ts,
                 connectivity_matrix=None,  # 自动计算

@@ -1,12 +1,73 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-20  
-**版本**：3.0  
+**最后更新**：2026-02-21  
+**版本**：V5.4  
 **状态**：生产就绪
 
 ---
 
-## [V5.3] 2026-02-20 — MemoryError 修复
+## [V5.4] 2026-02-21 — 端到端训练修复 + fMRI 多节点图
+
+### 🔴 关键 Bug 修复（5 个）
+
+#### 1. Decoder 时序长度静默增长（每层 +1）
+**问题**：`GraphNativeDecoder` 使用 `ConvTranspose1d(kernel_size=4, stride=1, padding=1)`，公式 `(T-1)*1 - 2*1 + 4 = T+1`，3 层后输出 T+3。`compute_loss` 对比 `[N,T+3,C]` 和 `[N,T,C]` → RuntimeError。  
+**修复**：对 stride=1 层改用 `Conv1d(kernel_size=3, padding=1)`（输出恰好为 T）；stride=2 上采样层保留 ConvTranspose1d。  
+**文件**：`models/graph_native_system.py`
+
+#### 2. Predictor forward 形状错误
+**问题**：`self.predictor(h.unsqueeze(0), ...)` 将 `[N, T, H]` 变成 `[1, N, T, H]`（4-D），但 `StratifiedWindowSampler.sample_windows` 用 `batch_size, seq_len, _ = sequence.shape` unpack 3 维 → `ValueError: too many values to unpack`。  
+**修复**：改为 `self.predictor(h, ...)` 直接传入（N 节点作为 batch 维），并 `.mean(dim=0)` 合并多窗口预测。  
+**文件**：`models/graph_native_system.py`
+
+#### 3. Prediction loss 跨空间维度比较
+**问题**：`compute_loss` 中 `pred`（潜在空间 H）与 `data[node_type].x`（原始空间 C=1）直接做 MSE → 语义错误（H 远大于 C，梯度无意义）。  
+**修复**：训练时跳过 prediction loss，`train_step` 改为 `return_prediction=False`。预测头用于推理，训练阶段仅用重建损失。  
+**文件**：`models/graph_native_system.py`
+
+#### 4. AdaptiveLossBalancer：backward 后 autograd.grad 崩溃 + warmup 永不结束
+**问题①**：`update_weights` 调用 `torch.autograd.grad(task_loss, ...)` 但此时 `backward()` 已释放计算图 → `RuntimeError: Trying to backward through the graph a second time`。  
+**问题②**：`set_epoch()` 从未在 `train_epoch` 里被调用 → `epoch_count` 恒为 0 → warmup 永不结束 → `update_weights` 永远是 no-op（这个 bug 意外地"保护"了 bug①）。  
+**修复**：用 loss 幅值差异代替 per-task 梯度范数（后者需完整图，前者只需 `.item()` 读值）；在 `train_epoch` 开头调用 `loss_balancer.set_epoch(epoch)`。  
+**文件**：`models/adaptive_loss_balancer.py`, `models/graph_native_system.py`
+
+#### 5. compute_loss 时序维度对齐防护
+**问题**：若上游改变导致重建输出 T' ≠ T，MSE 崩溃时错误信息不明确。  
+**修复**：在 compute_loss 中检查 T' vs T，自动截断并打印 warning。  
+**文件**：`models/graph_native_system.py`
+
+---
+
+### 🚀 重大架构改进
+
+#### fMRI 多节点图（1 节点 → 200 ROI 节点）
+**背景**：原 `process_fmri_timeseries` 对所有体素做 `mean(axis=0).reshape(1, -1)` → 整个 fMRI 只有 **1 个节点**。图卷积在 1 节点图上毫无意义，"图原生"完全失效。  
+
+**改进**：在 `build_graphs` 中新增 `_parcellate_fmri_with_atlas()` 函数，使用 `nilearn.NiftiLabelsMasker` 自动应用 Schaefer200 图谱，提取 **200 个解剖学 ROI 时间序列**，每个 ROI 对应图上独立一个节点。  
+
+**效果**：
+- 图从 `N_fmri=1` → `N_fmri=200`，空间信息真正保留
+- 跨模态边（EEG→fMRI）有实际解剖意义（各通道关联到不同脑区）
+- atlas 文件已配置于 `configs/default.yaml`，之前未使用
+
+**降级**：若 atlas 文件缺失或 parcellation 失败，优雅回退到旧的单节点方式。  
+**文件**：`main.py`
+
+---
+
+### 📁 修改文件汇总
+
+| 文件 | 修改内容 |
+|------|---------|
+| `models/graph_native_system.py` | Decoder Conv1d 修复；predictor 调用修复；compute_loss 时序对齐；train_step 禁用 return_prediction；train_epoch 添加 set_epoch |
+| `models/adaptive_loss_balancer.py` | update_weights 用 loss 幅值替代 post-backward autograd.grad |
+| `main.py` | 添加 _parcellate_fmri_with_atlas()；process_fmri_timeseries 支持 2D 输入；build_graphs 集成 atlas 流程 |
+| `AGENTS.md` | 新增 4 条错误记录（思维模式层面） |
+| `CHANGELOG.md` | 本条目 |
+
+---
+
+
 
 ### 🔴 关键 Bug 修复
 
