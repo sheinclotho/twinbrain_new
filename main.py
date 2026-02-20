@@ -13,12 +13,17 @@ TwinBrain V5 主程序
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 import yaml
 import torch
 import numpy as np
 from torch_geometric.data import HeteroData
+
+# Reduce CUDA memory fragmentation (recommended when reserved >> allocated).
+# Set before any CUDA allocations; setdefault preserves user overrides.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -27,6 +32,17 @@ from data.loaders import BrainDataLoader
 from models.graph_native_mapper import GraphNativeBrainMapper
 from models.graph_native_system import GraphNativeBrainModel, GraphNativeTrainer
 from utils.helpers import setup_logging, set_seed, save_config, create_output_dir
+
+
+def truncate_timeseries(ts: np.ndarray, max_len: int) -> np.ndarray:
+    """Truncate timeseries [..., T] to at most max_len timepoints.
+
+    Prevents CUDA OOM caused by very long EEG/fMRI sequences creating
+    multi-GB [N, T, hidden] tensors inside the ST-GCN encoder.
+    """
+    if ts.shape[-1] > max_len:
+        return ts[..., :max_len]
+    return ts
 
 
 def load_config(config_path: str = None) -> dict:
@@ -102,6 +118,9 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
     )
     
     # 为每个被试构建图
+    max_seq_len = config['training'].get('max_seq_len', None)
+    if max_seq_len is not None:
+        logger.info(f"Sequence truncation enabled: max_seq_len={max_seq_len} (prevents CUDA OOM)")
     graphs = []
     for subject_data in all_data:
         graph_list = []
@@ -114,6 +133,10 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             if error:
                 logger.warning(f"fMRI processing failed: {error}, skipping")
                 continue
+            
+            # Truncate to max_seq_len to prevent CUDA OOM with long sequences
+            if max_seq_len is not None:
+                fmri_ts = truncate_timeseries(fmri_ts, max_seq_len)
             
             fmri_graph = mapper.map_fmri_to_graph(
                 timeseries=fmri_ts,
@@ -136,6 +159,10 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             if np.isnan(eeg_data).any() or np.isinf(eeg_data).any():
                 logger.warning("EEG contains NaN or Inf values, skipping")
                 continue
+            
+            # Truncate to max_seq_len to prevent CUDA OOM with long sequences
+            if max_seq_len is not None:
+                eeg_data = truncate_timeseries(eeg_data, max_seq_len)
             
             eeg_graph = mapper.map_eeg_to_graph(
                 timeseries=eeg_data,

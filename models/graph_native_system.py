@@ -629,6 +629,14 @@ class GraphNativeTrainer:
         avg_loss = total_loss / len(data_list)
         self.history['train_loss'].append(avg_loss)
         
+        # Release fragmented GPU memory blocks once per epoch.
+        # This frees reserved-but-unallocated blocks back to the allocator so
+        # they can be reused, reducing fragmentation OOM across epochs.
+        # Called per-epoch (not per-step) to avoid repeated sync overhead.
+        device_type = getattr(self.device, 'type', str(self.device).split(':')[0])
+        if device_type == 'cuda':
+            torch.cuda.empty_cache()
+        
         # Step scheduler (if not ReduceLROnPlateau)
         if self.use_scheduler and self.scheduler is not None:
             if not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
