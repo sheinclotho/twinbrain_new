@@ -68,8 +68,10 @@ training:
   # Use EEG enhancement
   use_eeg_enhancement: true
   
-  # Use gradient checkpointing (saves memory)
-  use_gradient_checkpointing: false
+  # Use gradient checkpointing (saves memory, required for long sequences)
+  # Trades recomputation for memory: frees per-timestep activations in the
+  # ST-GCN temporal loop so they don't accumulate and exhaust RAM.
+  use_gradient_checkpointing: true
   
   # Use learning rate scheduler (10-20% faster convergence)
   use_scheduler: true
