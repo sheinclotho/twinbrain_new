@@ -217,6 +217,7 @@ def create_model(config: dict, logger: logging.Logger):
         prediction_steps=config['model']['prediction_steps'],
         dropout=config['model']['dropout'],
         loss_type=config['model'].get('loss_type', 'mse'),
+        use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
     )
     
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")

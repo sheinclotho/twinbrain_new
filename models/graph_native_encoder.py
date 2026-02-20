@@ -15,6 +15,7 @@ Key innovations:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from torch_geometric.nn import MessagePassing, HeteroConv, GCNConv, GATConv
 from torch_geometric.data import HeteroData
 from typing import Dict, Optional, Tuple, List
@@ -38,6 +39,7 @@ class SpatialTemporalGraphConv(MessagePassing):
         temporal_kernel_size: int = 3,
         use_attention: bool = True,
         use_spectral_norm: bool = True,
+        use_gradient_checkpointing: bool = False,
         dropout: float = 0.1,
     ):
         super().__init__(aggr='add')  # Sum aggregation
@@ -46,6 +48,7 @@ class SpatialTemporalGraphConv(MessagePassing):
         self.out_channels = out_channels
         self.use_attention = use_attention
         self.use_spectral_norm = use_spectral_norm
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         
         # Temporal convolution (processes time dimension)
         self.temporal_conv = nn.Conv1d(
@@ -118,19 +121,34 @@ class SpatialTemporalGraphConv(MessagePassing):
         x_t = x_t.permute(0, 2, 1)  # [N, T, C_out]
         
         # 2. Spatial message passing (along graph)
-        # Process each timestep independently
+        # Process each timestep independently.
+        # Gradient checkpointing frees intermediate activations (attention,
+        # messages, etc.) between timesteps, trading recomputation for memory.
+        # Without it, all T propagation graphs stay in memory for backprop,
+        # causing MemoryError on long sequences.
         out_list = []
         for t in range(T):
-            x_t_slice = x_t[:, t, :]  # [N, C_out]
-            x_orig_slice = x[:, t, :]  # [N, C_in]
+            x_t_slice = x_t[:, t, :].contiguous()   # [N, C_out]
+            x_orig_slice = x[:, t, :].contiguous()  # [N, C_in]
             
-            # Message passing for this timestep
-            out_t = self.propagate(
-                edge_index,
-                x=x_t_slice,
-                x_self=x_orig_slice,
-                edge_attr=edge_attr,
-            )
+            if self.use_gradient_checkpointing and self.training:
+                # Wrap propagate in gradient checkpoint to release intermediate
+                # activations immediately; they are recomputed during backward.
+                # Pass edge_index and edge_attr explicitly (use_reentrant=False
+                # supports non-tensor arguments such as None edge_attr).
+                def _propagate(xt_s, xo_s, ei, ea):
+                    return self.propagate(ei, x=xt_s, x_self=xo_s, edge_attr=ea)
+                out_t = gradient_checkpoint(
+                    _propagate, x_t_slice, x_orig_slice, edge_index, edge_attr,
+                    use_reentrant=False,
+                )
+            else:
+                out_t = self.propagate(
+                    edge_index,
+                    x=x_t_slice,
+                    x_self=x_orig_slice,
+                    edge_attr=edge_attr,
+                )
             out_list.append(out_t)
         
         # Stack timesteps
@@ -298,6 +316,7 @@ class GraphNativeEncoder(nn.Module):
         temporal_kernel_size: int = 3,
         use_temporal_attention: bool = True,
         attention_heads: int = 4,
+        use_gradient_checkpointing: bool = False,
         dropout: float = 0.1,
     ):
         """
@@ -312,6 +331,8 @@ class GraphNativeEncoder(nn.Module):
             temporal_kernel_size: Kernel size for temporal conv
             use_temporal_attention: Use temporal attention mechanism
             attention_heads: Number of attention heads
+            use_gradient_checkpointing: Free intermediate activations per timestep
+                to avoid MemoryError on long sequences (trades memory for compute)
             dropout: Dropout rate
         """
         super().__init__()
@@ -340,6 +361,7 @@ class GraphNativeEncoder(nn.Module):
                     out_channels=hidden_channels,
                     temporal_kernel_size=temporal_kernel_size,
                     use_attention=True,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
                     dropout=dropout,
                 )
             

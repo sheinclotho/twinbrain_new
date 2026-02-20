@@ -1,19 +1,34 @@
-# TwinBrain V5 - Complete Changelog & Optimization Summary
-# TwinBrain V5 - 完整更新日志与优化总结
+# TwinBrain V5 — 更新日志
 
-**Last Updated**: 2026-02-15  
-**Version**: 2.0  
-**Status**: Phase 1 & 2 Complete
+**最后更新**：2026-02-20  
+**版本**：3.0  
+**状态**：生产就绪
+
+---
+
+## [V5.3] 2026-02-20 — MemoryError 修复
+
+### 🔴 关键 Bug 修复
+
+#### MemoryError in ST-GCN 时间步循环
+
+**问题**：训练时在 `SpatialTemporalGraphConv.forward()` 中触发 `MemoryError`，最终触发点是 spectral_norm 的 `_power_method`（即最后一次内存分配）。
+
+**根因**：时间步循环（`for t in range(T)`）每次调用 `propagate()`，PyTorch autograd 保留所有 T 步的中间激活（注意力矩阵 `[E,1]`、消息矩阵 `[E,C]`）用于反向传播。当 T 较大时，内存耗尽。
+
+**附加问题**：`graph_native_system.py` 中的 `use_gradient_checkpointing` 虽有声明，但调用了不存在的 `HeteroConv.gradient_checkpointing_enable()` 方法，从未真正生效。
+
+**修复**：
+- `models/graph_native_encoder.py`：添加 `use_gradient_checkpointing` 参数到 `SpatialTemporalGraphConv` 和 `GraphNativeEncoder`；在时间步循环内使用 `torch.utils.checkpoint.checkpoint()` 包装 `propagate()`。
+- `models/graph_native_system.py`：将 `use_gradient_checkpointing` 传入 `GraphNativeBrainModel`；删除失效的 `gradient_checkpointing_enable()` 调用。
+- `main.py`：从 config 读取 `use_gradient_checkpointing` 并传入 model 构造函数。
+- `configs/default.yaml`：将 `use_gradient_checkpointing` 改为 `true`（之前虽为 false 但未实际生效）。
+
+**内存改善**：中间激活从 `O(T·E·C)` 降至 `O(T·N·C)`，对典型脑图（T=300, E=4000, N=200, C=128）减少约 20× 的 autograd 内存。
 
 ---
 
-## Executive Summary (概要)
 
-This document consolidates all device fixes, optimizations, and improvements made to TwinBrain V5. The system has been upgraded from grade **B+ to A-** with **5-20x training speedup** and **50-200x graph construction speedup**.
-
-本文档整合了TwinBrain V5的所有设备修复、优化和改进。系统已从**B+升级到A-**，实现**5-20倍训练加速**和**50-200倍图构建加速**。
-
----
 
 ## 🔧 Critical Bug Fixes (关键错误修复)
 

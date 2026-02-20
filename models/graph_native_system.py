@@ -168,6 +168,7 @@ class GraphNativeBrainModel(nn.Module):
         prediction_steps: int = 10,
         dropout: float = 0.1,
         loss_type: str = 'mse',
+        use_gradient_checkpointing: bool = False,
     ):
         """
         Initialize complete model.
@@ -183,6 +184,8 @@ class GraphNativeBrainModel(nn.Module):
             prediction_steps: Steps to predict ahead
             dropout: Dropout rate
             loss_type: Loss function type ('mse', 'huber', 'smooth_l1')
+            use_gradient_checkpointing: Free intermediate activations per timestep
+                to avoid MemoryError on long sequences (trades memory for compute)
         """
         super().__init__()
         
@@ -198,6 +201,7 @@ class GraphNativeBrainModel(nn.Module):
             in_channels_dict=in_channels_dict,
             hidden_channels=hidden_channels,
             num_layers=num_encoder_layers,
+            use_gradient_checkpointing=use_gradient_checkpointing,
             dropout=dropout,
         )
         
@@ -414,13 +418,11 @@ class GraphNativeTrainer:
             logger.warning("AMP requested but not available. Training without mixed precision.")
         
         # Gradient checkpointing
+        # NOTE: checkpointing is applied inside SpatialTemporalGraphConv's
+        # temporal loop (via use_gradient_checkpointing on the model).
+        # The trainer just logs its status here.
         if use_gradient_checkpointing:
-            # Enable checkpointing for encoder layers
-            if hasattr(model.encoder, 'stgcn_layers'):
-                for layer in model.encoder.stgcn_layers:
-                    if hasattr(layer, 'gradient_checkpointing_enable'):
-                        layer.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled")
+            logger.info("Gradient checkpointing enabled (applied per ST-GCN timestep)")
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
