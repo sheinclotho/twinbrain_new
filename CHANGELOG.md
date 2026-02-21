@@ -1,8 +1,28 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-21  
-**版本**：V5.4  
+**版本**：V5.5  
 **状态**：生产就绪
+
+---
+
+## [V5.5] 2026-02-21 — 修复 "backward through the graph a second time" 根因
+
+### 🔴 关键 Bug 修复
+
+#### log_weights 梯度累积 + "backward 两次" 错误
+
+**问题**：`AdaptiveLossBalancer.forward()` 中 `weights = torch.exp(self.log_weights[name]).clamp(...)` 未 `.detach()`，导致：
+1. `total_loss` 反向图包含 `log_weights`（nn.Parameter），backward() 为其计算梯度。
+2. `log_weights` 不在 optimizer 中，`optimizer.zero_grad()` 不清零其 `.grad`。
+3. 每次 backward 后 `log_weights.grad` 持续累积，不被重置。
+4. `update_weights()` 收到带 `grad_fn` 的 loss 张量（backward 已释放其中间节点），若 PyTorch 内部访问已释放节点，触发 `RuntimeError: Trying to backward through the graph a second time`。
+
+**修复**：
+1. `AdaptiveLossBalancer.forward()`: `weights = {name: torch.exp(self.log_weights[name]).detach().clamp(...)}` — 权重视为常数，不进入反向图。
+2. `GraphNativeTrainer.train_step()`: 在调用 `update_weights` 前先 `detached_losses = {k: v.detach() for k, v in losses.items()}`，明确 post-backward 语义。
+
+**文件**：`models/adaptive_loss_balancer.py`, `models/graph_native_system.py`
 
 ---
 

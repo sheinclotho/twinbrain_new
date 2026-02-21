@@ -607,9 +607,14 @@ class GraphNativeTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
         
-        # Update loss balancer
+        # Update loss balancer with detached scalar values.
+        # backward() has already freed the computation graph by this point;
+        # update_weights() uses .item() internally, so passing detached losses
+        # makes the post-backward contract explicit and avoids any accidental
+        # graph access that would raise "backward through the graph a second time".
         if self.use_adaptive_loss:
-            self.loss_balancer.update_weights(losses, self.model)
+            detached_losses = {k: v.detach() for k, v in losses.items()}
+            self.loss_balancer.update_weights(detached_losses, self.model)
         
         # Return loss values
         loss_dict = {k: v.item() for k, v in losses.items()}
