@@ -100,17 +100,23 @@ class SpatialTemporalGraphConv(MessagePassing):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: Optional[torch.Tensor] = None,
+        size: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """
         Forward pass.
         
         Args:
-            x: Node features [N, T, C_in]
+            x: Node features [N_src, T, C_in]
             edge_index: Graph edges [2, E]
             edge_attr: Edge weights [E, 1] (optional)
+            size: (N_src, N_dst) for cross-modal edges where N_src != N_dst.
+                  Must be provided for cross-modal edges so that propagate()
+                  allocates the correct number of destination-node slots.
+                  Without it, PyG defaults to (N_src, N_src) and aggregation
+                  silently produces [N_src, H] instead of [N_dst, H].
             
         Returns:
-            out: Updated features [N, T, C_out]
+            out: Updated features [N_dst, T, C_out]  (N_dst = size[1] if given)
         """
         N, T, C_in = x.shape
         
@@ -136,8 +142,11 @@ class SpatialTemporalGraphConv(MessagePassing):
                 # activations immediately; they are recomputed during backward.
                 # Pass edge_index and edge_attr explicitly (use_reentrant=False
                 # supports non-tensor arguments such as None edge_attr).
+                # `size` is a plain immutable tuple (or None) captured by the
+                # closure — compatible with gradient_checkpoint's non-tensor
+                # argument handling under use_reentrant=False.
                 def _propagate(xt_s, xo_s, ei, ea):
-                    return self.propagate(ei, x=xt_s, x_self=xo_s, edge_attr=ea)
+                    return self.propagate(ei, x=xt_s, x_self=xo_s, edge_attr=ea, size=size)
                 out_t = gradient_checkpoint(
                     _propagate, x_t_slice, x_orig_slice, edge_index, edge_attr,
                     use_reentrant=False,
@@ -148,6 +157,7 @@ class SpatialTemporalGraphConv(MessagePassing):
                     x=x_t_slice,
                     x_self=x_orig_slice,
                     edge_attr=edge_attr,
+                    size=size,
                 )
             out_list.append(out_t)
         
@@ -449,8 +459,15 @@ class GraphNativeEncoder(nn.Module):
                             x_src = x_dict[src]
                             
                             # Apply ST-GCN
+                            # Pass size=(N_src, N_dst) explicitly so propagate()
+                            # allocates N_dst destination slots.  Without this,
+                            # PyG defaults to (N_src, N_src) and cross-modal
+                            # aggregation silently produces [N_src, H] instead
+                            # of [N_dst, H], corrupting fMRI node features.
                             conv = stgcn.convs[edge_type]
-                            msg = conv(x_src, edge_index, edge_attr)
+                            N_src = x_src.shape[0]
+                            N_dst = x.shape[0]
+                            msg = conv(x_src, edge_index, edge_attr, size=(N_src, N_dst))
                             
                             # Cross-modal edges may have different source T than
                             # destination T (e.g. EEG T=190 vs fMRI T=300).
