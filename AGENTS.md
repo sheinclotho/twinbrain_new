@@ -130,6 +130,30 @@
 
 ---
 
+### [2026-02-21] 跨模态 ST-GCN 的 update() 将 N_src 广播给 N_dst → 重建 shape 错误
+
+**症状**：训练时警告 `Using a target size (torch.Size([1, 190, 1])) that is different to the input size (torch.Size([63, 190, 1]))` 在 `graph_native_system.py` 的 `compute_loss` 里 `F.huber_loss(recon, target)` 处。recon 有 63 个节点，而 fMRI target 只有 1 个节点。
+
+**根因**：`SpatialTemporalGraphConv.update(aggr_out, x_self)` 无条件计算 `aggr_out + lin_self(x_self)`。对于**跨模态边**（EEG→fMRI）：
+- `aggr_out`：shape `[N_dst=1, H]`（fMRI 目标节点聚合结果）
+- `x_self`：shape `[N_src=63, H]`（从 `propagate` 直传过来的 EEG 源节点特征）
+- `[1, H] + [63, H]` → PyTorch 广播 → 返回 `[63, H]`，而不是 `[1, H]`
+
+该错误在第一层编码器就扩散：`x_dict['fmri']` 变成 `[63, T, H]`，后续层、解码器全程处理 63 个"fMRI 节点"，最终重建输出 `[63, T, 1]` 与真实目标 `[1, T, 1]` 不匹配。
+
+**思维误区**：`SpatialTemporalGraphConv` 被设计为同模态（intra-modal）卷积，默认 N_src == N_dst，self-connection 代表节点自身残差。**跨模态边没有这个前提**——源节点和目标节点属于不同节点类型，数量可以完全不同。看到 `MessagePassing` 就以为 N 不变是错误的。
+
+**正确思路**：每次在异构图中将同一 conv 层用于跨模态边时，先问：**源节点数 N_src 和目标节点数 N_dst 是否相同？** 如不同，任何依赖"N 不变"假设的操作（如 `update` 里的 self-connection）都必须跳过或替换。
+
+**解决**：在 `SpatialTemporalGraphConv.update` 中添加一行检查：当 `aggr_out.shape[0] != x_self.shape[0]` 时，直接返回 `aggr_out`（跨模态边不做 self-connection）。
+
+**影响文件**：
+- `models/graph_native_encoder.py`
+- `AGENTS.md`
+- `CHANGELOG.md`
+
+---
+
 ### [2026-02-21] Decoder 的 ConvTranspose1d 悄悄改变了时序长度
 
 **思维误区**：以为 `ConvTranspose1d(kernel_size=4, stride=1, padding=1)` 和 `Conv1d` 是对称的，输出长度不变。实际上 ConvTranspose1d 的输出公式是 `(T-1)*stride - 2*padding + kernel_size`，stride=1, padding=1, kernel_size=4 → `T+1`。3 层后 T+3。

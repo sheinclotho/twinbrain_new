@@ -197,16 +197,23 @@ class SpatialTemporalGraphConv(MessagePassing):
         Update node features with aggregated messages.
         
         Args:
-            aggr_out: Aggregated messages [N, C_out]
-            x_self: Original node features [N, C_in]
+            aggr_out: Aggregated messages [N_dst, C_out]
+            x_self: Original node features [N_src, C_in]
             
         Returns:
-            Updated features [N, C_out]
+            Updated features [N_dst, C_out]
         """
-        # Add self-connection (residual-like)
-        self_out = self.lin_self(x_self)
+        # For cross-modal edges N_src != N_dst.  x_self comes from the SOURCE
+        # node tensor, so adding lin_self(x_self=[N_src, C_in]) to
+        # aggr_out=[N_dst, C_out] would broadcast the batch dimension and
+        # silently produce shape [N_src, C_out] instead of [N_dst, C_out].
+        # Skip the self-connection entirely for cross-modal edges; it is only
+        # meaningful for same-modal (intra-type) edges where N_src == N_dst.
+        if aggr_out.shape[0] != x_self.shape[0]:
+            return aggr_out
         
-        return aggr_out + self_out
+        # Same-modal edge: add self-connection (residual-like)
+        return aggr_out + self.lin_self(x_self)
 
 
 class TemporalAttention(nn.Module):

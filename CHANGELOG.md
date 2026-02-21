@@ -1,8 +1,22 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-21  
-**版本**：V5.5  
+**版本**：V5.6  
 **状态**：生产就绪
+
+---
+
+## [V5.6] 2026-02-21 — 修复跨模态边 N 维度广播导致的重建 shape 错误
+
+### 🔴 关键 Bug 修复
+
+#### 跨模态 ST-GCN update() 广播错误 → recon 节点数与 target 不符
+
+**问题**：`SpatialTemporalGraphConv.update(aggr_out, x_self)` 无条件执行 `aggr_out + lin_self(x_self)`。对于跨模态边（如 EEG→fMRI），`aggr_out` shape 为 `[N_dst=1, H]`（fMRI），而 `x_self` 仍是 `[N_src=63, H]`（EEG 源节点特征）。PyTorch 广播将 `[1,H]` 扩展为 `[63,H]`，导致后续所有层 fMRI 节点数从 1 变成 63。最终 `reconstructed['fmri']` 为 `[63, T, 1]`，而 `data['fmri'].x`（target）仍是 `[1, T, 1]`，触发警告：`Using a target size ([1, 190, 1]) that is different to the input size ([63, 190, 1])`。
+
+**修复**：在 `update()` 中添加一行检查：当 `aggr_out.shape[0] != x_self.shape[0]` 时（跨模态边），直接返回 `aggr_out`，跳过 self-connection。同模态边（N_src == N_dst）行为不变。
+
+**文件**：`models/graph_native_encoder.py`
 
 ---
 
