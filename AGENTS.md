@@ -104,6 +104,32 @@
 
 ---
 
+### [2026-02-21] log_weights 参与 backward 图导致梯度累积 + "backward 两次" 错误
+
+**症状**：训练时 `RuntimeError: Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed)`，触发点在 `graph_native_system.py` 的 `train_step` 调用 `self.scaler.scale(total_loss).backward()` 处。
+
+**根因**：`AdaptiveLossBalancer.forward()` 中计算权重时用了 `torch.exp(self.log_weights[name]).clamp(...)`，未 `.detach()`。这导致：
+1. `total_loss` 的计算图包含 `log_weights`（nn.Parameter），backward() 会为它们计算梯度。
+2. `log_weights` 不在 `optimizer` 中，`optimizer.zero_grad()` 不会清零它们的 `.grad`。
+3. 每次 backward 后 `log_weights.grad` 持续累积，不被重置。
+4. 同时，`update_weights()` 被调用时传入的是带 `grad_fn` 的 loss 张量（backward 已释放其计算图），若 PyTorch 内部尝试访问这些已释放的节点，即触发"backward 两次"错误。
+
+**思维误区**：看到 `nn.Parameter` 就以为"有梯度是正常的"。没有追问：**这个梯度会被使用吗？** `log_weights` 通过 `update_weights()` 手动更新（loss 幅值代理规则），完全不依赖 `.grad`。让它参与 backward 图只有负面效果：浪费显存、累积无用梯度、引发潜在的图释放错误。
+
+**正确思路**：对于**手动更新**的参数（不通过 optimizer），在 forward 中应使用 `.detach()` 将其从 backward 图中排除。同样，向 `update_weights()` 这类"只读 scalar"的后处理函数传入张量时，应先 `.detach()` 明确 post-backward 的使用语义。
+
+**解决**：
+1. `AdaptiveLossBalancer.forward()` 中：`weights = {name: torch.exp(self.log_weights[name]).detach().clamp(...)}` — 权重作为常数参与 loss 计算，不进入反向图。
+2. `GraphNativeTrainer.train_step()` 中：调用 `update_weights` 前先 `detached_losses = {k: v.detach() for k, v in losses.items()}`，明确表达 backward 已结束、只需读取 scalar 的意图。
+
+**影响文件**：
+- `models/adaptive_loss_balancer.py`
+- `models/graph_native_system.py`
+- `AGENTS.md`
+- `CHANGELOG.md`
+
+---
+
 ### [2026-02-21] Decoder 的 ConvTranspose1d 悄悄改变了时序长度
 
 **思维误区**：以为 `ConvTranspose1d(kernel_size=4, stride=1, padding=1)` 和 `Conv1d` 是对称的，输出长度不变。实际上 ConvTranspose1d 的输出公式是 `(T-1)*stride - 2*padding + kernel_size`，stride=1, padding=1, kernel_size=4 → `T+1`。3 层后 T+3。

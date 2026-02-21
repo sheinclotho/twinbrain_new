@@ -133,8 +133,15 @@ class AdaptiveLossBalancer(nn.Module):
             total_loss: Weighted sum of losses
             weight_dict: Current weights for logging
         """
-        # Get current weights
-        weights = {name: torch.exp(self.log_weights[name]).clamp(self.min_weight, self.max_weight) 
+        # Get current weights.
+        # Detach from the autograd graph: log_weights are updated via update_weights()
+        # (a manual, gradient-free rule) and are NOT part of the optimizer.  Including
+        # them in the backward graph would cause their .grad to accumulate across steps
+        # without ever being zeroed by optimizer.zero_grad(), which can trigger
+        # "Trying to backward through the graph a second time" in edge cases.
+        # Detaching treats the weight scalars as constants for THIS backward pass,
+        # which is exactly the intended semantics.
+        weights = {name: torch.exp(self.log_weights[name]).detach().clamp(self.min_weight, self.max_weight)
                    for name in self.task_names}
         
         # Set initial losses on first call (for normalization)
@@ -171,8 +178,8 @@ class AdaptiveLossBalancer(nn.Module):
         else:
             total_loss = weighted_losses
         
-        # Return weights for logging (detached)
-        weight_dict = {name: w.detach().item() for name, w in weights.items()}
+        # Return weights for logging (already detached above)
+        weight_dict = {name: w.item() for name, w in weights.items()}
         
         return total_loss, weight_dict
     
