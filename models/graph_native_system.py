@@ -321,6 +321,17 @@ class GraphNativeBrainModel(nn.Module):
                     recon = recon[:, :T_min, :]
                     target = target[:, :T_min, :]
                 
+                # Guard against N-mismatch: this signals the cross-modal encoder bug
+                # (propagate() called without size=(N_src, N_dst)).  Raise clearly
+                # rather than letting broadcasting silently corrupt gradients.
+                if recon.shape[0] != target.shape[0]:
+                    raise RuntimeError(
+                        f"Node count mismatch for '{node_type}': "
+                        f"recon has {recon.shape[0]} nodes but target has {target.shape[0]}. "
+                        f"This usually means propagate() was called without size=(N_src, N_dst) "
+                        f"for a cross-modal edge, causing N_src to bleed into N_dst."
+                    )
+                
                 # Choose loss function
                 if self.loss_type == 'huber':
                     recon_loss = F.huber_loss(recon, target, delta=1.0)
@@ -552,26 +563,54 @@ class GraphNativeTrainer:
         # Move data to device
         data = data.to(self.device)
         
-        # Apply EEG enhancement if enabled
+        # Apply EEG enhancement if enabled.
+        # IMPORTANT: Save original eeg_x and restore it in a finally block.
+        # eeg_x_enhanced is part of the current computation graph (requires_grad=True).
+        # If we leave data['eeg'].x pointing to it, the next epoch's forward pass
+        # will build a new graph ON TOP of last epoch's freed graph, triggering:
+        # "Trying to backward through the graph a second time".
+        # Using try-finally guarantees restoration even if an exception is raised
+        # anywhere inside the forward/backward path.
+        original_eeg_x = None
         if self.use_eeg_enhancement and 'eeg' in data.node_types:
-            eeg_x = data['eeg'].x
-            eeg_x_enhanced, eeg_info = self.eeg_handler(eeg_x, training=True)
+            original_eeg_x = data['eeg'].x
+            eeg_x_enhanced, eeg_info = self.eeg_handler(original_eeg_x, training=True)
             data['eeg'].x = eeg_x_enhanced
         
-        # Forward and backward pass with optional mixed precision
-        if self.use_amp:
-            # Use appropriate autocast context manager based on API version
-            if USE_NEW_AMP_API:
-                # New API: torch.amp.autocast() requires device_type
-                amp_context = autocast(device_type=self.device_type)
+        try:
+            # Forward and backward pass with optional mixed precision
+            if self.use_amp:
+                # Use appropriate autocast context manager based on API version
+                if USE_NEW_AMP_API:
+                    # New API: torch.amp.autocast() requires device_type
+                    amp_context = autocast(device_type=self.device_type)
+                else:
+                    # Old API: torch.cuda.amp.autocast() doesn't require device_type
+                    amp_context = autocast()
+                
+                with amp_context:
+                    # Forward pass: skip prediction during training — the predictor
+                    # operates in latent space and has no training loss (see compute_loss).
+                    # This also saves the compute of running the full prediction head.
+                    reconstructed, _ = self.model(data, return_prediction=False)
+                    
+                    # Compute losses
+                    losses = self.model.compute_loss(data, reconstructed, None)
+                    
+                    # Adaptive loss balancing
+                    if self.use_adaptive_loss:
+                        total_loss, weights = self.loss_balancer(losses)
+                    else:
+                        total_loss = sum(losses.values())
+                
+                # Backward pass with gradient scaling
+                self.scaler.scale(total_loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
             else:
-                # Old API: torch.cuda.amp.autocast() doesn't require device_type
-                amp_context = autocast()
-            
-            with amp_context:
-                # Forward pass: skip prediction during training — the predictor
-                # operates in latent space and has no training loss (see compute_loss).
-                # This also saves the compute of running the full prediction head.
+                # Standard training without AMP
                 reconstructed, _ = self.model(data, return_prediction=False)
                 
                 # Compute losses
@@ -582,45 +621,33 @@ class GraphNativeTrainer:
                     total_loss, weights = self.loss_balancer(losses)
                 else:
                     total_loss = sum(losses.values())
+                
+                # Backward pass
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
             
-            # Backward pass with gradient scaling
-            self.scaler.scale(total_loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            # Standard training without AMP
-            reconstructed, _ = self.model(data, return_prediction=False)
-            
-            # Compute losses
-            losses = self.model.compute_loss(data, reconstructed, None)
-            
-            # Adaptive loss balancing
+            # Update loss balancer with detached scalar values.
+            # backward() has already freed the computation graph by this point;
+            # update_weights() uses .item() internally, so passing detached losses
+            # makes the post-backward contract explicit and avoids any accidental
+            # graph access that would raise "backward through the graph a second time".
             if self.use_adaptive_loss:
-                total_loss, weights = self.loss_balancer(losses)
-            else:
-                total_loss = sum(losses.values())
+                detached_losses = {k: v.detach() for k, v in losses.items()}
+                self.loss_balancer.update_weights(detached_losses, self.model)
             
-            # Backward pass
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            # Return loss values
+            loss_dict = {k: v.item() for k, v in losses.items()}
+            loss_dict['total'] = total_loss.item()
+            
+            return loss_dict
         
-        # Update loss balancer with detached scalar values.
-        # backward() has already freed the computation graph by this point;
-        # update_weights() uses .item() internally, so passing detached losses
-        # makes the post-backward contract explicit and avoids any accidental
-        # graph access that would raise "backward through the graph a second time".
-        if self.use_adaptive_loss:
-            detached_losses = {k: v.detach() for k, v in losses.items()}
-            self.loss_balancer.update_weights(detached_losses, self.model)
-        
-        # Return loss values
-        loss_dict = {k: v.item() for k, v in losses.items()}
-        loss_dict['total'] = total_loss.item()
-        
-        return loss_dict
+        finally:
+            # Always restore original EEG data so subsequent epochs start from the
+            # raw (detached) tensor rather than this step's enhanced (grad-bearing)
+            # tensor — regardless of whether an exception was raised.
+            if original_eeg_x is not None:
+                data['eeg'].x = original_eeg_x
     
     def train_epoch(self, data_list: List[HeteroData], epoch: int = None, total_epochs: int = None) -> float:
         """

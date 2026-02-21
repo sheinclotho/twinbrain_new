@@ -164,6 +164,39 @@
 
 ---
 
+### [2026-02-21] propagate() 未传 size 导致跨模态 N 不匹配（第 5 次复现）
+
+**症状**：`UserWarning: Using a target size (torch.Size([1, 190, 1])) that is different to the input size (torch.Size([63, 190, 1]))` 在 `compute_loss` 的 `F.huber_loss` 处。`reconstructed['fmri']` 有 63 个节点，而 target 只有 1 个节点。
+
+**根因**：`SpatialTemporalGraphConv.forward()` 调用 `self.propagate(edge_index, x=x_t_slice, ...)` 时**没有传 `size=(N_src, N_dst)`**。PyG 默认 `size=(N_src, N_src)`，对 EEG→fMRI 跨模态边（N_src=63, N_dst=1）会产生 `aggr_out=[63, H]` 而非 `[1, H]`。既有的 `update()` 守卫（`aggr_out.shape[0] != x_self.shape[0]`）**永远不会触发**，因为两个张量都错误地显示 N=63。
+
+**思维误区**：看到 `update()` 里已经有 N 不匹配守卫，就以为问题已修复。没有追问：*这个守卫能被触发吗？* 守卫触发的前提是 `aggr_out` 已经有正确的 N_dst——而这依赖于 `propagate()` 拿到正确的 size，这才是真正的入口。**修复卫兵的前提条件，而不只是卫兵本身。**
+
+**解决**：
+1. `SpatialTemporalGraphConv.forward()` 新增 `size: Optional[Tuple[int, int]] = None` 参数，并将其传给两条路径（普通 / gradient checkpoint）里的 `propagate()`。
+2. `GraphNativeEncoder.forward()` 在调用 `conv(x_src, ...)` 时传入 `size=(x_src.shape[0], x.shape[0])`，其中 `x` 是目标节点的当前特征张量（N_dst 由此推导）。
+3. `compute_loss()` 在 `F.huber_loss` 之前新增 N 轴不匹配的 `RuntimeError`，防止 broadcasting 静默掩盖问题、引发后续迷惑性报错。
+
+**影响文件**：`models/graph_native_encoder.py`、`models/graph_native_system.py`、`AGENTS.md`
+
+---
+
+### [2026-02-21] EEG enhancement 原地修改 data 导致跨 epoch "backward through graph" 错误
+
+**症状**：Epoch 1 训练正常完成，Epoch 2 第一步 `scaler.scale(total_loss).backward()` 抛出 `RuntimeError: Trying to backward through the graph a second time`。
+
+**根因**：`train_step()` 做了 `data['eeg'].x = eeg_x_enhanced`，**永久改写了 `data_list` 里的原始数据对象**。`eeg_x_enhanced` 是 EEG handler 的输出（`requires_grad=True`，有 `grad_fn`）。Epoch 1 的 `backward()` 释放了计算图的 saved tensors，但 `data['eeg'].x` 仍指向那个 `grad_fn` 已被释放的张量。Epoch 2 的 `eeg_handler(data['eeg'].x)` 在这个已释放的图上构建新图，再调用 `backward()` 时访问已释放的 saved tensors → 报错。
+
+**思维误区**：以为 `data.to(self.device)` 会重新创建张量，从而切断上一步的图。实际上 `.to()` 对已在目标设备的张量是 no-op，并不会切断梯度链。**对 `data_list` 里的对象做原地修改，就是在 epochs 之间共享可变状态——这是典型的隐式状态依赖陷阱。**
+
+**正确思路**：凡是"将计算图中的输出写回共享数据结构"的操作，都要问：*这个数据结构会被下一次迭代复用吗？* 如果是，必须在本次迭代结束前恢复到原始（detached）值，或者不修改原始对象。
+
+**解决**：`train_step()` 用 `try-finally` 块保证 `data['eeg'].x` 在步骤结束后（无论是否抛出异常）恢复为保存的 `original_eeg_x`，使每个 epoch 都从原始未增强的张量开始。
+
+**影响文件**：`models/graph_native_system.py`、`AGENTS.md`
+
+---
+
 ## 四、文档格式规范（必须遵守）
 
 **项目永远只保留以下四个 MD 文件，不得新增，不得删除，每次修改后同步更新：**
