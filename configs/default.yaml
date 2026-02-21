@@ -180,6 +180,8 @@ device:
   # Use mixed precision (AMP)
   use_amp: True
   
-  # Use torch.compile() for 20-40% speedup (PyTorch 2.0+)
-  use_torch_compile: True
+  # Use torch.compile() for 20-40% speedup (PyTorch 2.0+, Linux/macOS only).
+  # Requires Triton which is NOT available on Windows. Set to True only if you
+  # have confirmed that `import triton` succeeds in your environment.
+  use_torch_compile: False
   compile_mode: "reduce-overhead"  # Options: default, reduce-overhead, max-autotune

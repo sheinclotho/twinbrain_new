@@ -398,17 +398,35 @@ class GraphNativeTrainer:
             self.model = self.model.to('cpu')
         
         # torch.compile() for PyTorch 2.0+ (20-40% speedup)
+        # NOTE: torch.compile() uses the 'inductor' backend which requires Triton.
+        # Triton is unavailable on Windows and some other platforms. The compilation
+        # is *lazy* – torch.compile() itself doesn't raise; the crash happens at the
+        # first forward pass. We therefore probe Triton availability upfront and skip
+        # compilation gracefully rather than relying on the try/except below.
         if use_torch_compile and hasattr(torch, 'compile'):
-            logger.info(f"Enabling torch.compile() with mode={compile_mode}")
+            _triton_ok = False
             try:
-                self.model = torch.compile(
-                    self.model,
-                    mode=compile_mode,
-                    fullgraph=False  # Allow graph breaks for flexibility
+                import triton  # noqa: F401
+                _triton_ok = True
+            except ImportError:
+                pass
+
+            if not _triton_ok:
+                logger.warning(
+                    "torch.compile() skipped: Triton is not installed or not supported "
+                    "on this platform (e.g. Windows). Running in eager mode."
                 )
-                logger.info("torch.compile() enabled successfully")
-            except Exception as e:
-                logger.warning(f"torch.compile() failed, continuing without it: {e}")
+            else:
+                logger.info(f"Enabling torch.compile() with mode={compile_mode}")
+                try:
+                    self.model = torch.compile(
+                        self.model,
+                        mode=compile_mode,
+                        fullgraph=False  # Allow graph breaks for flexibility
+                    )
+                    logger.info("torch.compile() enabled successfully")
+                except Exception as e:
+                    logger.warning(f"torch.compile() failed, continuing without it: {e}")
         elif use_torch_compile:
             logger.warning("torch.compile() requested but not available (requires PyTorch >= 2.0)")
         
