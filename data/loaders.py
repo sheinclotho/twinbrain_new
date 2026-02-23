@@ -5,6 +5,7 @@
 负责加载和预处理EEG和fMRI数据
 """
 
+import re
 import numpy as np
 import torch
 from pathlib import Path
@@ -172,34 +173,68 @@ class BrainDataLoader:
             logger.error(f"加载fMRI失败 {subject_id}: {e}")
             return None
     
+    def _discover_tasks(self, subject_id: str) -> List[Optional[str]]:
+        """自动发现该被试下所有可用的 BIDS 任务名。
+
+        在 EEG (.set) 和 fMRI (bold.nii*) 文件名中查找 ``task-<name>`` 标记，
+        返回去重排序后的任务名列表。若未发现任何任务标记，则返回 ``[None]``，
+        表示不过滤任务（加载首个匹配文件）。
+        """
+        tasks: set = set()
+        patterns: List[str] = []
+        if 'eeg' in self.modalities:
+            patterns.append(f"{subject_id}*task-*eeg.set")
+        if 'fmri' in self.modalities:
+            patterns.append(f"{subject_id}*task-*bold.nii*")
+        for pat in patterns:
+            for f in self.data_root.glob(f"**/{pat}"):
+                m = re.search(r'task-([^_]+)', f.name)
+                if m:
+                    tasks.add(m.group(1))
+        return sorted(tasks) if tasks else [None]
+
     def load_all_subjects(
         self,
-        task: Optional[str] = None,
+        tasks: Optional[List[str]] = None,
         max_subjects: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        加载所有被试数据
-        
+        """加载所有被试数据，每个被试可跨多个任务加载。
+
         Args:
-            task: 任务名称
-            max_subjects: 最大被试数
-            
+            tasks: 要加载的任务名列表，例如 ``["rest", "wm"]``。
+                   ``None``（默认）表示自动发现该被试下所有可用任务；
+                   ``[]`` 表示不过滤任务（直接加载首个匹配文件）。
+            max_subjects: 最大被试数（``0`` 或 ``None`` 表示不限制）。
+
         Returns:
-            被试数据列表
+            被试-任务数据列表，每项字典由 ``load_subject()`` 填充（含
+            ``subject_id`` 字段），本方法额外追加 ``task`` 字段。
         """
-        # 查找所有被试
+        # 查找所有被试目录
         subject_dirs = sorted(self.data_root.glob("sub-*"))
-        
+
         if max_subjects:
             subject_dirs = subject_dirs[:max_subjects]
-        
+
         all_data = []
         for subject_dir in subject_dirs:
             subject_id = subject_dir.name
-            data = self.load_subject(subject_id, task)
-            
-            if data:
-                all_data.append(data)
-        
-        logger.info(f"成功加载 {len(all_data)} 个被试")
+
+            # 确定本被试要加载的任务列表
+            if tasks is None:
+                # 自动发现：扫描该被试的文件名
+                subject_tasks: List[Optional[str]] = self._discover_tasks(subject_id)
+            elif len(tasks) == 0:
+                # 空列表 = 不过滤任务
+                subject_tasks = [None]
+            else:
+                subject_tasks = list(tasks)
+
+            for t in subject_tasks:
+                data = self.load_subject(subject_id, t)
+                if data:
+                    data['task'] = t  # 记录来自哪个任务
+                    all_data.append(data)
+
+        logger.info(f"成功加载 {len(all_data)} 个被试-任务组合")
         return all_data

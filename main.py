@@ -12,6 +12,8 @@ TwinBrain V5 主程序
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import sys
@@ -69,18 +71,57 @@ def prepare_data(config: dict, logger: logging.Logger):
         modalities=config['data']['modalities'],
     )
     
-    # 加载所有被试
+    # 解析任务列表配置
+    # 优先使用 tasks（列表），兼容旧版 task（单字符串）
+    tasks = config['data'].get('tasks')
+    if tasks is None:
+        legacy_task = config['data'].get('task')
+        if legacy_task is not None:
+            tasks = [legacy_task]
+            logger.info(
+                f"使用旧版 'task: {legacy_task}' 配置。"
+                f" 建议迁移到 'tasks: [{legacy_task}]'。"
+            )
+        # tasks 仍为 None → 自动发现所有任务
+    elif isinstance(tasks, str):
+        tasks = [tasks]
+
+    if tasks is None:
+        logger.info("tasks: null → 自动发现每个被试的所有任务")
+    else:
+        logger.info(f"将加载以下任务: {tasks}")
+    
+    # 加载所有被试（可跨多任务）
     all_data = data_loader.load_all_subjects(
-        task=config['data'].get('task'),
+        tasks=tasks,
         max_subjects=config['data'].get('max_subjects'),
     )
     
     if not all_data:
         raise ValueError("未加载到任何数据，请检查数据路径配置")
     
-    logger.info(f"成功加载 {len(all_data)} 个被试数据")
+    logger.info(f"成功加载 {len(all_data)} 个被试-任务组合")
     
     return all_data
+
+
+def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
+    """为图缓存生成稳定的文件名。
+
+    文件名内嵌图相关配置参数的 MD5 短哈希（8位），修改 atlas、图拓扑参数或
+    max_seq_len 后，旧缓存文件名将不再匹配，系统自动重建。
+    """
+    relevant = {
+        'graph': config.get('graph', {}),
+        'atlas': config['data'].get('atlas', {}),
+        'max_seq_len': config['training'].get('max_seq_len'),
+        'modalities': sorted(config['data'].get('modalities', [])),
+    }
+    params_hash = hashlib.md5(
+        json.dumps(relevant, sort_keys=True).encode()
+    ).hexdigest()[:8]
+    task_str = task if task else 'notask'
+    return f"{subject_id}_{task_str}_{params_hash}.pt"
 
 
 def build_graphs(all_data, config: dict, logger: logging.Logger):
@@ -194,12 +235,43 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             f"Atlas file not found at {atlas_file}; fMRI will use single-node fallback."
         )
     
+    # ── 图缓存设置 ──────────────────────────────────────────────
+    cache_cfg = config['data'].get('cache', {})
+    cache_enabled = cache_cfg.get('enabled', False)
+    cache_dir: Optional[Path] = None
+    if cache_enabled:
+        cache_dir = Path(cache_cfg.get('dir', 'outputs/graph_cache'))
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"图缓存已启用: {cache_dir}")
+        except OSError as e:
+            logger.warning(f"无法创建缓存目录 {cache_dir}: {e}，缓存已禁用")
+            cache_dir = None
+
     # 为每个被试构建图
     max_seq_len = config['training'].get('max_seq_len', None)
     if max_seq_len is not None:
         logger.info(f"Sequence truncation enabled: max_seq_len={max_seq_len} (prevents CUDA OOM)")
     graphs = []
+    n_cached = 0
     for subject_data in all_data:
+        subject_id = subject_data.get('subject_id', 'unknown')
+        task = subject_data.get('task')
+
+        # ── 尝试从缓存加载 ──────────────────────────────────────
+        if cache_dir is not None:
+            cache_key = _graph_cache_key(subject_id, task, config)
+            cache_path = cache_dir / cache_key
+            if cache_path.exists():
+                try:
+                    graph = torch.load(cache_path, map_location='cpu', weights_only=False)
+                    graphs.append(graph)
+                    n_cached += 1
+                    logger.debug(f"从缓存加载图: {cache_key}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"缓存加载失败 ({cache_key}): {e}，重新构建")
+
         graph_list = []
         
         # fMRI图
@@ -266,39 +338,52 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         if len(graph_list) > 0:
             if len(graph_list) == 1:
                 # Single modality: use as-is
-                graphs.append(graph_list[0][1])
+                built_graph = graph_list[0][1]
             else:
                 # Multi-modal: merge into heterograph
-                merged_graph = HeteroData()
+                built_graph = HeteroData()
                 for modality, graph in graph_list:
                     # Copy node features and structure
                     for key in graph.node_types:
-                        merged_graph[key].x = graph[key].x
+                        built_graph[key].x = graph[key].x
                         if hasattr(graph[key], 'num_nodes'):
-                            merged_graph[key].num_nodes = graph[key].num_nodes
+                            built_graph[key].num_nodes = graph[key].num_nodes
                         if hasattr(graph[key], 'pos'):
-                            merged_graph[key].pos = graph[key].pos
+                            built_graph[key].pos = graph[key].pos
                     
                     # Copy edge structure
                     for edge_type in graph.edge_types:
-                        merged_graph[edge_type].edge_index = graph[edge_type].edge_index
+                        built_graph[edge_type].edge_index = graph[edge_type].edge_index
                         if hasattr(graph[edge_type], 'edge_attr'):
-                            merged_graph[edge_type].edge_attr = graph[edge_type].edge_attr
+                            built_graph[edge_type].edge_attr = graph[edge_type].edge_attr
                 
                 # 跨模态边：EEG → fMRI
                 # 设计理念：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。
                 # create_simple_cross_modal_edges 会验证 N_eeg < N_fmri 并在违反时给出警告。
-                if 'fmri' in merged_graph.node_types and 'eeg' in merged_graph.node_types:
-                    cross_edges = mapper.create_simple_cross_modal_edges(merged_graph)
+                if 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
+                    cross_edges = mapper.create_simple_cross_modal_edges(built_graph)
                     if cross_edges is not None:
-                        merged_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
-                
-                graphs.append(merged_graph)
+                        built_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
+            
+            graphs.append(built_graph)
+
+            # ── 保存到缓存 ──────────────────────────────────────
+            if cache_dir is not None:
+                try:
+                    cache_key = _graph_cache_key(subject_id, task, config)
+                    cache_path = cache_dir / cache_key
+                    torch.save(built_graph, cache_path)
+                    logger.debug(f"图已缓存: {cache_key}")
+                except Exception as e:
+                    logger.warning(f"缓存保存失败 ({subject_id}/{task}): {e}")
     
     if len(graphs) == 0:
         raise ValueError("No valid graphs constructed. Check data quality and preprocessing.")
     
-    logger.info(f"成功构建 {len(graphs)} 个图")
+    if n_cached > 0:
+        logger.info(f"图构建完成: {len(graphs)} 个图 (其中 {n_cached} 个来自缓存，{len(graphs) - n_cached} 个新建)")
+    else:
+        logger.info(f"成功构建 {len(graphs)} 个图")
     
     return graphs, mapper
 

@@ -1,8 +1,57 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-21  
-**版本**：V5.6  
+**最后更新**：2026-02-23  
+**版本**：V5.7  
 **状态**：生产就绪
+
+---
+
+## [V5.7] 2026-02-23 — 多任务加载 + 图缓存
+
+### ✨ 新功能
+
+#### 多任务 / 多样本加载（`data/loaders.py`、`main.py`）
+
+**背景**：此前每个被试只加载一条数据（对应一个任务），多个被试直接混入训练会导致样本量少、无法捕捉被试内跨任务变化。
+
+**改进**：
+- `BrainDataLoader` 新增 `_discover_tasks(subject_id)` 方法，自动扫描 BIDS 文件名中的 `task-<name>` 标记，返回该被试下所有可用任务列表。
+- `load_all_subjects(tasks=None)` 参数由单任务字符串改为任务列表：  
+  - `None`（默认）→ 自动发现该被试所有任务；  
+  - `["rest", "wm"]` → 仅加载指定任务；  
+  - `[]` → 不过滤（加载首个匹配文件，与旧行为一致）。
+- 每个 `(被试, 任务)` 组合生成一个独立图样本，可显著增加训练数据量并捕捉跨任务脑动态。
+- 每条数据字典新增 `task` 字段，贯穿到图缓存键。
+
+**配置**（`configs/default.yaml`）：
+```yaml
+data:
+  tasks: null   # null=自动发现; []=不过滤; ["rest","wm"]=指定
+  task: null    # 旧版兼容，tasks 未设置时作为回退
+```
+
+#### 图缓存（`main.py`、`configs/default.yaml`）
+
+**背景**：每次训练都重新预处理 EEG/fMRI 并构建异质图，单被试数分钟、多被试数十分钟。
+
+**改进**：
+- `build_graphs()` 在图构建完成后自动将每个图保存为 `.pt` 文件（`torch.save`）。
+- 再次运行时，检查缓存文件是否存在并直接 `torch.load`，跳过所有预处理和图构建步骤。
+- **缓存键** = `{subject_id}_{task}_{config_hash}.pt`，其中 `config_hash` 是图参数（atlas、k近邻、阈值、max_seq_len 等）的 MD5 短哈希，修改这些参数后旧缓存自动失效并重建。
+- 缓存目录默认为 `outputs/graph_cache`，通过 `data.cache.dir` 配置，`.pt` 文件与可视化模块读取格式一致。
+
+**配置**：
+```yaml
+data:
+  cache:
+    enabled: true
+    dir: "outputs/graph_cache"
+```
+
+### 🔧 兼容性
+
+- 旧配置中的 `data.task` 字段仍然生效（自动升级为单元素列表并打印弃用提示）。
+- 缓存目录不可访问时自动降级为不缓存，不影响正常运行。
 
 ---
 

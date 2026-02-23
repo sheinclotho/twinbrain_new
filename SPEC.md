@@ -1,7 +1,7 @@
 # TwinBrain V5 — 项目规范说明
 
 > **受众**：另一个 AI Agent，目标是能够大体复现本项目。  
-> **版本**：V5.0 | **状态**：生产就绪 | **更新**：2026-02-20
+> **版本**：V5.7 | **状态**：生产就绪 | **更新**：2026-02-23
 
 ---
 
@@ -27,6 +27,8 @@
 原始数据 (BIDS格式)
     ↓
 BrainDataLoader (data/loaders.py)          — 统一加载 EEG/fMRI
+    | _discover_tasks()                    — 自动发现每个被试的所有任务
+    | load_all_subjects(tasks=None)        — 多任务加载，每(被试,任务)→一个样本
     ↓
 EEG预处理 / fMRI预处理                       — 滤波、配准、标准化
     ↓
@@ -38,6 +40,8 @@ GraphNativeBrainMapper (graph_native_mapper.py)
          ├── eeg  节点: [N_eeg,  T, 1]
          └── 边: fmri↔fmri, eeg↔eeg, fmri↔eeg
     ↓
+图缓存 (main.py _graph_cache_key)          — 保存/加载 .pt 文件，跳过重复预处理
+    ↓
 GraphNativeBrainModel (graph_native_system.py)
     ├── GraphNativeEncoder                  — ST-GCN 时空编码
     ├── GraphNativeDecoder                  — 信号重建
@@ -46,7 +50,22 @@ GraphNativeBrainModel (graph_native_system.py)
 GraphNativeTrainer                         — 训练循环 + 优化
 ```
 
-### 2.2 核心模型组件
+### 2.2 训练样本设计
+
+每个 **(被试, 任务)** 组合 → 一个图样本 → 加入训练列表。
+
+- 多被试混训：捕捉跨被试的群体级脑结构共性（population-level patterns）。
+- 多任务（静息 + 工作记忆等）：捕捉被试内跨认知状态的脑动态变化。
+- 样本 = 一张 `HeteroData` 异质图，包含该被试在该任务下的完整 EEG + fMRI 节点特征。
+
+### 2.3 图缓存
+
+图构建完成后自动保存为 `.pt` 文件：
+- **路径**：`{cache_dir}/{subject_id}_{task}_{config_hash}.pt`
+- **config_hash**：atlas、图参数（k近邻、阈值等）、max_seq_len 的 MD5 短哈希；参数变更时自动失效。
+- **好处**：再次运行时直接加载，跳过预处理和图构建，节省数分钟到数十分钟。
+
+### 2.4 核心模型组件
 
 #### GraphNativeEncoder (`models/graph_native_encoder.py`)
 ```

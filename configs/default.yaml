@@ -9,10 +9,14 @@ data:
   # 要处理的模态
   modalities: ["eeg", "fmri"]
   
-  # 任务名称 (可选, 留空则处理所有)
+  # 任务名称列表 (null = 自动发现每个被试下所有任务; [] = 不过滤; ["rest","wm"] = 指定任务)
+  # 每个 (被试, 任务) 组合生成一个图样本，多任务可显著增加训练数据量。
+  tasks: null
+
+  # task: (已弃用，请改用 tasks) 单任务名称；若 tasks 未设置则作为回退。
   task: null
-  
-  # 最大被试数 (用于测试, null表示处理所有)
+
+  # 最大被试数 (用于测试, 0 或 null 表示处理所有)
   max_subjects: 0
   
   # Atlas配置
@@ -20,6 +24,14 @@ data:
     name: "schaefer200"
     file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
     label_file: "atlases/schaefer200_mask_ready.json"
+
+  # 图缓存配置
+  # 每个 (被试, 任务) 的异质图构建完成后自动保存为 .pt 文件。
+  # 再次运行时直接加载，无需重新预处理，节省数分钟到数十分钟。
+  # 缓存文件名包含配置哈希，修改图参数后自动失效并重建。
+  cache:
+    enabled: true
+    dir: "outputs/graph_cache"
 
 # Model configuration
 model:
