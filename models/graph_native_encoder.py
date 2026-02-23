@@ -146,15 +146,29 @@ class SpatialTemporalGraphConv(MessagePassing):
                 # closure — compatible with gradient_checkpoint's non-tensor
                 # argument handling under use_reentrant=False.
                 def _propagate(xt_s, xo_s, ei, ea):
-                    return self.propagate(ei, x=xt_s, x_self=xo_s, edge_attr=ea, size=size)
+                    # For bipartite (cross-modal) edges where N_src != N_dst,
+                    # PyG requires x to be a (x_src, x_dst) tuple so it can
+                    # validate each tensor's size independently.  Provide a
+                    # zero-filled destination placeholder; att_dst is inactive
+                    # for cross-modal (source-only attention applies).
+                    if size is not None and size[0] != size[1]:
+                        x_in = (xt_s, xt_s.new_zeros(size[1], xt_s.shape[-1]))
+                    else:
+                        x_in = xt_s
+                    return self.propagate(ei, x=x_in, x_self=xo_s, edge_attr=ea, size=size)
                 out_t = gradient_checkpoint(
                     _propagate, x_t_slice, x_orig_slice, edge_index, edge_attr,
                     use_reentrant=False,
                 )
             else:
+                # Same bipartite-tuple fix for the non-checkpoint path.
+                if size is not None and size[0] != size[1]:
+                    x_in = (x_t_slice, x_t_slice.new_zeros(size[1], x_t_slice.shape[-1]))
+                else:
+                    x_in = x_t_slice
                 out_t = self.propagate(
                     edge_index,
-                    x=x_t_slice,
+                    x=x_in,
                     x_self=x_orig_slice,
                     edge_attr=edge_attr,
                     size=size,
