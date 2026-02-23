@@ -164,6 +164,53 @@
 
 ---
 
+### [2026-02-21] propagate() 未传 size 导致跨模态 N 不匹配（第 5 次复现）
+
+**症状**：`UserWarning: Using a target size (torch.Size([1, 190, 1])) that is different to the input size (torch.Size([63, 190, 1]))` 在 `compute_loss` 的 `F.huber_loss` 处。`reconstructed['fmri']` 有 63 个节点，而 target 只有 1 个节点。
+
+**根因**：`SpatialTemporalGraphConv.forward()` 调用 `self.propagate(edge_index, x=x_t_slice, ...)` 时**没有传 `size=(N_src, N_dst)`**。PyG 默认 `size=(N_src, N_src)`，对 EEG→fMRI 跨模态边（N_src=63, N_dst=1）会产生 `aggr_out=[63, H]` 而非 `[1, H]`。既有的 `update()` 守卫（`aggr_out.shape[0] != x_self.shape[0]`）**永远不会触发**，因为两个张量都错误地显示 N=63。
+
+**思维误区**：看到 `update()` 里已经有 N 不匹配守卫，就以为问题已修复。没有追问：*这个守卫能被触发吗？* 守卫触发的前提是 `aggr_out` 已经有正确的 N_dst——而这依赖于 `propagate()` 拿到正确的 size，这才是真正的入口。**修复卫兵的前提条件，而不只是卫兵本身。**
+
+**解决**：
+1. `SpatialTemporalGraphConv.forward()` 新增 `size: Optional[Tuple[int, int]] = None` 参数，并将其传给两条路径（普通 / gradient checkpoint）里的 `propagate()`。
+2. `GraphNativeEncoder.forward()` 在调用 `conv(x_src, ...)` 时传入 `size=(x_src.shape[0], x.shape[0])`，其中 `x` 是目标节点的当前特征张量（N_dst 由此推导）。
+3. `compute_loss()` 在 `F.huber_loss` 之前新增 N 轴不匹配的 `RuntimeError`，防止 broadcasting 静默掩盖问题、引发后续迷惑性报错。
+
+**影响文件**：`models/graph_native_encoder.py`、`models/graph_native_system.py`、`AGENTS.md`
+
+---
+
+### [2026-02-21] EEG enhancement 原地修改 data 导致跨 epoch "backward through graph" 错误
+
+**症状**：Epoch 1 训练正常完成，Epoch 2 第一步 `scaler.scale(total_loss).backward()` 抛出 `RuntimeError: Trying to backward through the graph a second time`。
+
+**根因**：`train_step()` 做了 `data['eeg'].x = eeg_x_enhanced`，**永久改写了 `data_list` 里的原始数据对象**。`eeg_x_enhanced` 是 EEG handler 的输出（`requires_grad=True`，有 `grad_fn`）。Epoch 1 的 `backward()` 释放了计算图的 saved tensors，但 `data['eeg'].x` 仍指向那个 `grad_fn` 已被释放的张量。Epoch 2 的 `eeg_handler(data['eeg'].x)` 在这个已释放的图上构建新图，再调用 `backward()` 时访问已释放的 saved tensors → 报错。
+
+**思维误区**：以为 `data.to(self.device)` 会重新创建张量，从而切断上一步的图。实际上 `.to()` 对已在目标设备的张量是 no-op，并不会切断梯度链。**对 `data_list` 里的对象做原地修改，就是在 epochs 之间共享可变状态——这是典型的隐式状态依赖陷阱。**
+
+**正确思路**：凡是"将计算图中的输出写回共享数据结构"的操作，都要问：*这个数据结构会被下一次迭代复用吗？* 如果是，必须在本次迭代结束前恢复到原始（detached）值，或者不修改原始对象。
+
+**解决**：`train_step()` 用 `try-finally` 块保证 `data['eeg'].x` 在步骤结束后（无论是否抛出异常）恢复为保存的 `original_eeg_x`，使每个 epoch 都从原始未增强的张量开始。
+
+**影响文件**：`models/graph_native_system.py`、`AGENTS.md`
+
+---
+
+### [2026-02-23] 硬编码顺序假设破坏 EEG→fMRI 设计意图
+
+**思维误区**：`create_model` 写了 `edge_types.append((node_types[0], 'projects_to', node_types[1]))`，以为 EEG 一定是 `node_types[0]`。实际上如果 `config['data']['modalities']` 写为 `["fmri", "eeg"]`，就会建立 `('fmri', 'projects_to', 'eeg')` 跨模态边，完全颠倒了方向。
+
+**正确思路**：凡是有方向性的设计意图（"A→B"），不应依赖参数的位置顺序，而应用**明确的模态名**来确定方向。问自己：*"如果用户改变了列表顺序，逻辑链会断吗？"*
+
+**解决**：
+1. `create_model` 改为：若 `'eeg' in node_types and 'fmri' in node_types`，显式添加 `('eeg', 'projects_to', 'fmri')`；其他模态组合使用通用回退。
+2. `build_graphs` 中的 `merged_graph['eeg', 'projects_to', 'fmri']` 已是显式，无需改动。
+
+**影响文件**：`main.py`、`AGENTS.md`
+
+---
+
 ## 四、文档格式规范（必须遵守）
 
 **项目永远只保留以下四个 MD 文件，不得新增，不得删除，每次修改后同步更新：**
@@ -186,3 +233,41 @@
 **核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡。
 
 **当前状态**：V5，生产就绪（MemoryError 已修复）。详见 `SPEC.md`。
+
+---
+
+## 六、EEG→fMRI 设计理念与逻辑链（必读，每次编码前确认）
+
+> **核心原则**：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。N_eeg < N_fmri 是整个跨模态设计的前提。
+
+### 数据形状全链路
+
+| 阶段 | EEG | fMRI |
+|------|-----|------|
+| 原始数据 | `[N_ch, N_times]` (e.g. 63×75000) | `[X, Y, Z, T]` (e.g. 64×64×40×190) |
+| 图节点特征 | `[N_eeg, T_eeg, 1]` (e.g. 63×300×1 截断后) | `[N_fmri, T_fmri, 1]` (e.g. 200×190×1，Schaefer200 atlas) |
+| 编码器输入投影 | `[N_eeg, T_eeg, H]` | `[N_fmri, T_fmri, H]` |
+| ST-GCN 跨模态消息 | 源：`[N_eeg, T_eeg, H]` → propagate(size=(N_eeg, N_fmri)) → `[N_fmri, T_eeg, H]` → interpolate → `[N_fmri, T_fmri, H]` | 目标 |
+| 编码器输出 | `[N_eeg, T_eeg, H]` | `[N_fmri, T_fmri, H]` |
+| 解码器输出 | `[N_eeg, T_eeg, 1]` | `[N_fmri, T_fmri, 1]` |
+| 损失函数目标 | `data['eeg'].x = [N_eeg, T_eeg, 1]` | `data['fmri'].x = [N_fmri, T_fmri, 1]` |
+
+### 跨模态边逻辑
+
+- **方向**：`('eeg', 'projects_to', 'fmri')` — EEG 为 source，fMRI 为 destination
+- **edge_index[0]**：EEG 节点索引（0..N_eeg-1）
+- **edge_index[1]**：fMRI 节点索引（0..N_fmri-1）
+- **当前映射策略**：随机连接（`connection_ratio=0.1`），适合无坐标配准场景
+- **理想映射策略**：EEG 电极坐标（head space mm）→ 最近 fMRI ROI 质心（MNI mm）；需要 EEG-fMRI 坐标配准（coregistration）方可使用
+
+### 关键不变量（违反即 bug）
+
+1. `N_eeg < N_fmri`（EEG 节点 < fMRI 节点）
+2. 跨模态边类型必须是 `('eeg', 'projects_to', 'fmri')`，**不依赖 config 列表顺序**
+3. `propagate(size=(N_eeg, N_fmri))` 必须传入 size，否则 PyG 默认 (N_eeg, N_eeg) 导致 fMRI 节点数被 EEG 数污染
+4. 重建损失中 `recon.shape[0] == target.shape[0]`（节点数一致），违反时应 raise RuntimeError 而非 broadcast
+
+### 违反不变量的症状
+- Warning: `Using a target size ([63, 190, 1]) different from input ([1, 190, 1])` → invariant 3 或 4 被违反
+- fMRI 解码输出节点数等于 N_eeg（如 63）而非 N_fmri → invariant 3 被违反
+- Error: `Trying to backward through the graph a second time` → data_list 中对象被原地修改（见上方错误记录）

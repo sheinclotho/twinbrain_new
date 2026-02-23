@@ -209,6 +209,7 @@ class GraphNativeBrainMapper:
         connectivity_matrix: Optional[np.ndarray] = None,
         node_positions: Optional[np.ndarray] = None,
         node_labels: Optional[List[str]] = None,
+        sampling_rate: float = 0.5,
     ) -> HeteroData:
         """
         Map fMRI timeseries to graph structure.
@@ -221,6 +222,8 @@ class GraphNativeBrainMapper:
             connectivity_matrix: [N_rois, N_rois] functional connectivity
             node_positions: [N_rois, 3] brain coordinates
             node_labels: ROI names
+            sampling_rate: Temporal sampling rate in Hz (TR⁻¹). Default 0.5 Hz = TR 2 s.
+                Pass the actual TR from the NIfTI header when available.
             
         Returns:
             HeteroData with 'fmri' node type
@@ -270,7 +273,7 @@ class GraphNativeBrainMapper:
         
         # Store temporal info
         data['fmri'].temporal_length = T_time
-        data['fmri'].sampling_rate = 0.5  # Typical fMRI TR (2 seconds)
+        data['fmri'].sampling_rate = sampling_rate
         
         logger.info(
             f"Mapped fMRI to graph: {N_rois} nodes, {T_time} timepoints, "
@@ -286,6 +289,7 @@ class GraphNativeBrainMapper:
         connectivity_matrix: Optional[np.ndarray] = None,
         channel_positions: Optional[np.ndarray] = None,
         atlas_mapping: Optional[Dict[str, int]] = None,
+        sampling_rate: float = 250.0,
     ) -> HeteroData:
         """
         Map EEG timeseries to graph structure.
@@ -297,8 +301,17 @@ class GraphNativeBrainMapper:
             timeseries: [N_channels, T_time] EEG signals
             channel_names: Channel labels
             connectivity_matrix: [N_channels, N_channels] connectivity
-            channel_positions: [N_channels, 3] electrode positions
+            channel_positions: [N_channels, 3] electrode positions in mm
+                (MNE head coordinate frame, converted from meters to mm).
+                Stored as `data['eeg'].pos` for visualization and future use.
+                NOTE: For distance-based cross-modal edge creation, EEG positions
+                (head space) and fMRI ROI positions (MNI space) are in different
+                coordinate systems and require coregistration before comparison.
+                Without coregistration, `create_simple_cross_modal_edges` (random
+                connections) should be used instead of distance-based mapping.
             atlas_mapping: Map channels to atlas ROIs
+            sampling_rate: EEG sampling frequency in Hz. Default 250 Hz.
+                Pass the actual sfreq from the MNE raw object.
             
         Returns:
             HeteroData with 'eeg' node type
@@ -345,7 +358,7 @@ class GraphNativeBrainMapper:
         
         data['eeg'].labels = channel_names
         data['eeg'].temporal_length = T_time
-        data['eeg'].sampling_rate = 250.0  # Typical EEG sampling rate
+        data['eeg'].sampling_rate = sampling_rate
         
         # Atlas mapping if provided (for EEG-fMRI alignment)
         if atlas_mapping is not None:
@@ -497,6 +510,20 @@ class GraphNativeBrainMapper:
         
         N_eeg = merged_data['eeg'].num_nodes
         N_fmri = merged_data['fmri'].num_nodes
+        
+        # Design intent validation: EEG (electrodes) should have FEWER nodes than
+        # fMRI (atlas ROIs).  With Schaefer200: N_fmri=200, N_eeg≈32–64.
+        # If N_eeg > N_fmri this almost always means atlas parcellation failed and
+        # fMRI fell back to a single-node average — graph convolution on 1 node is
+        # meaningless.  Warn clearly so the user can fix atlas loading.
+        if N_eeg > N_fmri:
+            logger.warning(
+                f"⚠️  Design intent: N_eeg ({N_eeg}) > N_fmri ({N_fmri}). "
+                f"EEG electrodes should have FEWER nodes than fMRI ROIs. "
+                f"This usually means atlas parcellation did not load — fMRI has "
+                f"collapsed to {N_fmri} node(s). Check that the atlas file exists "
+                f"and nilearn is installed."
+            )
         
         # Use helper method to determine device
         target_device = self._get_graph_device(merged_data)
