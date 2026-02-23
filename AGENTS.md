@@ -271,3 +271,38 @@
 - Warning: `Using a target size ([63, 190, 1]) different from input ([1, 190, 1])` → invariant 3 或 4 被违反
 - fMRI 解码输出节点数等于 N_eeg（如 63）而非 N_fmri → invariant 3 被违反
 - Error: `Trying to backward through the graph a second time` → data_list 中对象被原地修改（见上方错误记录）
+
+---
+
+## 七、训练数据设计原则（重要——防止重蹈已知错误）
+
+### 为什么 "max_seq_len=300" 是错误的训练单元
+
+> **思维误区**：把截断当成内存优化，而不是把截断看成数据设计缺陷。
+
+**EEG 致命问题**：max_seq_len=300 在 250Hz 下 = 1.2 秒。从 1.2 秒 EEG 信号估计节点间相关性（Pearson r）统计上完全不可靠（需至少 10-30 秒，即 2500-7500 个样本点）。这意味着 EEG 图的 edge_index（驱动所有 ST-GCN 消息传递）建立在统计噪声之上。
+
+**数据量问题**：10 被试 × 3 任务 = 30 个训练样本。深度学习模型无法从 30 个样本泛化。
+
+### 正确范式：动态功能连接（dFC）滑动窗口
+
+参见 Hutchison et al. 2013 (Nature Rev Neurosci); Chang & Glover 2010 (NeuroImage)。
+
+| 概念 | 图的哪个部分 | 如何计算 | 为何如此 |
+|------|-------------|---------|---------|
+| 结构连通性 | `edge_index` | 完整 run 的相关矩阵 | 需要充足数据保证统计可靠 |
+| 动态脑状态 | 节点特征 `x` | 时间窗口切片 | 每个窗口 = 一个认知瞬态 |
+
+**数据量对比**：
+
+```
+截断模式: 10 sub × 3 task × 1 sample = 30 训练样本
+窗口模式: 10 sub × 3 task × 11 win  = 330 训练样本 (11×)
+```
+
+### windowed_sampling 配置关键约束
+
+1. 当 `windowed_sampling.enabled: true` 时，**必须设 `max_seq_len: null`**（否则图构建仍使用截断序列，EEG 连通性估计仍不可靠）。
+2. 缓存存储**完整 run 图**（topology=全序列相关），窗口切分在运行时从缓存图提取（cheap tensor slice）。
+3. `fmri_window_size=50`（TRs）与 `eeg_window_size=500`（samples）对齐的是**认知时长**，不是样本数——两者均约等于 100 秒（fMRI: 50×2s=100s; EEG: 500÷250Hz=2s，注意 EEG/fMRI 一般非同步采集，2s EEG epoch 与 100s fMRI window 各自对应其模态的自然时间尺度）。
+4. `edge_index` 在同一 run 的所有窗口间**共享同一对象**（不复制），节省内存。

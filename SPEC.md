@@ -1,7 +1,7 @@
 # TwinBrain V5 — 项目规范说明
 
 > **受众**：另一个 AI Agent，目标是能够大体复现本项目。  
-> **版本**：V5.7 | **状态**：生产就绪 | **更新**：2026-02-23
+> **版本**：V5.8 | **状态**：生产就绪 | **更新**：2026-02-23
 
 ---
 
@@ -28,19 +28,25 @@
     ↓
 BrainDataLoader (data/loaders.py)          — 统一加载 EEG/fMRI
     | _discover_tasks()                    — 自动发现每个被试的所有任务
-    | load_all_subjects(tasks=None)        — 多任务加载，每(被试,任务)→一个样本
+    | load_all_subjects(tasks=None)        — 多任务加载，每(被试,任务)→一条run
     ↓
 EEG预处理 / fMRI预处理                       — 滤波、配准、标准化
     ↓
 GraphNativeBrainMapper (graph_native_mapper.py)
-    ├── build_graph_structure()             — K近邻 + 小世界图
+    ├── build_graph_structure()             — K近邻 + 小世界图（来自完整run相关性）
     ├── create_cross_modal_edges()          — 跨模态边（距离阈值）
-    └── HeteroData 输出
-         ├── fmri 节点: [N_fmri, T, 1]
-         ├── eeg  节点: [N_eeg,  T, 1]
+    └── HeteroData 输出（完整run图）
+         ├── fmri 节点: [N_fmri, T_full, 1]
+         ├── eeg  节点: [N_eeg,  T_full, 1]
          └── 边: fmri↔fmri, eeg↔eeg, fmri↔eeg
     ↓
-图缓存 (main.py _graph_cache_key)          — 保存/加载 .pt 文件，跳过重复预处理
+图缓存 (main.py _graph_cache_key)          — 保存/加载完整run图(.pt)，跳过重复预处理
+    ↓
+extract_windowed_samples (main.py)         — dFC滑动窗口：1 run → N_windows 训练样本
+    | 每个窗口: x=[N, T_window, 1]（切片）
+    | edge_index: 共享完整run的连通性（结构稳定）
+    ↓
+训练样本列表: N_subjects × N_tasks × N_windows 个 HeteroData
     ↓
 GraphNativeBrainModel (graph_native_system.py)
     ├── GraphNativeEncoder                  — ST-GCN 时空编码
@@ -52,17 +58,34 @@ GraphNativeTrainer                         — 训练循环 + 优化
 
 ### 2.2 训练样本设计
 
-每个 **(被试, 任务)** 组合 → 一个图样本 → 加入训练列表。
+**两级数据增强**（无需采集新数据）：
 
-- 多被试混训：捕捉跨被试的群体级脑结构共性（population-level patterns）。
-- 多任务（静息 + 工作记忆等）：捕捉被试内跨认知状态的脑动态变化。
-- 样本 = 一张 `HeteroData` 异质图，包含该被试在该任务下的完整 EEG + fMRI 节点特征。
+| 层级 | 机制 | 捕捉的信号 | 样本倍增 |
+|------|------|-----------|---------|
+| 跨被试 | 多被试混训 | 群体级结构共性 | ×N_subjects |
+| 跨任务 | 多任务自动发现 | 被试内认知状态变化 | ×N_tasks |
+| 跨时间 | dFC 滑动窗口 | run 内脑状态动态 | ×N_windows |
+
+**科学依据（dFC 范式）**：
+
+> 图拓扑（edge_index）= 完整 run 的相关矩阵 → 稳定结构连通性  
+> 节点特征（x）= 时间窗口切片 → 每窗口 = 一个脑状态快照
+
+若不使用窗口采样，EEG `max_seq_len=300` 仅 1.2 秒，相关性估计统计不可靠，ST-GCN 的 edge_index 建立在噪声之上。
+
+**典型数据量对比**（10 被试 × 3 任务 × 300 TR fMRI run）：
+
+```
+旧方案（截断单样本）: 10 × 3 × 1  =  30 训练样本
+新方案（窗口 ws=50）: 10 × 3 × 11 = 330 训练样本（11×提升）
+```
 
 ### 2.3 图缓存
 
 图构建完成后自动保存为 `.pt` 文件：
 - **路径**：`{cache_dir}/{subject_id}_{task}_{config_hash}.pt`
-- **config_hash**：atlas、图参数（k近邻、阈值等）、max_seq_len 的 MD5 短哈希；参数变更时自动失效。
+- **config_hash**：atlas、图参数（k近邻、阈值等）的 MD5 短哈希；窗口模式下不含 max_seq_len（截断不生效）。
+- **内容**：始终是**完整 run 图**（窗口从缓存图中实时切分，节省磁盘空间）。
 - **好处**：再次运行时直接加载，跳过预处理和图构建，节省数分钟到数十分钟。
 
 ### 2.4 核心模型组件

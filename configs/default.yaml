@@ -86,10 +86,13 @@ training:
   use_gradient_checkpointing: true
 
   # Maximum sequence length per modality (timepoints).
-  # EEG at 250 Hz × 60 s = 15,000 pts → tensors of many GB per encoder layer.
-  # Truncate to this value BEFORE building graphs to prevent CUDA OOM.
-  # Increase for longer sequences if you have sufficient VRAM.
-  # Rule-of-thumb: 300 fits comfortably in 8 GB; use 600 for 16 GB.
+  # ─────────────────────────────────────────────────────────────
+  # 【单样本训练模式 (windowed_sampling.enabled: false)】
+  #   截断到此长度再构建图。防止 CUDA OOM。
+  #   经验值: 300 适合 8 GB GPU; 600 适合 16 GB GPU。
+  # 【时间窗口模式 (windowed_sampling.enabled: true)】
+  #   此参数不生效（图构建使用完整序列，训练样本长度由 window_size 控制）。
+  #   建议设为 null 以使用完整 run 估计连通性。
   max_seq_len: 300
   
   # Use learning rate scheduler (10-20% faster convergence)
@@ -107,6 +110,29 @@ training:
   
   # Early stopping patience
   early_stopping_patience: 20
+
+# ── 时间窗口采样（动态功能连接 dFC 范式）────────────────────────────
+# 将每条完整扫描（run）切分为多个重叠时间窗口。
+#
+# 科学依据（Hutchison 2013; Chang & Glover 2010）：
+#   • 图拓扑（edge_index）= 完整 run 的相关性 → 稳定的结构连通性
+#   • 节点特征（x）= 窗口切片 → 每窗口 = 一个脑状态快照 = 一个训练样本
+#   • 多窗口 × 多被试 × 多任务 = 充足训练数据（n_subjects×n_tasks×n_windows）
+#
+# 与朴素截断（max_seq_len）的关键区别：
+#   截断 → 丢弃数据，1 样本/run，EEG 连通性估计仅 1.2s（统计不可靠）
+#   窗口 → 利用全部数据，N 样本/run，连通性来自完整 run（稳定可靠）
+#
+# 推荐配置（启用时将 max_seq_len 设为 null）：
+#   fmri_window_size: 50   → 50 TRs × TR=2s = 100s ≈ 一个静息脑状态周期
+#   eeg_window_size: 500   → 500pts ÷ 250Hz = 2s（覆盖 alpha/beta/gamma 节律）
+#   stride_fraction: 0.5   → 50% 重叠 → 约 2× 更多样本（标准 dFC 设置）
+windowed_sampling:
+  enabled: false          # true = dFC 窗口模式（推荐研究使用）
+                          # false = 单样本模式（与旧版本行为相同）
+  fmri_window_size: 50    # fMRI 每个窗口的 TR 数（建议 30-100）
+  eeg_window_size: 500    # EEG 每个窗口的采样点数（建议 250-2000）
+  stride_fraction: 0.5    # 步长 = window_size × stride_fraction（0.5 = 50% 重叠）
 
 # V5优化配置
 v5_optimization:

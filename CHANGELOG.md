@@ -1,8 +1,72 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-23  
-**版本**：V5.7  
+**版本**：V5.8  
 **状态**：生产就绪
+
+---
+
+## [V5.8] 2026-02-23 — 动态功能连接（dFC）滑动窗口采样
+
+### ✨ 核心改进：从根源解决训练数据设计缺陷
+
+#### 背景：为什么 max_seq_len=300 是错误的训练单元
+
+此前代码将每条完整扫描（run）截断到 300 个时间步，作为单个训练样本。这引发两个根本性问题：
+
+1. **EEG 连通性估计不可靠**：300 样本在 250Hz 下 = 1.2 秒。从 1.2 秒 EEG 估计 Pearson 相关（用于构建图拓扑 edge_index）在统计上完全不可靠——图的 ST-GCN 消息传递建立在随机噪声之上。可靠估计需至少 10–30 秒（2500–7500 样本点）。
+
+2. **训练数据严重不足**：10 被试 × 3 任务 × 1 样本/run = 30 训练样本。深度学习模型无法从 30 个样本习得可泛化的脑动态表示。
+
+#### 解决方案：dFC 滑动窗口范式
+
+参见 Hutchison et al. 2013 (Nature Rev Neurosci); Chang & Glover 2010 (NeuroImage)。
+
+**设计原则**：
+- `edge_index`（图拓扑）= 完整 run 的相关矩阵 → 统计可靠的结构连通性
+- 节点特征 `x`（动态信号）= 时间窗口切片 → 每个窗口 = 一个脑状态快照 = 一个训练样本
+
+**数据量对比**（10 被试 × 3 任务 × 300 TRs fMRI run）：
+```
+旧方案（截断）: 10 × 3 × 1  =  30 训练样本
+新方案（窗口）: 10 × 3 × 11 = 330 训练样本（11×提升，无新数据）
+```
+
+#### 实现（`main.py`）
+
+- 新增 `extract_windowed_samples(full_graph, w_cfg, logger)` 函数：
+  - 以 fMRI 为参考模态（时间步最少），按 `fmri_window_size` + `stride_fraction` 生成窗口起始点
+  - EEG 窗口等比例对齐（`round(t_start_ref × T_eeg/T_fmri)`），确保跨模态时间对齐
+  - `edge_index` 在所有窗口间共享同一对象（节省内存）
+  - 末尾窗口越界时零填充，保持固定窗口大小
+- 更新 `build_graphs()`：
+  - 当 `windowed_sampling.enabled: true` 时，**跳过 max_seq_len 截断**（完整序列 → 可靠连通性）
+  - 缓存始终存储完整 run 图，窗口切分在缓存加载/新建后执行
+  - 更新缓存键（`windowed=True` 时不含 max_seq_len，因为截断不生效）
+- 更新日志：汇报"N 条 run → M 个窗口训练样本（平均 K 窗口/run）"
+
+#### 配置（`configs/default.yaml`）
+
+```yaml
+windowed_sampling:
+  enabled: false          # 设 true 启用（推荐研究使用）
+  fmri_window_size: 50    # 50 TRs × TR=2s = 100s ≈ 一个脑状态周期
+  eeg_window_size: 500    # 500pts ÷ 250Hz = 2s（覆盖主要 EEG 节律）
+  stride_fraction: 0.5    # 50% 重叠（标准 dFC 设置）
+```
+
+**推荐用法**（启用时）：
+```yaml
+training:
+  max_seq_len: null       # 关闭截断，使用完整 run 估计连通性
+windowed_sampling:
+  enabled: true
+```
+
+#### 兼容性
+
+- `enabled: false`（默认）= 与旧版行为完全一致，无 breaking change
+- 两种模式的缓存文件互不冲突（缓存键中包含 `windowed` 标志）
 
 ---
 
