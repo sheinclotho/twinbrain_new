@@ -346,6 +346,146 @@ def create_model(config: dict, logger: logging.Logger):
     return model
 
 
+def log_training_summary(
+    config: dict,
+    graphs: list,
+    model,
+    logger: logging.Logger,
+) -> None:
+    """启动训练前打印一次人类可读的配置核对表。
+
+    目的：让任何人（不需要了解代码细节）在看到日志的第一眼就能
+    确认数据处理方式是否符合预期，避免"默默地用了错误参数训练完
+    才发现"的情况。
+
+    信息来源：
+    - 优先读取 graphs[0] 中的实际运行时值（节点数、序列长度等），
+      而不是 config 中的期望值——两者可能因数据质量问题而不同。
+    - 读取 config 获取模型结构和训练超参数。
+    """
+    sep = "=" * 60
+
+    logger.info(sep)
+    logger.info("📋 训练配置核对表 (Training Configuration Summary)")
+    logger.info(sep)
+
+    # ── 从第一个图提取运行时实际值 ──────────────────────────────
+    g = graphs[0] if graphs else None
+    modalities = config['data'].get('modalities', [])
+
+    logger.info("【数据】")
+
+    if g is not None:
+        # EEG
+        if 'eeg' in getattr(g, 'node_types', []):
+            eeg_x = g['eeg'].x  # [N, T, C]
+            N_eeg, T_eeg = eeg_x.shape[0], eeg_x.shape[1]
+            has_eeg_pos = (
+                hasattr(g['eeg'], 'pos')
+                and g['eeg'].pos is not None
+                and g['eeg'].pos.shape[0] > 0
+            )
+            # sampling_rate is always written by map_eeg_to_graph; the fallback
+            # here matches that function's default (250 Hz) for robustness.
+            eeg_sr = getattr(g['eeg'], 'sampling_rate', 250.0)
+            logger.info(
+                f"  EEG  : {N_eeg} 个电极通道 | "
+                f"采样率: {eeg_sr:.1f} Hz | "
+                f"序列长度: {T_eeg} 个时间点"
+            )
+            pos_note = (
+                "已找到 (来自 MNE standard_1020 montage，单位 mm)"
+                if has_eeg_pos
+                else "未找到 → 将使用随机跨模态连接（非距离加权）"
+            )
+            logger.info(f"         电极坐标: {pos_note}")
+
+        # fMRI
+        if 'fmri' in getattr(g, 'node_types', []):
+            fmri_x = g['fmri'].x  # [N, T, C]
+            N_fmri, T_fmri = fmri_x.shape[0], fmri_x.shape[1]
+            # sampling_rate is always written by map_fmri_to_graph; the fallback
+            # here matches that function's default (0.5 Hz = TR 2 s) for robustness.
+            fmri_sr = getattr(g['fmri'], 'sampling_rate', 0.5)
+            tr_sec = 1.0 / fmri_sr if fmri_sr > 0 else float('nan')
+            atlas_used = N_fmri > 1
+            atlas_note = (
+                f"已启用 ({config['data']['atlas']['name']}, {N_fmri} 个 ROI 节点)"
+                if atlas_used
+                else f"未启用 → 单节点回退 (N_fmri={N_fmri}，空间信息已丢失)"
+            )
+            logger.info(
+                f"  fMRI : {N_fmri} 个 ROI 节点 | "
+                f"采样率: {fmri_sr:.3g} Hz (TR≈{tr_sec:.1f}s) | "
+                f"序列长度: {T_fmri} 个时间点"
+            )
+            logger.info(f"         图谱分区: {atlas_note}")
+            if not atlas_used:
+                logger.info(
+                    f"  ⚠️   fMRI 只有 {N_fmri} 个节点！图卷积无法提取空间信息。"
+                    f" 请检查 atlas 文件路径是否正确、nilearn 是否已安装。"
+                )
+
+        # 跨模态边
+        if (
+            'eeg' in getattr(g, 'node_types', [])
+            and 'fmri' in getattr(g, 'node_types', [])
+        ):
+            cross_edge_type = ('eeg', 'projects_to', 'fmri')
+            if cross_edge_type in getattr(g, 'edge_types', []):
+                n_cross = g[cross_edge_type].edge_index.shape[1]
+                logger.info(
+                    f"  跨模态边 (EEG→fMRI): {n_cross} 条"
+                    f" | 方向正确 (N_eeg={N_eeg} < N_fmri={N_fmri})"
+                    if N_eeg < N_fmri
+                    else
+                    f"  跨模态边 (EEG→fMRI): {n_cross} 条"
+                    f"  ⚠️  N_eeg({N_eeg}) ≥ N_fmri({N_fmri}), 请检查图谱加载"
+                )
+            else:
+                logger.info("  跨模态边 (EEG→fMRI): 未建立")
+    else:
+        logger.info("  (无图数据可供分析)")
+
+    max_seq = config['training'].get('max_seq_len')
+    if max_seq:
+        logger.info(f"  序列截断 max_seq_len: {max_seq} (防止 CUDA OOM)")
+    else:
+        logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议设置 max_seq_len)")
+
+    # ── 模型 ────────────────────────────────────────────────────
+    logger.info("【模型】")
+    logger.info(
+        f"  隐层维度: {config['model']['hidden_channels']} | "
+        f"编码层数: {config['model']['num_encoder_layers']} | "
+        f"解码层数: {config['model']['num_decoder_layers']}"
+    )
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"  总参数量: {total_params:,}")
+    logger.info(f"  损失函数: {config['model'].get('loss_type', 'mse')}")
+
+    # ── 训练 ────────────────────────────────────────────────────
+    logger.info("【训练】")
+    device = config['device']['type']
+    use_amp = config['device'].get('use_amp', True)
+    use_gc = config['training'].get('use_gradient_checkpointing', False)
+    use_al = config['training'].get('use_adaptive_loss', True)
+    lr = config['training']['learning_rate']
+    logger.info(
+        f"  设备: {device} | "
+        f"混合精度(AMP): {'是' if use_amp else '否'} | "
+        f"梯度检查点: {'是' if use_gc else '否'}"
+    )
+    logger.info(
+        f"  学习率: {lr} | "
+        f"自适应损失权重: {'是' if use_al else '否'}"
+    )
+
+    logger.info(sep)
+    logger.info("⚠️  请核对以上参数是否与您的实验预期一致，再继续训练。")
+    logger.info(sep)
+
+
 def train_model(model, graphs, config: dict, logger: logging.Logger):
     """训练模型"""
     logger.info("=" * 60)
@@ -560,6 +700,9 @@ def main():
         
         # 步骤3: 创建模型
         model = create_model(config, logger)
+        
+        # 启动前打印一次人类可读的配置核对表，方便快速验证参数
+        log_training_summary(config, graphs, model, logger)
         
         # 步骤4: 训练
         train_model(model, graphs, config, logger)
