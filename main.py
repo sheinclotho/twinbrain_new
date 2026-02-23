@@ -146,7 +146,10 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         we get 200 anatomically meaningful nodes — the actual design intent.
         """
         try:
-            from nilearn.input_data import NiftiLabelsMasker
+            try:
+                from nilearn.maskers import NiftiLabelsMasker  # nilearn >= 0.10
+            except ImportError:
+                from nilearn.input_data import NiftiLabelsMasker  # nilearn < 0.10
             masker = NiftiLabelsMasker(
                 labels_img=str(atlas_path),
                 standardize=True,
