@@ -114,11 +114,23 @@ class BrainDataLoader:
             # 提取数据
             data, times = raw.get_data(return_times=True)
             
+            # 提取电极坐标（由 EEGPreprocessor.preprocess 通过 set_montage("standard_1020")
+            # 设置）。转换单位：MNE 内部坐标以米为单位，转为毫米供空间距离计算使用。
+            # 若 montage 未设置，loc 向量全零；使用 1e-3 m (= 1 mm) 作为"有效位置"门限。
+            ch_pos = None
+            try:
+                locs = np.array([ch['loc'][:3] for ch in raw.info['chs']])  # [N, 3] 单位：米
+                if np.any(np.abs(locs) > 1e-3):  # montage 已设置（至少有电极距原点 > 1 mm）
+                    ch_pos = locs * 1000.0  # 米 → 毫米
+            except Exception:
+                pass
+            
             return {
                 'data': data,  # [n_channels, n_times]
                 'times': times,
                 'ch_names': raw.ch_names,
                 'sfreq': raw.info['sfreq'],
+                'ch_pos': ch_pos,  # [n_channels, 3] 单位 mm，或 None（montage 未设置时）
             }
             
         except Exception as e:

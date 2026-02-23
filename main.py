@@ -231,6 +231,10 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         if 'eeg' in subject_data:
             eeg_data = subject_data['eeg']['data']  # [n_channels, n_times]
             eeg_ch_names = subject_data['eeg']['ch_names']
+            # 从 loader 获取真实采样率和电极坐标（由 EEGPreprocessor 通过
+            # standard_1020 montage 设置，单位 mm）
+            eeg_sfreq = subject_data['eeg'].get('sfreq', 250.0)
+            eeg_ch_pos = subject_data['eeg'].get('ch_pos', None)  # [N_ch, 3] mm 或 None
             
             # Validate EEG data
             if eeg_data.shape[0] < 8:
@@ -250,6 +254,8 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             eeg_graph = mapper.map_eeg_to_graph(
                 timeseries=eeg_data,
                 channel_names=eeg_ch_names,
+                channel_positions=eeg_ch_pos,
+                sampling_rate=eeg_sfreq,
             )
             graph_list.append(('eeg', eeg_graph))
         
@@ -276,13 +282,12 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                         if hasattr(graph[edge_type], 'edge_attr'):
                             merged_graph[edge_type].edge_attr = graph[edge_type].edge_attr
                 
-                # Add cross-modal edges if we have both modalities
+                # 跨模态边：EEG → fMRI
+                # 设计理念：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。
+                # create_simple_cross_modal_edges 会验证 N_eeg < N_fmri 并在违反时给出警告。
                 if 'fmri' in merged_graph.node_types and 'eeg' in merged_graph.node_types:
-                    # Create simple cross-modal connections (can be improved with atlas mapping)
-                    # Returns edges from EEG to fMRI [eeg_idx, fmri_idx]
                     cross_edges = mapper.create_simple_cross_modal_edges(merged_graph)
                     if cross_edges is not None:
-                        # Edge direction: EEG -> fMRI
                         merged_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
                 
                 graphs.append(merged_graph)
@@ -308,8 +313,14 @@ def create_model(config: dict, logger: logging.Logger):
     for modality in node_types:
         edge_types.append((modality, 'connects', modality))
     
-    # 跨模态边
-    if len(node_types) > 1:
+    # 跨模态边：设计理念是 EEG → fMRI
+    # EEG 电极（通常 32–64 通道）节点数 < fMRI ROI（如 Schaefer200 的 200 个），
+    # 因此由 EEG 向 fMRI 投射消息符合"少节点向多节点传播"的图卷积语义。
+    # 使用模态名而非位置索引，保证不受 config['data']['modalities'] 顺序影响。
+    if 'eeg' in node_types and 'fmri' in node_types:
+        edge_types.append(('eeg', 'projects_to', 'fmri'))
+    elif len(node_types) > 1:
+        # 非 EEG/fMRI 模态组合的通用回退
         edge_types.append((node_types[0], 'projects_to', node_types[1]))
     
     # 输入通道
