@@ -772,6 +772,7 @@ def log_training_summary(
 
 def train_model(model, graphs, config: dict, logger: logging.Logger):
     """训练模型"""
+    import random
     logger.info("=" * 60)
     logger.info("步骤 4/4: 训练模型")
     logger.info("=" * 60)
@@ -782,20 +783,27 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         logger.error("提示: 请增加数据量或调整 max_subjects 配置")
         raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个。请检查数据配置。")
     
+    # 打乱后再划分，避免以下偏差：
+    # 1. 窗口采样时序列前段全入训练集、后段全入验证集（不同脑状态）
+    # 2. 被试按字母顺序排列时最后几个被试全部只出现在验证集中
+    # 使用 seed 保证复现性
+    shuffled = graphs.copy()
+    rng = random.Random(42)
+    rng.shuffle(shuffled)
+    
     # Use at least 10% or 1 sample for validation, ensure both train and val have at least 1
-    min_val_samples = max(1, len(graphs) // 10)
-    n_train = len(graphs) - min_val_samples
+    min_val_samples = max(1, len(shuffled) // 10)
+    n_train = len(shuffled) - min_val_samples
     
     # Safety check: ensure both sets have at least 1 sample
     if n_train < 1:
         n_train = 1
-        min_val_samples = len(graphs) - 1
+        min_val_samples = len(shuffled) - 1
     
-    train_graphs = graphs[:n_train]
-    val_graphs = graphs[n_train:]
+    train_graphs = shuffled[:n_train]
+    val_graphs = shuffled[n_train:]
     
-    logger.info(f"训练集: {len(train_graphs)} 个样本")
-    logger.info(f"验证集: {len(val_graphs)} 个样本")
+    logger.info(f"训练集: {len(train_graphs)} 个样本 | 验证集: {len(val_graphs)} 个样本 (seed=42 随机打乱, 结果可复现)")
     
     if len(train_graphs) < 5:
         logger.warning("⚠️ 训练样本较少，模型可能过拟合。建议使用更多数据。")

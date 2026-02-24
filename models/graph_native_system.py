@@ -558,14 +558,40 @@ class GraphNativeTrainer:
         self.scheduler = None
         if use_scheduler:
             if scheduler_type == 'cosine':
-                # Cosine annealing with warm restarts
-                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                    self.optimizer,
-                    T_0=10,  # Restart every 10 epochs
-                    T_mult=2,  # Double period after each restart
-                    eta_min=learning_rate * 0.01
+                # Linear warm-up for the first `warmup_epochs` epochs, then
+                # CosineAnnealingWarmRestarts.  Without warm-up, the full LR
+                # is applied from epoch 1, which often causes large gradient
+                # steps on a freshly initialised model — particularly harmful
+                # when training on small neuroimaging datasets (N < 100 samples).
+                #
+                # SequentialLR chains two schedulers: LinearLR ramps from
+                # start_factor × lr up to lr over warmup_epochs steps, then
+                # hands off to CosineAnnealingWarmRestarts.
+                warmup_epochs = self._optimization_config.get(
+                    'warmup_epochs',
+                    3,  # safe minimum; v5_optimization.warmup_epochs in default.yaml is 5
                 )
-                logger.info(f"Learning rate scheduler enabled: CosineAnnealingWarmRestarts")
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=0.1,   # start at 10% of target LR
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optimizer,
+                    T_0=10,    # restart every 10 epochs
+                    T_mult=2,  # double period after each restart
+                    eta_min=learning_rate * 0.01,
+                )
+                self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_sched, cosine_sched],
+                    milestones=[warmup_epochs],
+                )
+                logger.info(
+                    f"LR scheduler: Linear warmup ({warmup_epochs} epochs) "
+                    f"→ CosineAnnealingWarmRestarts(T_0=10, T_mult=2)"
+                )
             elif scheduler_type == 'onecycle':
                 # OneCycle (will need total_steps, set in train_epoch)
                 self.scheduler_type = 'onecycle'
@@ -607,38 +633,71 @@ class GraphNativeTrainer:
             )
         
         # EEG enhancement
-        self.use_eeg_enhancement = use_eeg_enhancement
-        if use_eeg_enhancement and 'eeg' in node_types:
-            try:
-                # Get EEG channel count from model (with safety checks)
-                if hasattr(model.encoder, 'input_proj') and 'eeg' in model.encoder.input_proj:
-                    eeg_channels = model.encoder.input_proj['eeg'].in_features
-                    eeg_cfg = self._optimization_config.get('eeg_enhancement', {})
-                    self.eeg_handler = EnhancedEEGHandler(
-                        num_channels=eeg_channels,
-                        enable_monitoring=eeg_cfg.get('enable_monitoring', True),
-                        enable_dropout=eeg_cfg.get('enable_dropout', True),
-                        enable_attention=eeg_cfg.get('enable_attention', True),
-                        enable_regularization=eeg_cfg.get('enable_regularization', True),
-                        dropout_rate=eeg_cfg.get('dropout_rate', 0.1),
-                        attention_hidden_dim=eeg_cfg.get('attention_hidden_dim', 64),
-                        entropy_weight=eeg_cfg.get('entropy_weight', 0.01),
-                        diversity_weight=eeg_cfg.get('diversity_weight', 0.01),
-                        activity_weight=eeg_cfg.get('activity_weight', 0.01),
-                    ).to(self.device)  # Move to device to prevent device mismatch errors
-                else:
-                    logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
-                    self.use_eeg_enhancement = False
-            except (AttributeError, KeyError) as e:
-                logger.warning(f"Failed to initialize EEG handler: {e}. Disabling EEG enhancement.")
-                self.use_eeg_enhancement = False
+        # DESIGN NOTE: EEG graph data has shape [N_eeg, T, 1] — each graph node is
+        # one electrode, with 1-dimensional feature (signal amplitude).
+        # EnhancedEEGHandler was designed for [batch, time, channels] where 'channels'
+        # are individual EEG electrodes.  The correct mapping is:
+        #   graph format: [N_eeg, T, 1]  →  handler format: [1, T, N_eeg]
+        # N_eeg is only known at data-loading time (varies per dataset/subject), so
+        # we use lazy initialisation: the handler is created on the first training step.
+        self.use_eeg_enhancement = use_eeg_enhancement and 'eeg' in node_types
+        self.eeg_handler = None          # created lazily in train_step()
+        self._eeg_handler_cfg = self._optimization_config.get('eeg_enhancement', {})
         
         # Training history
         self.history = {
             'train_loss': [],
             'val_loss': [],
         }
+
+    def _ensure_eeg_handler(self, n_eeg_channels: int) -> None:
+        """Lazily initialise EnhancedEEGHandler once N_eeg is known from real data.
+
+        Called from train_step() on the first forward pass so that the handler
+        is built with the correct num_channels = N_eeg (number of electrodes),
+        not the graph feature dimension (always 1).
+        """
+        if self.eeg_handler is not None:
+            return  # already initialised
+        cfg = self._eeg_handler_cfg
+        try:
+            self.eeg_handler = EnhancedEEGHandler(
+                num_channels=n_eeg_channels,
+                enable_monitoring=cfg.get('enable_monitoring', True),
+                enable_dropout=cfg.get('enable_dropout', True),
+                enable_attention=cfg.get('enable_attention', True),
+                enable_regularization=cfg.get('enable_regularization', True),
+                dropout_rate=cfg.get('dropout_rate', 0.1),
+                attention_hidden_dim=cfg.get('attention_hidden_dim', 64),
+                entropy_weight=cfg.get('entropy_weight', 0.01),
+                diversity_weight=cfg.get('diversity_weight', 0.01),
+                activity_weight=cfg.get('activity_weight', 0.01),
+            ).to(self.device)
+            logger.info(f"EEG handler initialised for {n_eeg_channels} channels.")
+        except Exception as e:
+            logger.warning(f"Failed to initialise EEG handler: {e}. Disabling EEG enhancement.")
+            self.use_eeg_enhancement = False
     
+    @staticmethod
+    def _graph_to_handler_format(eeg_x: torch.Tensor) -> torch.Tensor:
+        """Reshape EEG graph tensor for EnhancedEEGHandler.
+
+        EnhancedEEGHandler expects ``[batch, time, channels]`` where *channels*
+        are individual EEG electrodes.  Graph node features are stored as
+        ``[N_eeg, T, 1]``.  This helper converts between the two formats.
+
+        ``[N_eeg, T, 1]`` → ``[1, T, N_eeg]``
+        """
+        return eeg_x.squeeze(-1).permute(1, 0).unsqueeze(0)
+
+    @staticmethod
+    def _handler_to_graph_format(eeg_x: torch.Tensor) -> torch.Tensor:
+        """Inverse of :meth:`_graph_to_handler_format`.
+
+        ``[1, T, N_eeg]`` → ``[N_eeg, T, 1]``
+        """
+        return eeg_x.squeeze(0).permute(1, 0).unsqueeze(-1)
+
     def train_step(self, data: HeteroData) -> Dict[str, float]:
         """
         Single training step with optional mixed precision.
@@ -656,6 +715,11 @@ class GraphNativeTrainer:
         data = data.to(self.device)
         
         # Apply EEG enhancement if enabled.
+        # Graph data shape: [N_eeg, T, 1] (N_eeg nodes, each with a 1-dim feature).
+        # EnhancedEEGHandler expects [batch, time, channels] where 'channels' are
+        # individual EEG electrodes.  We therefore reshape:
+        #   graph format: [N_eeg, T, 1]  →  handler format: [1, T, N_eeg]
+        # After processing we reshape back.
         # IMPORTANT: Save original eeg_x and restore it in a finally block.
         # eeg_x_enhanced is part of the current computation graph (requires_grad=True).
         # If we leave data['eeg'].x pointing to it, the next epoch's forward pass
@@ -666,9 +730,18 @@ class GraphNativeTrainer:
         eeg_info: dict = {}  # 初始为空；仅当 EEG handler 激活时（下方 if 块）被填充
         original_eeg_x = None
         if self.use_eeg_enhancement and 'eeg' in data.node_types:
-            original_eeg_x = data['eeg'].x
-            eeg_x_enhanced, eeg_info = self.eeg_handler(original_eeg_x, training=True)
-            data['eeg'].x = eeg_x_enhanced
+            original_eeg_x = data['eeg'].x  # [N_eeg, T, 1]
+            N_eeg = original_eeg_x.shape[0]
+            # Lazy-initialise handler with true electrode count (N_eeg).
+            # Previous approach used in_features=1 (graph feature dim), which
+            # made all channel-specific processing trivially useless.
+            self._ensure_eeg_handler(N_eeg)
+            if self.use_eeg_enhancement and self.eeg_handler is not None:
+                eeg_x_t, eeg_info = self.eeg_handler(
+                    self._graph_to_handler_format(original_eeg_x), training=True
+                )
+                eeg_x_enhanced = self._handler_to_graph_format(eeg_x_t)
+                data['eeg'].x = eeg_x_enhanced
         
         try:
             # Forward and backward pass with optional mixed precision
@@ -843,6 +916,11 @@ class GraphNativeTrainer:
         """
         Validation pass.
         
+        Computes the same loss terms as training (reconstruction + prediction)
+        so that early stopping is driven by the actual optimisation objective.
+        Previously this only computed reconstruction loss, making val_loss
+        artificially lower than train_loss regardless of overfitting.
+        
         Args:
             data_list: List of validation data
             
@@ -855,11 +933,18 @@ class GraphNativeTrainer:
         for data in data_list:
             data = data.to(self.device)
             
-            # Forward pass: skip prediction (compute_loss doesn't use it)
-            reconstructed, _ = self.model(data, return_prediction=False)
+            # Request encoded representations when prediction is enabled so that
+            # compute_loss() can include the latent-space prediction loss —
+            # the same terms that are optimised during training.
+            if self.model.use_prediction:
+                reconstructed, _, encoded = self.model(
+                    data, return_prediction=False, return_encoded=True
+                )
+            else:
+                reconstructed, _ = self.model(data, return_prediction=False)
+                encoded = None
             
-            # Compute losses
-            losses = self.model.compute_loss(data, reconstructed, None)
+            losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
             total_loss += sum(losses.values()).item()
         
         avg_loss = total_loss / len(data_list)

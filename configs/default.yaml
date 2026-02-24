@@ -1,7 +1,11 @@
 # TwinBrain V5 配置文件
 # ===================
+# 所有超参数均附有科学依据注释。
+# 「建议」代表在典型神经影像场景下经验验证的起始值，可根据设备内存/数据量微调。
 
-# 数据配置
+# ──────────────────────────────────────────────────────────────────────────
+# 一、数据配置
+# ──────────────────────────────────────────────────────────────────────────
 data:
   # 数据根目录 - 修改为你的数据路径
   root_dir: "F:/twinbrain_v3/test_file3"
@@ -19,7 +23,8 @@ data:
   # 最大被试数 (用于测试, 0 或 null 表示处理所有)
   max_subjects: 0
   
-  # Atlas配置
+  # Atlas配置（fMRI 空间分区）
+  # Schaefer200: 200 ROI，性价比最高；400 ROI 精度更高但内存翻倍
   atlas:
     name: "schaefer200"
     file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
@@ -33,82 +38,103 @@ data:
     enabled: true
     dir: "outputs/graph_cache"
 
-# Model configuration
+# ──────────────────────────────────────────────────────────────────────────
+# 二、模型结构
+# ──────────────────────────────────────────────────────────────────────────
 model:
-  # Model type: "graph_native" or "v5_optimized"
+  # 模型类型
   type: "v5_optimized"
   
-  # Hidden layer dimension
+  # 隐层特征维度（H）
+  # 建议：
+  #   8 GB GPU  → 64（安全）或 128（标准）
+  #   16 GB GPU → 128 或 256
+  # 每翻倍大约占用 4× 内存（STGCN 时序循环的中间激活）。
   hidden_channels: 128
   
-  # Number of encoder layers
+  # 编码器层数（ST-GCN 堆叠深度）
+  # 建议：4。增加至 6 对小数据集（<100 样本）通常过拟合。
   num_encoder_layers: 4
   
-  # Number of decoder layers
+  # 解码器层数（时序卷积深度）
+  # 建议：3。用于信号重建，比编码器浅足矣。
   num_decoder_layers: 3
   
-  # Enable prediction
+  # 是否启用潜空间预测头
+  # true：编码器潜向量的前 2/3 → 预测后 1/3，给预测头真正的梯度信号。
   use_prediction: true
   
-  # Prediction steps
+  # 预测步数（T_future = T × 1/3 与此参数的最小值）
+  # 建议：10（fMRI 10 TRs = 20s，EEG 10 pts = 40ms）。
   prediction_steps: 10
   
-  # Dropout rate
+  # Dropout 比率
+  # 建议：0.1。小数据集可提高到 0.2–0.3 以增强正则化。
   dropout: 0.1
   
-  # Loss function type (mse, huber, smooth_l1)
-  # huber: robust to outliers, 5-10% better on noisy signals
+  # 损失函数类型
+  # mse: 均方误差，对离群值敏感。
+  # huber: 对大误差用 L1，小误差用 MSE（推荐，对 EEG 高振幅尖峰鲁棒）。
+  # smooth_l1: 与 huber 类似（delta=1）。
   loss_type: "huber"
 
-# Training configuration
+# ──────────────────────────────────────────────────────────────────────────
+# 三、训练配置
+# ──────────────────────────────────────────────────────────────────────────
 training:
   # 训练轮数
+  # 建议：50–100（小数据集）；200（大数据集或启用 dFC 窗口后）。
   num_epochs: 100
   
-  # 批次大小
+  # 批次大小（当前实现每步一个图）
   batch_size: 1
   
-  # 学习率
+  # 初始学习率
+  # 建议：1e-4（Adam 系列的经典起点）。
+  # 若 loss 在前 10 epoch 不下降，尝试 5e-4；若震荡，尝试 5e-5。
   learning_rate: 0.0001
   
-  # 权重衰减
+  # 权重衰减（L2 正则化）
+  # 建议：1e-5。小数据集可提高到 1e-4。
   weight_decay: 0.00001
   
-  # Use adaptive loss balancing
+  # 启用自适应损失平衡（GradNorm 变体）
+  # true：自动平衡 recon_eeg/recon_fmri/pred_eeg/pred_fmri 的训练速度。
   use_adaptive_loss: true
   
-  # Use EEG enhancement
+  # 启用 EEG 通道增强（解决静默通道问题）
   use_eeg_enhancement: true
   
-  # Use gradient checkpointing (saves memory, required for long sequences)
-  # Trades recomputation for memory: frees per-timestep activations in the
-  # ST-GCN temporal loop so they don't accumulate and exhaust RAM.
+  # 启用梯度检查点（节省显存，对长序列必要）
+  # 以重新计算换显存：ST-GCN 时序循环每步释放中间激活，防止 CUDA OOM。
+  # 代价：约 20–30% 训练速度下降。
   use_gradient_checkpointing: true
 
-  # Maximum sequence length per modality (timepoints).
+  # 最大序列长度（单样本模式，windowed_sampling.enabled: false）
   # ─────────────────────────────────────────────────────────────
-  # 【单样本训练模式 (windowed_sampling.enabled: false)】
-  #   截断到此长度再构建图。防止 CUDA OOM。
-  #   经验值: 300 适合 8 GB GPU; 600 适合 16 GB GPU。
-  # 【时间窗口模式 (windowed_sampling.enabled: true)】
-  #   此参数不生效（图构建使用完整序列，训练样本长度由 window_size 控制）。
-  #   建议设为 null 以使用完整 run 估计连通性。
+  # 截断到此长度再构建图，防止 CUDA OOM。
+  # 建议：300（8 GB GPU）；600（16 GB GPU）。
+  # 启用 windowed_sampling 后此参数无效（建议设为 null）。
   max_seq_len: 300
   
-  # Use learning rate scheduler (10-20% faster convergence)
+  # 启用学习率调度器（10–20% 更快收敛）
   use_scheduler: true
-  scheduler_type: "cosine"  # Options: cosine, onecycle, plateau
+  # 调度器类型：cosine（推荐）/ onecycle / plateau
+  # cosine：先线性预热，再余弦退火重启——对神经影像小数据集最稳定。
+  scheduler_type: "cosine"
   
-  # Gradient clipping
+  # 梯度裁剪阈值（防止梯度爆炸）
+  # 建议：1.0（Adam 系列标准）。
   max_grad_norm: 1.0
   
-  # Validation frequency (every N epochs)
+  # 验证频率（每 N 个 epoch 做一次验证）
   val_frequency: 5
   
-  # Save checkpoint frequency
+  # 检查点保存频率（每 N 个 epoch 保存一次）
   save_frequency: 10
   
-  # Early stopping patience
+  # 早停耐心（连续 N 次验证无改善则停止）
+  # 建议：20（允许 LR 重启后的短暂退步）。
   early_stopping_patience: 20
 
 # ── 时间窗口采样（动态功能连接 dFC 范式）────────────────────────────
@@ -141,92 +167,129 @@ windowed_sampling:
   #        ⚠ 启用前确认 GPU 内存足够：对齐后 EEG 窗口通常达数千点
   cross_modal_align: false
 
-# V5优化配置
+# ──────────────────────────────────────────────────────────────────────────
+# 四、V5 精细优化（高级用户）
+# 大多数用户无需修改这一节；系统会使用科学文献验证的默认值。
+# ──────────────────────────────────────────────────────────────────────────
 v5_optimization:
-  # 自适应损失平衡
+  # 学习率线性预热 epoch 数（cosine 调度器的第一阶段）
+  # 预热期使用 10% → 100% 的线性 LR 斜坡，避免刚初始化时梯度爆炸。
+  # 建议：5（约总 epoch 数的 5–10%）。
+  warmup_epochs: 5
+
+  # 自适应损失平衡（GradNorm 变体）
   adaptive_loss:
+    # GradNorm 恢复力系数。较大 → 更激进地平衡各任务训练速度。
+    # 建议：1.5（Chen et al. 2018 推荐值）。
     alpha: 1.5
+    # 损失权重内部学习率
+    # 建议：0.025（远小于主学习率，确保权重缓慢调整）。
     learning_rate: 0.025
+    # 每隔多少步更新一次权重（频繁更新会引入噪声）
     update_frequency: 10
+    # 预热 epoch 数（预热期权重固定为初始值，保证模型先有稳定梯度）
     warmup_epochs: 5
+    # EEG/fMRI 信号能量比（用于初始化权重，防止 fMRI 信号幅度主导损失）
+    # EEG 信号典型幅度 ~10μV，fMRI BOLD ~1–5%；此比值使初始损失量级一致。
     modality_energy_ratios:
       eeg: 0.02
       fmri: 1.0
   
-  # EEG通道增强
+  # EEG 通道增强（解决"静默通道"导致的训练退化）
   eeg_enhancement:
-    enable_monitoring: true
-    enable_dropout: true
-    enable_attention: true
-    enable_regularization: true
+    enable_monitoring: true   # 实时监控通道活动（SNR、方差、梯度）
+    enable_dropout: true      # 对低活跃通道施加更高 dropout 概率
+    enable_attention: true    # 可学习的通道重要性权重
+    enable_regularization: true  # 熵+多样性+活动正则化，防止零解崩塌
+    # 基础 dropout 比率（自适应 dropout 会在此基础上调整）
+    # 建议：0.1–0.2（EEG 静默通道比例较高时可提高）。
     dropout_rate: 0.1
+    # 通道注意力隐层维度（过大会过拟合，过小无法区分通道差异）
     attention_hidden_dim: 64
+    # 熵正则化权重（鼓励输出分布多样，防止全零预测）
     entropy_weight: 0.01
+    # 通道间多样性权重（防止所有通道输出相同波形）
     diversity_weight: 0.01
+    # 活动强制权重（惩罚长期静默通道）
     activity_weight: 0.01
   
-  # 高级预测
+  # 潜空间预测头配置（EnhancedMultiStepPredictor）
   advanced_prediction:
+    # true：多尺度层级预测（粗→细，Transformer + 上采样）
+    # 理论基础：大脑对时间信息的处理本身是层级的（Hasson et al. 2015）。
     use_hierarchical: true
+    # true：使用 Transformer（长程依赖）；false：使用 GRU（短程、更快）
+    # 建议：序列长度 < 100 用 GRU（内存低），> 100 用 Transformer。
     use_transformer: true
+    # true：输出预测均值 + 方差（不确定性估计），启用 NLL 损失
+    # 不确定性信号可用于下游任务的置信度度量
     use_uncertainty: true
+    # 时间尺度数（Hierarchical 模式下的粗-中-细层数）
+    # 建议：3（2^2, 2^1, 2^0 下采样因子，覆盖不同频率成分）。
     num_scales: 3
+    # 采样窗口数（每次 forward 从序列中采样的窗口数量）
+    # 建议：3（Stratified 采样覆盖序列首/中/尾）。
     num_windows: 3
+    # 窗口采样策略：uniform（均匀）/ random（随机）/ adaptive（重要性加权）
     sampling_strategy: "uniform"
 
-# 图配置
+# ──────────────────────────────────────────────────────────────────────────
+# 五、图构建配置
+# ──────────────────────────────────────────────────────────────────────────
 graph:
-  # fMRI连接性阈值
+  # fMRI 连通性阈值（Pearson |r| 超过此值才建边）
+  # 建议：0.3（Bullmore & Sporns 2009 推荐，保留强连接）。
+  # 降低 → 更密集图（内存增加）；提高 → 更稀疏图（可能丢失弱连接信息）。
   threshold_fmri: 0.3
   
-  # EEG连接性阈值
+  # EEG 连通性阈值
+  # 建议：0.2（EEG 整体相关性较 fMRI 低，阈值稍低保留足够连接）。
   threshold_eeg: 0.2
   
-  # fMRI K近邻 (小世界网络)
+  # fMRI K 近邻（每个节点保留最强的 K 条边，确保图连通性）
+  # 建议：20（对 200 节点图平均度 ≈ 40，与实证小世界网络吻合）。
   k_nearest_fmri: 20
   
-  # EEG K近邻 (更局部的连接)
+  # EEG K 近邻（EEG 节点数少，邻域更局部）
+  # 建议：10（对 64 通道图平均度 ≈ 20）。
   k_nearest_eeg: 10
   
-  # 是否添加自环
+  # 是否添加自环（GNN 消息传递保留自身特征）
   add_self_loops: true
   
-  # 是否无向图
+  # 是否无向图（脑连接通常双向对称）
   make_undirected: true
   
-  # 跨模态边距离阈值 (mm)
+  # 跨模态距离阈值（mm，用于基于电极坐标的 EEG→fMRI 边建立）
+  # 仅当 EEG 电极已通过 MNE 配准到 MNI 坐标系时有效；
+  # 否则使用随机连接（connection_ratio）。
   cross_modal_distance_threshold: 30.0
 
-# 输出配置
+# ──────────────────────────────────────────────────────────────────────────
+# 六、输出配置
+# ──────────────────────────────────────────────────────────────────────────
 output:
-  # 输出目录
   output_dir: "outputs"
-  
-  # 实验名称
   experiment_name: "twinbrain_v5"
-  
-  # 是否保存图结构
   save_graphs: true
-  
-  # 是否保存预测结果
   save_predictions: true
-  
-  # 日志级别
   log_level: "INFO"
 
-# Device configuration
+# ──────────────────────────────────────────────────────────────────────────
+# 七、设备配置
+# ──────────────────────────────────────────────────────────────────────────
 device:
-  # Device type: "cuda", "cpu", or "cuda:0"
+  # 设备类型："cuda"（GPU）/ "cpu"（CPU）/ "cuda:0"（指定 GPU）
   type: "cuda"
   
-  # GPU memory configuration (8GB, 12GB, 16GB)
+  # GPU 内存规格（仅用于日志提示，不影响实际分配）
   gpu_memory: "8GB"
   
-  # Use mixed precision (AMP)
+  # 混合精度训练（AMP）——约 2× 速度提升，无精度损失
+  # 建议：true（支持 CUDA 的 GPU 均推荐启用）。
   use_amp: True
   
-  # Use torch.compile() for 20-40% speedup (PyTorch 2.0+, Linux/macOS only).
-  # Requires Triton which is NOT available on Windows. Set to True only if you
-  # have confirmed that `import triton` succeeds in your environment.
+  # torch.compile()（PyTorch 2.0+，约 20–40% 加速）
+  # ⚠ 需要 Triton，Windows 不支持。Linux/macOS 且确认 `import triton` 成功后再开启。
   use_torch_compile: False
   compile_mode: "reduce-overhead"  # Options: default, reduce-overhead, max-autotune

@@ -235,7 +235,14 @@ class HierarchicalPredictor(nn.Module):
                     stride=scale_factor,
                     padding=scale_factor // 2,
                 ),
-                nn.LayerNorm(input_dim),
+                # BUG FIX: nn.LayerNorm(input_dim) here normalizes the LAST dimension.
+                # After ConvTranspose1d the tensor is [batch, input_dim, T_up] — the last
+                # dim is T_up (variable length), NOT input_dim.  LayerNorm would raise
+                # "normalized_shape (input_dim,) does not match input.shape[-1] = T_up"
+                # whenever T_up != input_dim.
+                # BatchNorm1d(input_dim) operates on [N, C, L] format correctly:
+                # it normalises each of the C=input_dim channels across batch×L.
+                nn.BatchNorm1d(input_dim),
                 nn.GELU(),
             )
             self.upsamplers.append(upsampler)
