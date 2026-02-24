@@ -478,7 +478,10 @@ class GraphNativeEncoder(nn.Module):
                             # PyG defaults to (N_src, N_src) and cross-modal
                             # aggregation silently produces [N_src, H] instead
                             # of [N_dst, H], corrupting fMRI node features.
-                            conv = stgcn.convs[edge_type]
+                            # HeteroConv stores modules in nn.ModuleDict with
+                            # string keys: '__'.join((src, rel, dst)).
+                            # Accessing with a tuple raises KeyError.
+                            conv = stgcn.convs['__'.join(edge_type)]
                             N_src = x_src.shape[0]
                             N_dst = x.shape[0]
                             msg = conv(x_src, edge_index, edge_attr, size=(N_src, N_dst))

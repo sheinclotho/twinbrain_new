@@ -226,7 +226,57 @@
 
 ---
 
-## 五、项目背景速览
+### [2026-02-24] HeteroConv.convs 用 tuple key 访问导致 KeyError（第一次 forward 即崩溃）
+
+**思维误区**：看到 `HeteroConv(conv_dict)` 接受 `{(src, rel, dst): conv}` 形式的字典，就以为内部存储也是用 tuple 作为 key。
+
+**根因**：PyG 的 `HeteroConv.__init__` 将卷积存入 `nn.ModuleDict`：
+```python
+self.convs = nn.ModuleDict({'__'.join(key): module for key, module in convs.items()})
+```
+key 是 `'eeg__projects_to__fmri'`（字符串），不是 tuple。`GraphNativeEncoder.forward()` 用 `stgcn.convs[edge_type]`（tuple）访问，必然 `KeyError`。这意味着编码器从未成功运行过。
+
+**正确思路**：每次在自定义 forward 中绕过 `HeteroConv.forward()` 手动访问其内部卷积时，必须问：**内部 dict 的 key 格式是什么？** PyG 约定是 `'__'.join(edge_type_tuple)`。
+
+**修复**：`stgcn.convs['__'.join(edge_type)]`
+
+---
+
+### [2026-02-24] 整个 v5_optimization 配置块从未被读取（死配置）
+
+**思维误区**：看到 YAML 里有详细的 `v5_optimization.adaptive_loss.alpha`、`v5_optimization.eeg_enhancement.entropy_weight` 等参数，就以为它们被传入了对应模块。
+
+**根因**：`GraphNativeTrainer.__init__()` 中 `AdaptiveLossBalancer`、`EnhancedEEGHandler`、`EnhancedMultiStepPredictor` 的所有参数都是硬编码默认值；config 中的对应值从未被读取。
+
+**正确思路**：每次在代码里硬编码一个"配置参数"时，问：**这个值是否也出现在 YAML 里？如果是，哪一方是权威来源？** YAML 应永远是用户可见的权威；代码里不应有"隐形"覆盖。
+
+**修复**：为 `GraphNativeTrainer` 添加 `optimization_config: Optional[dict]` 参数，为 `GraphNativeBrainModel` 添加 `predictor_config: Optional[dict]` 参数，`main.py` 传入 `config['v5_optimization']`。
+
+---
+
+### [2026-02-24] EnhancedGraphNativeTrainer optimizer 只覆盖 base_model（增强模块无梯度）
+
+**思维误区**：`super().__init__(model=model.base_model)` 之后立即 `self.model = model`，以为 optimizer 会自动"跟随"新的 model。
+
+**根因**：`torch.optim.AdamW` 在构造时捕获参数快照；后续修改 `self.model` 不会更新 optimizer 的参数组。`ConsciousnessModule`、`CrossModalAttention`、`HierarchicalPredictiveCoding` 的参数有梯度但永远不会被更新。
+
+**正确思路**：每次 `self.model = new_model` 替换模型后，问：**optimizer 里的参数组是否仍然正确？** 如果不是，必须重新创建 optimizer（或 `optimizer.add_param_group()`）。
+
+**修复**：在 `EnhancedGraphNativeTrainer.__init__()` 的 `super()` 调用后，用 `self.model.parameters()` 重新创建 optimizer。
+
+---
+
+### [2026-02-24] ConsciousGraphNativeBrainModel 用重建输出（信号空间）作为 CrossModalAttention 的输入（潜空间）
+
+**思维误区**：`reconstructions.get('eeg')` 听起来像"编码器的输出"，实际上是**解码器的输出**（`[N, T, 1]`），而 `CrossModalAttention` 期望 `[batch, N, hidden_dim=256]`。
+
+**根因**：`ConsciousGraphNativeBrainModel.forward()` 原来调用 `base_model(data)` 拿到 `(reconstructions, predictions)`，没有请求 `return_encoded=True`，因此无法拿到真正的潜表征；只能用重建输出作为"代理"，这在 shape 和语义上都是错误的。
+
+**正确思路**：`CrossModalAttention`（以及任何需要"高维潜特征"的模块）应当接收编码器输出（`[N, T, H]`），而非解码器输出（`[N, T, 1]`）。每次引入跨模块的特征传递时，明确标注"来自哪一层、shape 是什么"。
+
+**修复**：调用 `base_model(data, return_encoded=True)` 拿到 encoded dict，使用 `encoded['eeg']` / `encoded['fmri']` 作为跨模态注意力的输入。
+
+---
 
 **TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 

@@ -1,12 +1,78 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-24  
-**版本**：V5.9  
+**版本**：V5.10  
 **状态**：生产就绪
 
 ---
 
-## [V5.9] 2026-02-24 — 修复三处死代码：预测头、EEG正则、跨模态对齐
+## [V5.10] 2026-02-24 — 全面代码审查：修复 7 处 Bug（含 1 处致命崩溃）
+
+### 背景
+
+经过全量代码审查（graph_native_encoder.py, graph_native_system.py, enhanced_graph_native.py, main.py, adaptive_loss_balancer.py, loaders.py 等），共发现 7 处 bug，其中 1 处在第一次 forward 即崩溃（一直以来编码器从未真正运行过）。
+
+---
+
+### 🔴 BUG-A (CRASH, 活跃路径): `graph_native_encoder.py` — HeteroConv.convs 用 tuple key 访问
+
+**位置**：`GraphNativeEncoder.forward()` line ~481
+
+**问题**：`stgcn.convs[edge_type]` 其中 `edge_type = ('eeg', 'projects_to', 'fmri')`（tuple）。PyG 的 `HeteroConv` 将卷积存入 `nn.ModuleDict` 时用 `'__'.join(key)` 作为字符串 key。tuple 访问触发 `KeyError`，第一次 forward 即崩溃。这意味着编码器从未成功运行。
+
+**修复**：`stgcn.convs['__'.join(edge_type)]`
+
+---
+
+### 🟡 BUG-B (死配置, 活跃路径): `graph_native_system.py` + `main.py` — v5_optimization 块被完全忽略
+
+**问题**：`default.yaml` 中 `v5_optimization.adaptive_loss`（alpha, warmup_epochs, modality_energy_ratios）、`v5_optimization.eeg_enhancement`（dropout_rate, entropy_weight 等）、`v5_optimization.advanced_prediction`（use_uncertainty, num_scales 等）全部有配置，但在代码中全部被硬编码默认值覆盖，从未被读取。用户修改 YAML 对训练行为没有任何影响。
+
+**修复**：
+- `GraphNativeBrainModel.__init__()` 新增 `predictor_config: Optional[dict] = None`，传入时覆盖 `EnhancedMultiStepPredictor` 的各参数
+- `GraphNativeTrainer.__init__()` 新增 `optimization_config: Optional[dict] = None`，传入时覆盖 `AdaptiveLossBalancer` 和 `EnhancedEEGHandler` 的各参数
+- `main.py` `create_model()` 传入 `predictor_config=config.get('v5_optimization', {}).get('advanced_prediction')`
+- `main.py` `train_model()` 传入 `optimization_config=config.get('v5_optimization')`
+
+---
+
+### 🟡 BUG-C (元数据丢失, 活跃路径): `main.py` — 合并图时遗漏 sampling_rate
+
+**问题**：多模态图合并时只复制了 `x`, `num_nodes`, `pos`，未复制 `sampling_rate`。`log_training_summary()` 中显示的采样率会回落到错误的默认值（EEG: 250 Hz 硬编码默认，fMRI: 0.5 Hz 硬编码默认），即使真实数据的采样率不同。
+
+**修复**：合并循环中加入 `sampling_rate` 属性复制
+
+---
+
+### 🔴 BUG-D (CRASH, 非活跃路径): `enhanced_graph_native.py` — Optimizer 只覆盖 base_model
+
+**问题**：`EnhancedGraphNativeTrainer.__init__()` 先以 `model.base_model` 调用 `super().__init__()` 创建 optimizer，再 `self.model = model` 替换为增强模型。optimizer 的参数快照已固定为 `base_model.parameters()`。`ConsciousnessModule`, `CrossModalAttention`, `HierarchicalPredictiveCoding` 的所有参数有梯度但永远不会被更新 (gradient is computed but optimizer step is a no-op for them)。
+
+**修复**：在 `super().__init__()` 后用 `self.model.parameters()` 重建 optimizer
+
+---
+
+### 🔴 BUG-E (CRASH + 数据空间错误, 非活跃路径): `enhanced_graph_native.py` — ConsciousGraphNativeBrainModel API 不兼容
+
+**问题1（CRASH）**：`ConsciousGraphNativeBrainModel.forward()` 无 `return_prediction` / `return_encoded` 参数，无 `use_prediction` 属性，无 `compute_loss()` 方法。父类 `train_step()` 调用这些都会 `TypeError` / `AttributeError`。
+
+**问题2（数据空间错误）**：cross-modal attention 接收 `reconstructions.get('eeg')` 即解码器输出 `[N, T, 1]`（信号空间，C=1），但 `CrossModalAttention` 期望 `[batch, N, hidden_dim=256]`（潜空间）。Shape 和语义都是错的。
+
+**修复**：
+- 添加 `use_prediction` property、`loss_type` property、`compute_loss()` delegation
+- `forward()` 新增 `return_prediction`, `return_encoded`, `return_consciousness_metrics` 参数
+- 改为调用 `base_model(data, return_encoded=True)` 获取真正的潜表征（encoded latent），用它驱动 cross-modal attention 和 consciousness module
+- 返回格式与 `GraphNativeBrainModel.forward()` 完全兼容（2/3/4-tuple 依 flags）
+
+---
+
+### 🔴 BUG-F (死代码, 非活跃路径): `enhanced_graph_native.py` — compute_additional_losses() 从未被调用
+
+**问题**：`compute_additional_losses()` 定义了 consciousness loss 和 free energy loss，但没有任何训练路径调用它。这两个损失对模型训练零贡献。
+
+**修复**：`EnhancedGraphNativeTrainer` 新增 `train_step()` 覆盖方法，在同一 forward/backward 中提取 `consciousness_info` 并调用 `compute_additional_losses()`，将附加损失加入 `total_loss`。同时修复了 AMP autocast 在 forward 中正确包裹的问题。
+
+---
 
 ### 🔴 关键 Bug 修复（3 处）
 

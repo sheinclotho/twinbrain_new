@@ -512,13 +512,17 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 # Multi-modal: merge into heterograph
                 built_graph = HeteroData()
                 for modality, graph in graph_list:
-                    # Copy node features and structure
+                    # Copy node features, structure, AND metadata
                     for key in graph.node_types:
                         built_graph[key].x = graph[key].x
                         if hasattr(graph[key], 'num_nodes'):
                             built_graph[key].num_nodes = graph[key].num_nodes
                         if hasattr(graph[key], 'pos'):
                             built_graph[key].pos = graph[key].pos
+                        # sampling_rate used by log_training_summary; omitting it
+                        # causes silent fallback to wrong defaults (250 Hz / 0.5 Hz)
+                        if hasattr(graph[key], 'sampling_rate'):
+                            built_graph[key].sampling_rate = graph[key].sampling_rate
                     
                     # Copy edge structure
                     for edge_type in graph.edge_types:
@@ -618,6 +622,7 @@ def create_model(config: dict, logger: logging.Logger):
         dropout=config['model']['dropout'],
         loss_type=config['model'].get('loss_type', 'mse'),
         use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
+        predictor_config=config.get('v5_optimization', {}).get('advanced_prediction'),
     )
     
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
@@ -814,6 +819,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         use_torch_compile=config['device'].get('use_torch_compile', True),
         compile_mode=config['device'].get('compile_mode', 'reduce-overhead'),
         device=config['device']['type'],
+        optimization_config=config.get('v5_optimization'),
     )
     logger.info("✅ 训练器初始化完成")
     logger.info("=" * 60)

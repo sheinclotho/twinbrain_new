@@ -182,6 +182,7 @@ class GraphNativeBrainModel(nn.Module):
         dropout: float = 0.1,
         loss_type: str = 'mse',
         use_gradient_checkpointing: bool = False,
+        predictor_config: Optional[Dict] = None,
     ):
         """
         Initialize complete model.
@@ -199,6 +200,9 @@ class GraphNativeBrainModel(nn.Module):
             loss_type: Loss function type ('mse', 'huber', 'smooth_l1')
             use_gradient_checkpointing: Free intermediate activations per timestep
                 to avoid MemoryError on long sequences (trades memory for compute)
+            predictor_config: Optional dict from config['v5_optimization']['advanced_prediction'].
+                Keys: use_hierarchical, use_transformer, use_uncertainty, num_scales,
+                num_windows, sampling_strategy.  Defaults used when None.
         """
         super().__init__()
         
@@ -228,12 +232,17 @@ class GraphNativeBrainModel(nn.Module):
         
         # Predictor: Future prediction (optional)
         if use_prediction:
+            pred_cfg = predictor_config or {}
             self.predictor = EnhancedMultiStepPredictor(
                 input_dim=hidden_channels,
                 hidden_dim=hidden_channels * 2,
                 prediction_steps=prediction_steps,
-                use_hierarchical=True,
-                use_transformer=True,
+                use_hierarchical=pred_cfg.get('use_hierarchical', True),
+                use_transformer=pred_cfg.get('use_transformer', True),
+                use_uncertainty=pred_cfg.get('use_uncertainty', True),
+                num_scales=pred_cfg.get('num_scales', 3),
+                num_windows=pred_cfg.get('num_windows', 3),
+                sampling_strategy=pred_cfg.get('sampling_strategy', 'uniform'),
             )
     
     def forward(
@@ -445,6 +454,7 @@ class GraphNativeTrainer:
         use_torch_compile: bool = True,
         compile_mode: str = 'reduce-overhead',
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        optimization_config: Optional[Dict] = None,
     ):
         """
         Initialize trainer.
@@ -463,7 +473,11 @@ class GraphNativeTrainer:
             use_torch_compile: Use torch.compile() for 20-40% speedup (PyTorch 2.0+)
             compile_mode: Compilation mode ('default', 'reduce-overhead', 'max-autotune')
             device: Device to train on
+            optimization_config: Optional dict from config['v5_optimization'].
+                Contains sub-dicts 'adaptive_loss' and 'eeg_enhancement' with
+                fine-grained hyperparameters.  Defaults used when None.
         """
+        self._optimization_config = optimization_config or {}
         self.model = model.to(device)
         self.device = device
         self.node_types = node_types
@@ -581,10 +595,15 @@ class GraphNativeTrainer:
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
             
+            al_cfg = self._optimization_config.get('adaptive_loss', {})
             self.loss_balancer = AdaptiveLossBalancer(
                 task_names=task_names,
                 modality_names=node_types,
-                modality_energy_ratios={'eeg': 0.02, 'fmri': 1.0},
+                alpha=al_cfg.get('alpha', 1.5),
+                update_frequency=al_cfg.get('update_frequency', 10),
+                learning_rate=al_cfg.get('learning_rate', 0.025),
+                warmup_epochs=al_cfg.get('warmup_epochs', 5),
+                modality_energy_ratios=al_cfg.get('modality_energy_ratios', {'eeg': 0.02, 'fmri': 1.0}),
             )
         
         # EEG enhancement
@@ -594,11 +613,18 @@ class GraphNativeTrainer:
                 # Get EEG channel count from model (with safety checks)
                 if hasattr(model.encoder, 'input_proj') and 'eeg' in model.encoder.input_proj:
                     eeg_channels = model.encoder.input_proj['eeg'].in_features
+                    eeg_cfg = self._optimization_config.get('eeg_enhancement', {})
                     self.eeg_handler = EnhancedEEGHandler(
                         num_channels=eeg_channels,
-                        enable_monitoring=True,
-                        enable_attention=True,
-                        enable_regularization=True,
+                        enable_monitoring=eeg_cfg.get('enable_monitoring', True),
+                        enable_dropout=eeg_cfg.get('enable_dropout', True),
+                        enable_attention=eeg_cfg.get('enable_attention', True),
+                        enable_regularization=eeg_cfg.get('enable_regularization', True),
+                        dropout_rate=eeg_cfg.get('dropout_rate', 0.1),
+                        attention_hidden_dim=eeg_cfg.get('attention_hidden_dim', 64),
+                        entropy_weight=eeg_cfg.get('entropy_weight', 0.01),
+                        diversity_weight=eeg_cfg.get('diversity_weight', 0.01),
+                        activity_weight=eeg_cfg.get('activity_weight', 0.01),
                     ).to(self.device)  # Move to device to prevent device mismatch errors
                 else:
                     logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
