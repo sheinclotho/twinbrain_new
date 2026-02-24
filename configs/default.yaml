@@ -134,6 +134,13 @@ windowed_sampling:
   eeg_window_size: 500    # EEG 每个窗口的采样点数（建议 250-2000）
   stride_fraction: 0.5    # 步长 = window_size × stride_fraction（0.5 = 50% 重叠）
 
+  # 跨模态时间对齐（实验性功能）
+  # false（默认）：各模态使用各自自然时间尺度（intra-modal 预测推荐）
+  # true：EEG 窗口大小 = round(fmri_window_size × T_eeg / T_fmri)，
+  #        强制 EEG/fMRI 窗口覆盖相同实际时长（跨模态预测时需要）
+  #        ⚠ 启用前确认 GPU 内存足够：对齐后 EEG 窗口通常达数千点
+  cross_modal_align: false
+
 # V5优化配置
 v5_optimization:
   # 自适应损失平衡

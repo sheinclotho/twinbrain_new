@@ -1,8 +1,50 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-23  
-**版本**：V5.8  
+**最后更新**：2026-02-24  
+**版本**：V5.9  
 **状态**：生产就绪
+
+---
+
+## [V5.9] 2026-02-24 — 修复三处死代码：预测头、EEG正则、跨模态对齐
+
+### 🔴 关键 Bug 修复（3 处）
+
+#### 1. 预测头从未训练（`graph_native_system.py`）
+
+**问题**：`compute_loss()` 有明确注释 "implement as future work"。`EnhancedMultiStepPredictor`（含 Transformer、GRU、数千参数）在所有训练步骤中均未接收任何梯度信号。`train_step()` 以 `return_prediction=False` 调用模型，预测头参数完全无效。`AdaptiveLossBalancer` 中 `pred_*` 任务名 = 空占位符。
+
+**根因**：旧代码的注释准确描述了问题：预测头输出在潜空间 H，而数据标签在原始信号空间 C，无法直接比较。
+
+**修复**（自监督潜空间预测损失）：
+- `GraphNativeBrainModel.forward()` 新增 `return_encoded: bool` 参数，当 True 时额外返回 `{node_type: h[N,T,H]}` 字典。
+- `GraphNativeBrainModel.compute_loss()` 新增 `encoded` 参数；当提供且 `use_prediction=True` 时，将潜序列切分为 context（前 2/3）→ 预测 future（后 1/3），两者均在潜空间 H，可直接 MSE/Huber 比较。
+- `GraphNativeTrainer.train_step()` 调用 `return_encoded=True` 并将 `encoded` 传入 `compute_loss`。
+- 隐式跨模态：ST-GCN 的 EEG→fMRI 边使两个模态的潜向量相互混合，故"预测 fMRI 潜向量未来"已包含来自 EEG 的跨模态信息。
+
+**数据量对比**（以 fMRI T=300, T_ctx=200 为例）：
+```
+旧：predictors 预测 0 步，loss=0，梯度=0
+新：context[N,200,H] → predict future[N,100,H]，有效梯度信号
+```
+
+#### 2. EEG 防零崩塌正则化从未生效（`graph_native_system.py`）
+
+**问题**：`eeg_handler()` 返回的 `eeg_info['regularization_loss']`（熵损失 + 多样性损失 + 活动损失）一直被静默丢弃，从未加入 `total_loss`。`AntiCollapseRegularizer` 完全是死代码。EEG 有大量"静默通道"（低振幅/低方差），模型可以把这些通道的重建输出设为接近零——MSE 最低，梯度最小，通道彻底被忽略。
+
+**修复**：
+- 在 `train_step()` 中初始化 `eeg_info: dict = {}`（确保变量始终定义）。
+- 在自适应损失平衡后，提取 `eeg_reg = eeg_info.get('regularization_loss')` 并加入 `total_loss`。
+- EEG 正则化权重（0.01）已在 `AntiCollapseRegularizer` 初始化时配置，故额外开销可控。
+- AMP 和非 AMP 两条路径均已修复。
+
+#### 3. 跨模态预测时序对齐缺失（`main.py`）
+
+**问题**：`windowed_sampling` 默认使用 `fmri_window_size=50 TRs ≈ 100s` 和 `eeg_window_size=500 pts = 2s`，两者覆盖完全不同的实际时长。对于各模态预测自身未来（intra-modal）这没有问题；但若要用 EEG 上下文预测 fMRI 未来（cross-modal），必须让两个窗口覆盖相同时长。
+
+**修复**：在 `extract_windowed_samples()` 中新增 `cross_modal_align` 选项（默认 False）：
+- `True`：`ws_eeg = round(ws_fmri × T_eeg / T_fmri)`，强制时间对齐。
+- 配置项：`windowed_sampling.cross_modal_align: false`（见 `configs/default.yaml`）。
 
 ---
 

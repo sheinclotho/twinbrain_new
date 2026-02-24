@@ -182,6 +182,27 @@ def extract_windowed_samples(
     # 以 fMRI 作为参考模态（时间步最少，避免分数窗口）
     # 若无 fMRI 则取节点数第一项
     ref_type = 'fmri' if 'fmri' in node_types else node_types[0]
+
+    # ── 跨模态时间对齐（可选）────────────────────────────────────────
+    # 默认（cross_modal_align=False）：各模态使用各自的自然时间尺度。
+    #   fMRI 50 TRs ≈ 100s（慢血动力学），EEG 500 pts = 2s（快神经振荡）。
+    #   适用于：各模态预测自身未来（intra-modal prediction，默认场景）。
+    #
+    # cross_modal_align=True：强制所有模态窗口覆盖相同的实际时长。
+    #   ws_eeg = round(ws_fmri × T_eeg / T_fmri)
+    #   适用于：跨模态预测（EEG→fMRI、fMRI→EEG）。
+    #   ⚠ 注意：对齐后 EEG 窗口约 12500 pts（500s at 250Hz），
+    #            可能导致 CUDA OOM。确保 VRAM 足够后再启用。
+    if w_cfg.get('cross_modal_align', False) and ref_type == 'fmri' and 'eeg' in node_types:
+        T_fmri_ref = T_per_type['fmri']
+        if T_fmri_ref > 0:
+            T_eeg = T_per_type['eeg']
+            ws_fmri = window_sizes['fmri']
+            window_sizes['eeg'] = round(ws_fmri * (T_eeg / T_fmri_ref))
+            logger.debug(
+                f"跨模态时间对齐已启用: EEG 窗口调整为 {window_sizes['eeg']} pts"
+                f" (与 fMRI {ws_fmri} TRs 覆盖相同实际时长)"
+            )
     ws_ref = window_sizes[ref_type]
     T_ref = T_per_type[ref_type]
     stride = max(1, int(ws_ref * stride_fraction))

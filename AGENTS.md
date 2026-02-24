@@ -306,3 +306,43 @@
 2. 缓存存储**完整 run 图**（topology=全序列相关），窗口切分在运行时从缓存图提取（cheap tensor slice）。
 3. `fmri_window_size=50`（TRs）与 `eeg_window_size=500`（samples）对齐的是**认知时长**，不是样本数——两者均约等于 100 秒（fMRI: 50×2s=100s; EEG: 500÷250Hz=2s，注意 EEG/fMRI 一般非同步采集，2s EEG epoch 与 100s fMRI window 各自对应其模态的自然时间尺度）。
 4. `edge_index` 在同一 run 的所有窗口间**共享同一对象**（不复制），节省内存。
+5. 跨模态预测（EEG→fMRI）需要 `cross_modal_align: true`，此时 `ws_eeg = round(ws_fmri × T_eeg/T_fmri)`；⚠ 会显著增大 EEG 窗口（可能导致 CUDA OOM）。
+
+---
+
+## 八、损失函数体系（关键——防止重蹈死代码错误）
+
+> **教训**：有 3 处精心设计的组件长期是死代码：预测头无梯度、EEG 正则被丢弃、跨模态窗口对齐缺失。每次新增 loss 组件，必须检查以下完整链路。
+
+### 损失函数调用链路（必须完整）
+
+```
+train_step()
+    eeg_handler() → eeg_info['regularization_loss']  ← 必须加入 total_loss
+    model.forward(return_encoded=True) → reconstructed, _, encoded
+    model.compute_loss(data, reconstructed, encoded=encoded)
+        ├── recon_{node_type}: 重建损失（decoder 输出 vs 原始信号）
+        └── pred_{node_type}: 潜空间预测损失（context→predict future，均在 H 空间）
+    loss_balancer(losses)  ← 只平衡 recon_* 和 pred_*，不处理 eeg_reg
+    total_loss += eeg_info['regularization_loss']   ← eeg_reg 固定权重，不参与平衡
+    total_loss.backward()
+```
+
+### 每种损失的设计意图
+
+| 损失名 | 空间 | 目的 | 权重 |
+|--------|------|------|------|
+| `recon_eeg` | 原始 C=1 | EEG 信号重建 | 自适应（loss_balancer） |
+| `recon_fmri` | 原始 C=1 | fMRI 信号重建 | 自适应（loss_balancer） |
+| `pred_eeg` | 潜空间 H | EEG 潜向量未来预测（含跨模态混合） | 自适应（loss_balancer） |
+| `pred_fmri` | 潜空间 H | fMRI 潜向量未来预测（含跨模态混合） | 自适应（loss_balancer） |
+| `eeg_reg` | 原始 C=1 | 防止 EEG 静默通道崩塌（熵+多样性+活动） | 固定 0.01 × 3 |
+
+### 为什么"潜空间预测"隐式包含跨模态信息
+
+ST-GCN 编码器含 EEG→fMRI 跨模态边。因此：
+- `h_fmri` 已包含通过 EEG 电极发来的消息
+- "预测 fMRI 潜向量未来" = "用含 EEG 信息的表征预测含 EEG 信息的未来"
+- 等价于一种软跨模态预测，无需专用跨模态预测头
+
+真正的跨模态预测（EEG context → fMRI future，空间维度不同）需要额外的跨模态预测头，目前未实现（future work）。
