@@ -146,11 +146,22 @@ class BrainDataLoader:
         """加载fMRI数据"""
         try:
             # 查找fMRI文件
+            # 优先使用任务特异性模式；若找不到则回退到该被试下任意 bold.nii* 文件。
+            # 这处理了 EEG 文件包含 task-XXX 标签而 fMRI 文件无任务标签的常见情况。
             fmri_pattern = f"{subject_id}*bold.nii*"
             if task:
-                fmri_pattern = f"{subject_id}*task-{task}*bold.nii*"
-            
-            fmri_files = list(self.data_root.glob(f"**/{fmri_pattern}"))
+                task_pattern = f"{subject_id}*task-{task}*bold.nii*"
+                fmri_files = list(self.data_root.glob(f"**/{task_pattern}"))
+                if not fmri_files:
+                    # 回退：在该被试目录下搜索任意 bold.nii* 文件
+                    fmri_files = list(self.data_root.glob(f"**/{fmri_pattern}"))
+                    if fmri_files:
+                        logger.warning(
+                            f"未找到任务特异性fMRI文件 (task-{task})，"
+                            f"回退到: {fmri_files[0].name}"
+                        )
+            else:
+                fmri_files = list(self.data_root.glob(f"**/{fmri_pattern}"))
             
             if not fmri_files:
                 logger.warning(f"未找到fMRI文件: {subject_id}")
