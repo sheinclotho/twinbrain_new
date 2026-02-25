@@ -1,8 +1,51 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-25  
-**版本**：V5.14  
+**版本**：V5.15  
 **状态**：生产就绪
+
+---
+
+## [V5.15] 2026-02-25 — 显式 fMRI-EEG 任务对齐（1:N 场景支持）
+
+### 🔍 问题分析
+
+用户数据中存在「1 fMRI 对应 2 个 EEG 条件」的场景（GRADON / GRADOFF 条件各对应一个 EEG 录音，但只有一个 fMRI run，文件名含 `task-CB`）。
+
+**旧代码的三个缺陷**：
+1. `_discover_tasks()` 同时扫描 EEG 和 fMRI 文件名，发现了 `CB` 任务——但 `task-CB` 没有对应 EEG，加载后产生无跨模态边的单模态 fMRI 图（对联合训练毫无价值，纯浪费预处理时间）。
+2. GRADON/GRADOFF 加载 fMRI 时依赖静默回退（"未找到 task-GRADON fMRI，回退到任意 bold 文件"），对应关系完全不透明，靠「碰巧文件名」成立。
+3. 无任何配置项让用户显式声明哪个 EEG 任务对应哪个 fMRI——1:N 对齐是「设计缺失」而非「设计完成」。
+
+### ✨ 新增功能：`fmri_task_mapping` 显式对齐
+
+**`configs/default.yaml`**（新增配置项）：
+```yaml
+fmri_task_mapping: null  # 默认 null = 旧行为（向后兼容）
+
+# 示例（GRADON 和 GRADOFF 均对应 task-CB 的 fMRI）：
+# fmri_task_mapping:
+#   GRADON: CB
+#   GRADOFF: CB
+```
+
+**`data/loaders.py`**：
+- `BrainDataLoader.__init__` 新增 `fmri_task_mapping` 参数
+- `_load_fmri()` 查找顺序：① 映射后的 fMRI 任务名 → ② EEG 同名 fMRI → ③ 任意 bold（回退）
+- `_discover_tasks()` 配置映射后只扫描 EEG 文件（避免 fMRI-only 幽灵任务）
+
+**`main.py`**：
+- `prepare_data()` 读取 `config['data']['fmri_task_mapping']` 并传入 `BrainDataLoader`
+
+### 📊 行为变化对比
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| 自动发现任务（tasks: null） | 发现 GRADON, GRADOFF, CB（3个 run） | 仅发现 GRADON, GRADOFF（2个 run，配置映射后） |
+| task-CB run | 加载为单模态 fMRI 图 | **不加载**（无 EEG 配对） |
+| GRADON 的 fMRI | 静默回退+警告 | 显式映射命中，无警告 |
+| GRADOFF 的 fMRI | 静默回退+警告 | 显式映射命中，无警告 |
+| 未配置 mapping | — | 行为与旧版完全相同 |
 
 ---
 

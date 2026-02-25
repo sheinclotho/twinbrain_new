@@ -20,6 +20,25 @@ data:
   # task: (已弃用，请改用 tasks) 单任务名称；若 tasks 未设置则作为回退。
   task: null
 
+  # EEG 任务 → fMRI 任务 显式映射（1:N 对齐场景）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 适用场景：同一 fMRI 扫描对应多个 EEG 条件（例如 GRADON / GRADOFF 两段
+  # EEG 同步录制，但 fMRI 只有一个 run，文件名含 task-CB）。
+  #
+  # 配置后的行为变化：
+  #   1. 加载 fMRI 时优先按映射后的任务名查找，而非 EEG 任务名（显式 > 回退）。
+  #   2. 自动任务发现（tasks: null）仅扫描 EEG 文件，避免 fMRI-only 任务
+  #      （如 task-CB）被当作独立 run 加载——该 run 因缺少 EEG 而产生无跨模态
+  #      边的单模态图，对联合训练没有价值。
+  #
+  # 示例（GRADON 和 GRADOFF 均使用 task-CB 的 fMRI）：
+  #   fmri_task_mapping:
+  #     GRADON: CB
+  #     GRADOFF: CB
+  #
+  # 1:1 标准场景（EEG 任务名与 fMRI 任务名相同）：保持 null 即可。
+  fmri_task_mapping: null
+
   # 最大被试数 (用于测试, 0 或 null 表示处理所有)
   max_subjects: 0
   

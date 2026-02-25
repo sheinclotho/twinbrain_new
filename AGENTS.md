@@ -292,6 +292,25 @@ key 是 `'eeg__projects_to__fmri'`（字符串），不是 tuple。`GraphNativeE
 
 ---
 
+### [2026-02-25] 1:N EEG→fMRI 对齐是「设计缺失」而非「设计完成」
+
+**场景**：用户数据中 2 个 EEG 条件（GRADON / GRADOFF）共享 1 个 fMRI 扫描（task-CB）。
+
+**思维误区**：`_discover_tasks()` 同时扫描 EEG 和 fMRI 文件名，把"BIDS 文件名中出现的所有 task"等同于"有效的训练 run"。实际上：
+- `task-CB` 来自 fMRI 文件，没有 EEG 配对
+- 把它作为独立 run 加载 → 单模态 fMRI 图（无跨模态边，对联合训练没有价值）
+- GRADON/GRADOFF 找不到同名 fMRI → 静默回退（警告被忽视）→ 看起来工作了，实际上是「碰巧文件名匹配」
+
+**根因**：没有任何配置项让用户声明"哪个 EEG 任务对应哪个 fMRI"。1:N 对齐依靠"顺序回退"实现，而回退在设计上就是应急手段，不是对齐机制。
+
+**正确思路**：每次看到"两种模态的任务名不一致"时，第一个问题应该是：**用户有没有办法显式告诉系统配对关系？** 没有的话，配对逻辑就是不完整的设计。
+
+**修复**：新增 `fmri_task_mapping: dict`（YAML + `BrainDataLoader.__init__`），支持 `{"GRADON": "CB", "GRADOFF": "CB"}` 形式的显式映射；配置后 `_discover_tasks()` 只扫描 EEG 文件（避免幽灵 fMRI-only 任务）；`_load_fmri()` 优先按映射查找。
+
+**影响文件**：`data/loaders.py`、`main.py`、`configs/default.yaml`、`CHANGELOG.md`
+
+---
+
 **TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 
 **核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡。
