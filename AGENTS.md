@@ -410,3 +410,48 @@ ST-GCN 编码器含 EEG→fMRI 跨模态边。因此：
 - 等价于一种软跨模态预测，无需专用跨模态预测头
 
 真正的跨模态预测（EEG context → fMRI future，空间维度不同）需要额外的跨模态预测头，目前未实现（future work）。
+
+---
+
+## 九、数字孪生脑的根本目的与当前架构差距（V5.14 深度分析）
+
+### 数字孪生脑应该是什么
+
+| 维度 | 数字孪生定义 | 当前 V5.14 实现 | 差距 |
+|------|-------------|-----------------|------|
+| **个性化** | 特定于某一个体大脑 | 所有被试共享模型参数 | 未实现 |
+| **动态拓扑** | 连接模式随认知状态改变 | V5.14 新增 DynamicGraphConstructor | **已实现** |
+| **跨会话预测** | 预测下次扫描的脑状态 | 在同一 run 内预测未来窗口 | 部分实现 |
+| **干预响应** | 模拟刺激/药物对脑活动的影响 | 未实现 | 未实现 |
+| **自我演化** | 随学习/发育更新模型 | 需要纵向数据 + 持续学习 | 未实现 |
+
+### 三个最重要的架构差距（按优先级排序）
+
+**Gap 1（已修复）：动态图拓扑** ← V5.14 DynamicGraphConstructor
+- 原问题：edge_index 在数据预处理阶段固定，无法反映认知状态的动态变化
+- 解决：每个 ST-GCN 层从当前节点特征动态推算软邻接，与静态拓扑混合
+
+**Gap 2（未实现）：被试特异性嵌入（真正的个性化）**
+- 每个被试学一个可学习的嵌入向量 `subject_embed[subject_id]`，在 forward() 开始时加到节点特征上
+- 推理时只需 fine-tune 该嵌入（frozen encoder），即"few-shot personalization"
+- 实现要点：
+  1. `GraphNativeBrainModel` 加 `nn.Embedding(num_subjects, hidden_channels)`
+  2. `data` 中存储 `subject_idx` (int)
+  3. `forward()` 开始时 `x += self.subject_embed(subject_idx)`
+  4. `create_model()` 从图列表推断 num_subjects
+
+**Gap 3（未实现）：跨会话预测（真正的"孪生"预测力）**
+- 当前 pred_loss 是 within-run（context→future in same scan）
+- 真正的孪生应能预测 next-session brain state given current session
+- 需要：跨会话数据对、subject-specific state persistence
+
+### 为什么 Gap 2 比 Gap 3 更优先
+- Gap 2 直接由现有训练数据（多被试）实现
+- Gap 3 需要额外的纵向设计（同一被试多次扫描）
+- Gap 2 实现后，每个被试的嵌入即是"个人大脑的数字指纹"
+
+### DynamicGraphConstructor 的正确使用姿势
+- 默认 `use_dynamic_graph: false`（后向兼容）
+- 研究场景推荐 `true`：对认知神经科学应用，功能连接动态性是核心现象
+- 小数据集（< 50 样本）建议谨慎：动态图引入额外参数（每层 `node_proj + mix_logit`），可能过拟合
+- `k_dynamic_neighbors` 建议：fMRI(N=200) 设 10；EEG(N≤64) 设 5

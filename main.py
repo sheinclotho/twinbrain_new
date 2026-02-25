@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -625,6 +626,8 @@ def create_model(config: dict, logger: logging.Logger):
         loss_type=config['model'].get('loss_type', 'mse'),
         use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
         predictor_config=config.get('v5_optimization', {}).get('advanced_prediction'),
+        use_dynamic_graph=config['model'].get('use_dynamic_graph', False),
+        k_dynamic_neighbors=config['model'].get('k_dynamic_neighbors', 10),
     )
     
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
@@ -774,7 +777,6 @@ def log_training_summary(
 
 def train_model(model, graphs, config: dict, logger: logging.Logger):
     """训练模型"""
-    import random
     logger.info("=" * 60)
     logger.info("步骤 4/4: 训练模型")
     logger.info("=" * 60)

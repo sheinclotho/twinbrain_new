@@ -22,6 +22,126 @@ from typing import Dict, Optional, Tuple, List
 import math
 
 
+class DynamicGraphConstructor(nn.Module):
+    """
+    自迭代图结构学习器 — Self-iterating Graph Structure Learning.
+
+    用户的"自迭代图结构，模拟复杂系统的自演化"在机器学习文献中对应
+    Graph Structure Learning (GSL) 或自适应图卷积网络 (AGCRN, Bai et al. 2020)。
+
+    核心思路：图拓扑不再固定在数据预处理阶段，而是在每个 ST-GCN 层内
+    根据当前节点特征动态计算，与预先估计的静态拓扑混合使用。这与神经科学
+    中动态功能连接（Dynamic Functional Connectivity, dFC; Hutchison 2013）
+    的概念完全对应：大脑的功能连接随认知状态实时重构，而非固定不变。
+
+    算法步骤：
+    1. 均值池化时间维度：x[N, T, H] → x_agg[N, H]
+    2. 投影 + L2 归一化：e[N, H//2]（无偏置，避免常数偏移影响相似性计算）
+    3. 余弦相似度矩阵：sim[N, N] = e @ e.T
+    4. Top-k 稀疏化：每节点保留 k 个最强连接（去除自环）
+    5. 可学习混合权重 α（sigmoid 约束到 [0,1]）：
+       combined = (1-α) × fixed_edges + α × dynamic_edges
+
+    可学习参数：
+    - node_proj (H→H//2)：节点嵌入投影
+    - mix_logit (scalar)：控制动态 vs 固定拓扑的混合比例
+
+    参考文献：
+    - Bai et al. (2020). Adaptive Graph Convolutional Recurrent Network.
+    - Hutchison et al. (2013). Dynamic functional connectivity. NeuroImage.
+    - Cao et al. (2020). Spectral Temporal Graph Neural Network. NeurIPS.
+    """
+
+    def __init__(
+        self,
+        hidden_channels: int,
+        k_neighbors: int = 10,
+        mix_alpha: float = 0.3,
+    ):
+        """
+        Args:
+            hidden_channels: 节点特征维度（ST-GCN 输出）。
+            k_neighbors: 动态图每节点保留的 k 近邻数。
+                建议：fMRI 10（200 节点图）；EEG 5（63 节点图）。
+            mix_alpha: 初始混合比例（0 = 全静态，1 = 全动态）。
+                设为 0.3：以静态拓扑为主（来自全 run 相关估计，统计可靠），
+                动态分量 30% 允许模型捕捉认知状态依赖的连接。
+        """
+        super().__init__()
+        self.k = k_neighbors
+        # 可学习混合参数：sigmoid(mix_logit) = alpha
+        # logit(0.3) ≈ -0.847
+        self.mix_logit = nn.Parameter(
+            torch.tensor(math.log(mix_alpha / (1.0 - mix_alpha + 1e-8)))
+        )
+        # 节点嵌入投影（无偏置，保证 L2 归一化后余弦相似度的纯方向语义）
+        self.node_proj = nn.Linear(hidden_channels, hidden_channels // 2, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        fixed_edge_index: torch.Tensor,
+        fixed_edge_attr: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算混合（动态 + 静态）图拓扑。
+
+        Args:
+            x: 当前层节点特征 [N, T, H]
+            fixed_edge_index: 预计算静态边 [2, E_fixed]
+            fixed_edge_attr: 静态边权重 [E_fixed, 1]，可为 None
+
+        Returns:
+            combined_edge_index: [2, E_fixed + E_dyn]
+            combined_edge_attr: [E_fixed + E_dyn, 1]
+        """
+        N = x.shape[0]
+
+        # 1. 时间维度均值池化（跨 T 聚合，得到节点级全局表征）
+        x_agg = x.mean(dim=1)  # [N, H]
+
+        # 2. 投影 + L2 归一化（保证余弦相似度等价于点积）
+        e = F.normalize(self.node_proj(x_agg), dim=-1)  # [N, H//2]
+
+        # 3. 余弦相似度矩阵 [N, N]（GPU 矩阵乘法，O(N²·H//2)）
+        sim = torch.mm(e, e.T)
+
+        # 4. Top-k 稀疏化：每节点保留 k 个最强连接
+        #    k+1 是为了包含自环（自身余弦相似度 = 1.0，永远最大），再去掉
+        k = min(self.k, N - 1)
+        if k < 1:
+            # N=1 的退化情况：无法构建任何动态边，直接返回静态拓扑
+            fa = fixed_edge_attr if fixed_edge_attr is not None else \
+                torch.ones(fixed_edge_index.shape[1], 1, device=x.device)
+            return fixed_edge_index, fa
+
+        topk_vals, topk_idx = torch.topk(sim, k + 1, dim=1)  # [N, k+1]
+        topk_vals = topk_vals[:, 1:]  # [N, k]，去掉自环
+        topk_idx  = topk_idx[:, 1:]   # [N, k]
+
+        # 构建稀疏 edge_index
+        src = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, k).reshape(-1)
+        dst = topk_idx.reshape(-1)
+        dyn_edge_index = torch.stack([src, dst], dim=0)   # [2, N*k]
+        dyn_edge_attr  = topk_vals.reshape(-1, 1)         # [N*k, 1]
+
+        # 5. 可学习混合：alpha 控制动态比例
+        alpha = torch.sigmoid(self.mix_logit)
+
+        if fixed_edge_attr is None:
+            fixed_edge_attr = torch.ones(
+                fixed_edge_index.shape[1], 1, device=x.device
+            )
+
+        combined_edge_index = torch.cat([fixed_edge_index, dyn_edge_index], dim=1)
+        combined_edge_attr  = torch.cat([
+            fixed_edge_attr * (1.0 - alpha),
+            dyn_edge_attr   * alpha,
+        ], dim=0)
+
+        return combined_edge_index, combined_edge_attr
+
+
 class SpatialTemporalGraphConv(MessagePassing):
     """
     Spatial-Temporal Graph Convolution.
@@ -349,6 +469,8 @@ class GraphNativeEncoder(nn.Module):
         attention_heads: int = 4,
         use_gradient_checkpointing: bool = False,
         dropout: float = 0.1,
+        use_dynamic_graph: bool = False,
+        k_dynamic_neighbors: int = 10,
     ):
         """
         Initialize graph-native encoder.
@@ -365,6 +487,14 @@ class GraphNativeEncoder(nn.Module):
             use_gradient_checkpointing: Free intermediate activations per timestep
                 to avoid MemoryError on long sequences (trades memory for compute)
             dropout: Dropout rate
+            use_dynamic_graph: Enable self-iterating graph structure learning.
+                At each ST-GCN layer, a DynamicGraphConstructor computes a soft
+                adjacency from current node features (cosine similarity + top-k)
+                and mixes it with the pre-computed fixed edges via a learnable α.
+                Implements the "自迭代图结构" concept (AGCRN, Bai et al. 2020).
+                Only applies to intra-modal edges (src == dst node type).
+            k_dynamic_neighbors: Number of neighbors kept per node in the
+                dynamically computed adjacency.
         """
         super().__init__()
         
@@ -420,6 +550,23 @@ class GraphNativeEncoder(nn.Module):
             })
         
         self.dropout = nn.Dropout(dropout)
+
+        # 自迭代图结构学习器（每层一个，仅同模态边有效）
+        # Cross-modal edges skip dynamic topology: EEG and fMRI are different
+        # node types with no natural intra-type similarity to exploit.
+        self.use_dynamic_graph = use_dynamic_graph
+        if use_dynamic_graph:
+            intra_modal_ets = [et for et in edge_types if et[0] == et[2]]
+            self.dynamic_constructors = nn.ModuleList([
+                nn.ModuleDict({
+                    '__'.join(et): DynamicGraphConstructor(
+                        hidden_channels=hidden_channels,
+                        k_neighbors=k_dynamic_neighbors,
+                    )
+                    for et in intra_modal_ets
+                })
+                for _ in range(num_layers)
+            ])
     
     def forward(self, data: HeteroData) -> HeteroData:
         """
@@ -471,6 +618,22 @@ class GraphNativeEncoder(nn.Module):
                             
                             # Get source features
                             x_src = x_dict[src]
+
+                            # 自迭代图结构：仅对同模态边（src==dst）启用动态拓扑。
+                            # 跨模态边（EEG→fMRI）跳过：两者节点类型不同，
+                            # 不存在可用于推断连接的"节点间余弦相似性"语义。
+                            ei = edge_index
+                            ea = edge_attr
+                            if (
+                                self.use_dynamic_graph
+                                and src == dst  # intra-modal only
+                                and hasattr(self, 'dynamic_constructors')
+                                and layer_idx < len(self.dynamic_constructors)
+                                and '__'.join(edge_type) in self.dynamic_constructors[layer_idx]
+                            ):
+                                ei, ea = self.dynamic_constructors[layer_idx][
+                                    '__'.join(edge_type)
+                                ](x_src, edge_index, edge_attr)
                             
                             # Apply ST-GCN
                             # Pass size=(N_src, N_dst) explicitly so propagate()
@@ -484,7 +647,7 @@ class GraphNativeEncoder(nn.Module):
                             conv = stgcn.convs['__'.join(edge_type)]
                             N_src = x_src.shape[0]
                             N_dst = x.shape[0]
-                            msg = conv(x_src, edge_index, edge_attr, size=(N_src, N_dst))
+                            msg = conv(x_src, ei, ea, size=(N_src, N_dst))
                             
                             # Cross-modal edges may have different source T than
                             # destination T (e.g. EEG T=190 vs fMRI T=300).

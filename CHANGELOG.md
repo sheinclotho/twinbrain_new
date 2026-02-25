@@ -1,12 +1,76 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-25  
-**版本**：V5.13  
+**版本**：V5.14  
 **状态**：生产就绪
 
 ---
 
-## [V5.13] 2026-02-25 — 设计回顾：拯救死代码的正确设计意图 + 最终残余清理
+## [V5.14] 2026-02-25 — 数字孪生根本目的分析 + 自迭代图结构 + 清理
+
+### 🧠 架构哲学分析：当前代码是否实现了"数字孪生脑"？
+
+**结论**：当前是一个优秀的**跨模态时空图自编码器**，但距离真正的数字孪生还有三个架构层次的差距。
+
+| 数字孪生维度 | V5.14 状态 | 说明 |
+|------------|-----------|------|
+| 多模态联合建模（EEG+fMRI） | ✅ 已实现 | 跨模态 ST-GCN 边 |
+| 时空保持建模 | ✅ 已实现 | 图原生，无序列转换 |
+| **动态图拓扑** | ✅ **V5.14 新增** | DynamicGraphConstructor |
+| 个性化（被试特异性） | ❌ 未实现 | 所有被试共享参数 |
+| 跨会话预测 | ⚠️ 部分 | 仅 within-run 预测 |
+| 干预/刺激响应模拟 | ❌ 未实现 | 需要干预设计数据 |
+
+### ✨ 核心创新：自迭代图结构 `DynamicGraphConstructor`
+
+**用户洞察**："能不能用自迭代的图结构？模拟复杂系统的自演化。"
+
+这正是机器学习文献中的 Graph Structure Learning (GSL)：
+- AGCRN (Bai et al., 2020): Adaptive Graph Convolutional Recurrent Network
+- StemGNN (Cao et al., 2020): Spectral-Temporal GNN with Learnable Adjacency
+- 神经科学基础：功能连接是动态的 (Hutchison et al., 2013, NeuroImage)
+
+**实现**（`models/graph_native_encoder.py`）：
+```
+每个 ST-GCN 层：
+  1. 均值池化 T 维 → x_agg [N, H]
+  2. 投影 + L2 归一化 → e [N, H//2]
+  3. 余弦相似度 → sim [N, N]
+  4. Top-k 稀疏化 → dyn_edge_index [2, N*k]
+  5. 混合：combined = (1-α)×fixed + α×dynamic
+     α = sigmoid(learnable_logit)，初始 0.3
+```
+- 仅作用于**同模态边**（fmri→fmri, eeg→eeg），跨模态边保持固定
+- 每层独立的 α 值：允许浅层保守（依赖解剖拓扑），深层激进（依赖语义相似性）
+- 额外参数：每层 `node_proj (H × H//2) + mix_logit (scalar)`，约 0.1% 参数增量
+- 配置：`model.use_dynamic_graph: false`（默认关闭，后向兼容）
+
+### 🧹 残余死代码彻底清除
+
+- **`graph_native_mapper.py`**: 删除 `TemporalGraphFeatureExtractor` 类（85 行）
+  - 该类在 V5.12 时已删除了从 `graph_native_system.py` 的导入，但类定义本身遗留
+  - 功能已由 `SpatialTemporalGraphConv` 的 `temporal_conv` 覆盖
+
+- **`main.py`**: `import random` 从 `train_model()` 函数体内移至文件顶层（PEP 8）
+  - V5.12 只移动了 `import time`，`import random` 被遗漏
+
+### 🔧 配置新增
+
+```yaml
+model:
+  use_dynamic_graph: false   # 自迭代图结构（研究场景推荐 true）
+  k_dynamic_neighbors: 10   # 动态图 k 近邻数
+```
+
+### 下一步建议
+
+1. **被试特异性嵌入**（Gap 2，最高优先级）：为每个被试学习一个嵌入向量，使模型真正个性化
+2. **开启 `use_dynamic_graph: true`** 并比较 val_loss 曲线
+3. 扩大数据量（更多被试 + 启用 `windowed_sampling`）以充分利用动态图
+
+---
+
+
 
 ### 哲学问题回答：被移除的死代码是好设计还是坏设计？
 

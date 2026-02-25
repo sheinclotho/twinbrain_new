@@ -183,6 +183,8 @@ class GraphNativeBrainModel(nn.Module):
         loss_type: str = 'mse',
         use_gradient_checkpointing: bool = False,
         predictor_config: Optional[Dict] = None,
+        use_dynamic_graph: bool = False,
+        k_dynamic_neighbors: int = 10,
     ):
         """
         Initialize complete model.
@@ -203,6 +205,9 @@ class GraphNativeBrainModel(nn.Module):
             predictor_config: Optional dict from config['v5_optimization']['advanced_prediction'].
                 Keys: use_hierarchical, use_transformer, use_uncertainty, num_scales,
                 num_windows, sampling_strategy.  Defaults used when None.
+            use_dynamic_graph: Enable self-iterating graph structure learning
+                (DynamicGraphConstructor per ST-GCN layer, intra-modal edges only).
+            k_dynamic_neighbors: k-nearest neighbours for the dynamic adjacency.
         """
         super().__init__()
         
@@ -220,6 +225,8 @@ class GraphNativeBrainModel(nn.Module):
             num_layers=num_encoder_layers,
             use_gradient_checkpointing=use_gradient_checkpointing,
             dropout=dropout,
+            use_dynamic_graph=use_dynamic_graph,
+            k_dynamic_neighbors=k_dynamic_neighbors,
         )
         
         # Decoder: Reconstruct temporal signals
