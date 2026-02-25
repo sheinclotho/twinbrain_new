@@ -22,7 +22,6 @@ from .graph_native_encoder import (
 )
 from .graph_native_mapper import (
     GraphNativeBrainMapper,
-    TemporalGraphFeatureExtractor,
 )
 
 # Optimization modules
@@ -72,7 +71,6 @@ __all__ = [
     'GraphNativeEncoder',
     'SpatialTemporalGraphConv',
     'GraphNativeBrainMapper',
-    'TemporalGraphFeatureExtractor',
     # Optimization
     'AdaptiveLossBalancer',
     'EnhancedEEGHandler',

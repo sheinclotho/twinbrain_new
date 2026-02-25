@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
 from nilearn import image
-from nilearn.input_data import NiftiMasker
+try:
+    from nilearn.maskers import NiftiMasker  # nilearn >= 0.10
+except ImportError:
+    from nilearn.input_data import NiftiMasker  # nilearn < 0.10
 from tqdm import tqdm
 
 
