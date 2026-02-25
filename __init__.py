@@ -39,12 +39,10 @@ __author__ = 'TwinBrain Team'
 try:
     from .adaptive_loss_balancer import (
         AdaptiveLossBalancer,
-        ModalityGradientScaler,
     )
 except ImportError as e:
     print(f"Warning: Could not import adaptive_loss_balancer: {e}")
     AdaptiveLossBalancer = None
-    ModalityGradientScaler = None
 
 try:
     from .eeg_channel_handler import (
@@ -82,12 +80,10 @@ except ImportError as e:
 try:
     from .graph_native_mapper import (
         GraphNativeBrainMapper,
-        TemporalGraphFeatureExtractor,
     )
 except ImportError as e:
     print(f"Warning: Could not import graph_native_mapper: {e}")
     GraphNativeBrainMapper = None
-    TemporalGraphFeatureExtractor = None
 
 try:
     from .graph_native_encoder import (
@@ -116,7 +112,6 @@ except ImportError as e:
 __all__ = [
     # Adaptive loss balancing
     'AdaptiveLossBalancer',
-    'ModalityGradientScaler',
     
     # EEG channel handling
     'EnhancedEEGHandler',
@@ -134,7 +129,6 @@ __all__ = [
     
     # Graph-native system (NEW!)
     'GraphNativeBrainMapper',
-    'TemporalGraphFeatureExtractor',
     'GraphNativeEncoder',
     'SpatialTemporalGraphConv',
     'TemporalAttention',
