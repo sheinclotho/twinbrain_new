@@ -1,8 +1,411 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-21  
-**版本**：V5.6  
+**最后更新**：2026-02-25  
+**版本**：V5.14  
 **状态**：生产就绪
+
+---
+
+## [V5.14] 2026-02-25 — 数字孪生根本目的分析 + 自迭代图结构 + 清理
+
+### 🧠 架构哲学分析：当前代码是否实现了"数字孪生脑"？
+
+**结论**：当前是一个优秀的**跨模态时空图自编码器**，但距离真正的数字孪生还有三个架构层次的差距。
+
+| 数字孪生维度 | V5.14 状态 | 说明 |
+|------------|-----------|------|
+| 多模态联合建模（EEG+fMRI） | ✅ 已实现 | 跨模态 ST-GCN 边 |
+| 时空保持建模 | ✅ 已实现 | 图原生，无序列转换 |
+| **动态图拓扑** | ✅ **V5.14 新增** | DynamicGraphConstructor |
+| 个性化（被试特异性） | ❌ 未实现 | 所有被试共享参数 |
+| 跨会话预测 | ⚠️ 部分 | 仅 within-run 预测 |
+| 干预/刺激响应模拟 | ❌ 未实现 | 需要干预设计数据 |
+
+### ✨ 核心创新：自迭代图结构 `DynamicGraphConstructor`
+
+**用户洞察**："能不能用自迭代的图结构？模拟复杂系统的自演化。"
+
+这正是机器学习文献中的 Graph Structure Learning (GSL)：
+- AGCRN (Bai et al., 2020): Adaptive Graph Convolutional Recurrent Network
+- StemGNN (Cao et al., 2020): Spectral-Temporal GNN with Learnable Adjacency
+- 神经科学基础：功能连接是动态的 (Hutchison et al., 2013, NeuroImage)
+
+**实现**（`models/graph_native_encoder.py`）：
+```
+每个 ST-GCN 层：
+  1. 均值池化 T 维 → x_agg [N, H]
+  2. 投影 + L2 归一化 → e [N, H//2]
+  3. 余弦相似度 → sim [N, N]
+  4. Top-k 稀疏化 → dyn_edge_index [2, N*k]
+  5. 混合：combined = (1-α)×fixed + α×dynamic
+     α = sigmoid(learnable_logit)，初始 0.3
+```
+- 仅作用于**同模态边**（fmri→fmri, eeg→eeg），跨模态边保持固定
+- 每层独立的 α 值：允许浅层保守（依赖解剖拓扑），深层激进（依赖语义相似性）
+- 额外参数：每层 `node_proj (H × H//2) + mix_logit (scalar)`，约 0.1% 参数增量
+- 配置：`model.use_dynamic_graph: false`（默认关闭，后向兼容）
+
+### 🧹 残余死代码彻底清除
+
+- **`graph_native_mapper.py`**: 删除 `TemporalGraphFeatureExtractor` 类（85 行）
+  - 该类在 V5.12 时已删除了从 `graph_native_system.py` 的导入，但类定义本身遗留
+  - 功能已由 `SpatialTemporalGraphConv` 的 `temporal_conv` 覆盖
+
+- **`main.py`**: `import random` 从 `train_model()` 函数体内移至文件顶层（PEP 8）
+  - V5.12 只移动了 `import time`，`import random` 被遗漏
+
+### 🔧 配置新增
+
+```yaml
+model:
+  use_dynamic_graph: false   # 自迭代图结构（研究场景推荐 true）
+  k_dynamic_neighbors: 10   # 动态图 k 近邻数
+```
+
+### 下一步建议
+
+1. **被试特异性嵌入**（Gap 2，最高优先级）：为每个被试学习一个嵌入向量，使模型真正个性化
+2. **开启 `use_dynamic_graph: true`** 并比较 val_loss 曲线
+3. 扩大数据量（更多被试 + 启用 `windowed_sampling`）以充分利用动态图
+
+---
+
+
+
+### 哲学问题回答：被移除的死代码是好设计还是坏设计？
+
+| 组件 | 设计意图 | 为何被移除 | 设计本身是否正确 |
+|------|---------|-----------|--------------|
+| `ModalityGradientScaler` | EEG/fMRI 幅值相差 ~50x，需要平衡梯度贡献 | `autograd.grad()` 在 `backward()` 后调用 → 崩溃 | ✅ 问题真实存在；实现方式错误 |
+| `_apply_modality_scaling()` | 对损失施加 per-modality 能量缩放 | `modality_losses` 参数从未传入 → 代码永不执行 | ❌ 与 initial_weights 机制重复；正确移除 |
+| `get_temporal_pooling()` | 静态节点嵌入用于分类等下游任务 | 当前流水线不需要 | ✅ 未来有用；但 YAGNI，正确移除 |
+
+### 🟢 DESIGN RESCUE: `AdaptiveLossBalancer` — 正确实现 ModalityGradientScaler 的设计意图
+
+**根本问题**：`modality_energy_ratios` 存储为 buffer 但**从未用于计算任何内容**。所有任务（`recon_eeg`, `recon_fmri`, `pred_eeg`, `pred_fmri`）以相同初始权重 1.0 开始。这意味着 fMRI 重建损失（~50× 更大）在预热阶段（前 5 个 epoch，权重自适应关闭）完全主导，模型基本忽略 EEG 重建。
+
+**正确实现**（无任何 `autograd.grad()` 调用，零运行时开销）：
+```
+initial_weight(recon_eeg) ∝ 1/energy_eeg = 1/0.02 = 50
+initial_weight(recon_fmri) ∝ 1/energy_fmri = 1/1.0 = 1
+（归一化到 mean=1.0 保持总损失尺度稳定）
+```
+通过在 `__init__` 时匹配任务名后缀与模态名（e.g. `recon_eeg` → `eeg`）实现，任务权重随训练动态自适应调整（warmup 后），但初始条件从第一步就是平衡的。
+
+### 🧹 残余清理（无功能意义的死属性）
+
+- `AdaptiveLossBalancer.update_weights(model, shared_params)` — `model`/`shared_params` 参数接受但从不使用（GradNorm 梯度计算被移除时遗留）；从签名移除；更新两处调用方
+- `AdaptiveLossBalancer.loss_history` 属性 — 创建但从不 append；`reset_history()` 方法只重置空 dict；两者均移除
+- `AdaptiveLossBalancer.modality_energy_ratios` buffer — 不再需要在 forward 时访问（只在 `__init__` 用于计算初始权重）；从 `register_buffer` 改为本地变量
+- `enhanced_graph_native.py` — `from contextlib import nullcontext` 从函数体内移到文件顶层（PEP 8）
+
+---
+
+
+### 🔴 BUG (CRASH, enhanced path): `enhanced_graph_native.py` `EnhancedGraphNativeTrainer.train_step()` — EEG handler 为 None + 形状错误
+
+**问题**：`EnhancedGraphNativeTrainer.train_step()` 覆盖了基类方法，但**未移植** V5.11 的三项 EEG 修复：
+1. 未调用 `_ensure_eeg_handler(N_eeg)` — `self.eeg_handler = None`（基类懒初始化）→ `TypeError: 'NoneType' object is not callable`
+2. 传入 `original_eeg_x = [N_eeg, T, 1]` 而非 handler 期望的 `[1, T, N_eeg]`
+
+**修复**：调用 `_ensure_eeg_handler(N_eeg)` + 使用 `_graph_to_handler_format()` / `_handler_to_graph_format()` 静态方法（与基类完全一致）。
+
+---
+
+### 🧹 大规模死代码清理（-223 行）
+
+#### `adaptive_loss_balancer.py`: 移除 `ModalityGradientScaler` 类（-152 行）
+
+**为何删除**：从未被实例化，内部调用 `torch.autograd.grad(loss, ...)` 会在 `backward()` 释放计算图后崩溃（与 AGENTS.md §2021-02-21 记录的完全相同错误）。
+
+#### `adaptive_loss_balancer.py`: 移除 `_apply_modality_scaling()` 死代码路径（-50 行）
+
+调用者 `self.loss_balancer(losses)` 从不传 `modality_losses` 参数（始终为 `None`），`if self.enable_modality_scaling and modality_losses is not None:` 永远为假。同时移除 `enable_modality_scaling` 参数、`grad_norm_history` 跟踪、`return_weighted` 分支（始终为 True）。
+
+#### `graph_native_encoder.py`: 移除 `GraphNativeEncoder.get_temporal_pooling()`（-36 行）
+
+从未从任何调用方调用。
+
+---
+
+### 🧹 次要清理
+
+- `graph_native_system.py`: 移除死导入 `TemporalGraphFeatureExtractor`（从未使用）
+- `main.py`: 将 `import time` 从函数体内移到文件顶部（PEP 8 规范）
+- `main.py` `build_graphs()`: `_graph_cache_key()` 每次迭代只计算一次，供读缓存和写缓存共用（原先各自独立调用）
+
+---
+
+
+**问题**：`HierarchicalPredictor.__init__()` 的 `upsamplers` 序列中包含 `nn.LayerNorm(input_dim)`。`ConvTranspose1d` 输出形状为 `[N, input_dim, T_up]`，但 `LayerNorm(input_dim)` 标准化的是**最后一维**（= `T_up`），而非 `input_dim`。当 `T_up ≠ input_dim` 时触发 `RuntimeError: normalized_shape does not match input shape`。预测头首次被调用（V5.9 修复死代码后）即崩溃。
+
+**修复**：`nn.LayerNorm(input_dim)` → `nn.BatchNorm1d(input_dim)`，正确对 `[N, C, L]` 格式按通道标准化。
+
+---
+
+### 🟡 BUG-2 (misleading metrics): `graph_native_system.py` `validate()` — 缺少预测损失
+
+**问题**：`validate()` 调用 `compute_loss(data, reconstructed, None)` 不传 `encoded`，导致所有 `pred_*` 损失项被排除在验证之外。验证损失系统性地低于训练损失（因为训练包含 recon + pred，验证只有 recon），使早停机制完全失效（永远觉得没有过拟合）。
+
+**修复**：`validate()` 使用 `return_encoded=True` 并将 `encoded` 传给 `compute_loss`，与训练路径计算完全相同的损失项。
+
+---
+
+### 🟡 BUG-3 (data bias): `main.py` `train_model()` — 顺序切分偏差
+
+**问题**：原代码将 `graphs[:n_train]` 作为训练集、`graphs[n_train:]` 作为验证集。启用窗口采样时，训练集是各 run 的前段窗口，验证集是后段；多被试数据按字母顺序排列时，最后几个被试可能全部只出现在验证集。
+
+**修复**：先 `random.Random(42).shuffle(graphs)` 再切分，`seed=42` 保证复现性。
+
+---
+
+### 🟡 BUG-4 (silent wrong): `graph_native_system.py` — EEG Handler 通道维度错误
+
+**问题**：`EnhancedEEGHandler` 被初始化为 `num_channels = input_proj['eeg'].in_features = 1`（图特征维度），但应为 `N_eeg`（电极数，如 63）。整个通道注意力、通道活动监控、抗崩塌正则化都是对"1 个通道"操作，完全无效。
+
+**根因**：图节点特征形状是 `[N_eeg, T, 1]` — N_eeg 是节点数（电极数），1 是特征维度。`in_features = 1` 是对的，但对于 EEG 通道处理，我们应把电极作为"通道"，即需要 `num_channels = N_eeg`。而 N_eeg 只在运行时从数据中知道。
+
+**修复**：  
+- 延迟初始化：`_ensure_eeg_handler(N_eeg)` 在 `train_step()` 首次调用时建立  
+- 正确重排：`[N_eeg, T, 1] → [1, T, N_eeg]`（电极作为通道），处理后反变换  
+- 提取静态辅助方法 `_graph_to_handler_format()` / `_handler_to_graph_format()` 提升可读性
+
+---
+
+### ✅ QUALITY-5: `graph_native_system.py` — 添加线性 LR 预热
+
+**问题**：`CosineAnnealingWarmRestarts` 从第 1 个 epoch 就使用完整学习率，对刚初始化的模型易产生大梯度步，在小数据集（N < 100）尤为不稳定。
+
+**修复**：使用 `SequentialLR(LinearLR → CosineAnnealingWarmRestarts)` 实现线性预热：  
+- 前 `warmup_epochs`（默认 5）epoch 从 10% LR 线性升至 100% LR  
+- 之后接余弦退火重启（T_0=10, T_mult=2）  
+- `warmup_epochs` 可通过 `v5_optimization.warmup_epochs` 配置
+
+---
+
+### ✅ QUALITY-6: `configs/default.yaml` — 科学依据注释 + 参数重组
+
+**改动**：所有超参数均添加科学依据和量化建议（例如"8 GB GPU 建议 hidden_channels=128"），帮助非专业用户理解每个参数的作用范围，无需翻阅论文。新增 `v5_optimization.warmup_epochs: 5`。
+
+---
+
+
+### 背景
+
+经过全量代码审查（graph_native_encoder.py, graph_native_system.py, enhanced_graph_native.py, main.py, adaptive_loss_balancer.py, loaders.py 等），共发现 7 处 bug，其中 1 处在第一次 forward 即崩溃（一直以来编码器从未真正运行过）。
+
+---
+
+### 🔴 BUG-A (CRASH, 活跃路径): `graph_native_encoder.py` — HeteroConv.convs 用 tuple key 访问
+
+**位置**：`GraphNativeEncoder.forward()` line ~481
+
+**问题**：`stgcn.convs[edge_type]` 其中 `edge_type = ('eeg', 'projects_to', 'fmri')`（tuple）。PyG 的 `HeteroConv` 将卷积存入 `nn.ModuleDict` 时用 `'__'.join(key)` 作为字符串 key。tuple 访问触发 `KeyError`，第一次 forward 即崩溃。这意味着编码器从未成功运行。
+
+**修复**：`stgcn.convs['__'.join(edge_type)]`
+
+---
+
+### 🟡 BUG-B (死配置, 活跃路径): `graph_native_system.py` + `main.py` — v5_optimization 块被完全忽略
+
+**问题**：`default.yaml` 中 `v5_optimization.adaptive_loss`（alpha, warmup_epochs, modality_energy_ratios）、`v5_optimization.eeg_enhancement`（dropout_rate, entropy_weight 等）、`v5_optimization.advanced_prediction`（use_uncertainty, num_scales 等）全部有配置，但在代码中全部被硬编码默认值覆盖，从未被读取。用户修改 YAML 对训练行为没有任何影响。
+
+**修复**：
+- `GraphNativeBrainModel.__init__()` 新增 `predictor_config: Optional[dict] = None`，传入时覆盖 `EnhancedMultiStepPredictor` 的各参数
+- `GraphNativeTrainer.__init__()` 新增 `optimization_config: Optional[dict] = None`，传入时覆盖 `AdaptiveLossBalancer` 和 `EnhancedEEGHandler` 的各参数
+- `main.py` `create_model()` 传入 `predictor_config=config.get('v5_optimization', {}).get('advanced_prediction')`
+- `main.py` `train_model()` 传入 `optimization_config=config.get('v5_optimization')`
+
+---
+
+### 🟡 BUG-C (元数据丢失, 活跃路径): `main.py` — 合并图时遗漏 sampling_rate
+
+**问题**：多模态图合并时只复制了 `x`, `num_nodes`, `pos`，未复制 `sampling_rate`。`log_training_summary()` 中显示的采样率会回落到错误的默认值（EEG: 250 Hz 硬编码默认，fMRI: 0.5 Hz 硬编码默认），即使真实数据的采样率不同。
+
+**修复**：合并循环中加入 `sampling_rate` 属性复制
+
+---
+
+### 🔴 BUG-D (CRASH, 非活跃路径): `enhanced_graph_native.py` — Optimizer 只覆盖 base_model
+
+**问题**：`EnhancedGraphNativeTrainer.__init__()` 先以 `model.base_model` 调用 `super().__init__()` 创建 optimizer，再 `self.model = model` 替换为增强模型。optimizer 的参数快照已固定为 `base_model.parameters()`。`ConsciousnessModule`, `CrossModalAttention`, `HierarchicalPredictiveCoding` 的所有参数有梯度但永远不会被更新 (gradient is computed but optimizer step is a no-op for them)。
+
+**修复**：在 `super().__init__()` 后用 `self.model.parameters()` 重建 optimizer
+
+---
+
+### 🔴 BUG-E (CRASH + 数据空间错误, 非活跃路径): `enhanced_graph_native.py` — ConsciousGraphNativeBrainModel API 不兼容
+
+**问题1（CRASH）**：`ConsciousGraphNativeBrainModel.forward()` 无 `return_prediction` / `return_encoded` 参数，无 `use_prediction` 属性，无 `compute_loss()` 方法。父类 `train_step()` 调用这些都会 `TypeError` / `AttributeError`。
+
+**问题2（数据空间错误）**：cross-modal attention 接收 `reconstructions.get('eeg')` 即解码器输出 `[N, T, 1]`（信号空间，C=1），但 `CrossModalAttention` 期望 `[batch, N, hidden_dim=256]`（潜空间）。Shape 和语义都是错的。
+
+**修复**：
+- 添加 `use_prediction` property、`loss_type` property、`compute_loss()` delegation
+- `forward()` 新增 `return_prediction`, `return_encoded`, `return_consciousness_metrics` 参数
+- 改为调用 `base_model(data, return_encoded=True)` 获取真正的潜表征（encoded latent），用它驱动 cross-modal attention 和 consciousness module
+- 返回格式与 `GraphNativeBrainModel.forward()` 完全兼容（2/3/4-tuple 依 flags）
+
+---
+
+### 🔴 BUG-F (死代码, 非活跃路径): `enhanced_graph_native.py` — compute_additional_losses() 从未被调用
+
+**问题**：`compute_additional_losses()` 定义了 consciousness loss 和 free energy loss，但没有任何训练路径调用它。这两个损失对模型训练零贡献。
+
+**修复**：`EnhancedGraphNativeTrainer` 新增 `train_step()` 覆盖方法，在同一 forward/backward 中提取 `consciousness_info` 并调用 `compute_additional_losses()`，将附加损失加入 `total_loss`。同时修复了 AMP autocast 在 forward 中正确包裹的问题。
+
+---
+
+### 🔴 关键 Bug 修复（3 处）
+
+#### 1. 预测头从未训练（`graph_native_system.py`）
+
+**问题**：`compute_loss()` 有明确注释 "implement as future work"。`EnhancedMultiStepPredictor`（含 Transformer、GRU、数千参数）在所有训练步骤中均未接收任何梯度信号。`train_step()` 以 `return_prediction=False` 调用模型，预测头参数完全无效。`AdaptiveLossBalancer` 中 `pred_*` 任务名 = 空占位符。
+
+**根因**：旧代码的注释准确描述了问题：预测头输出在潜空间 H，而数据标签在原始信号空间 C，无法直接比较。
+
+**修复**（自监督潜空间预测损失）：
+- `GraphNativeBrainModel.forward()` 新增 `return_encoded: bool` 参数，当 True 时额外返回 `{node_type: h[N,T,H]}` 字典。
+- `GraphNativeBrainModel.compute_loss()` 新增 `encoded` 参数；当提供且 `use_prediction=True` 时，将潜序列切分为 context（前 2/3）→ 预测 future（后 1/3），两者均在潜空间 H，可直接 MSE/Huber 比较。
+- `GraphNativeTrainer.train_step()` 调用 `return_encoded=True` 并将 `encoded` 传入 `compute_loss`。
+- 隐式跨模态：ST-GCN 的 EEG→fMRI 边使两个模态的潜向量相互混合，故"预测 fMRI 潜向量未来"已包含来自 EEG 的跨模态信息。
+
+**数据量对比**（以 fMRI T=300, T_ctx=200 为例）：
+```
+旧：predictors 预测 0 步，loss=0，梯度=0
+新：context[N,200,H] → predict future[N,100,H]，有效梯度信号
+```
+
+#### 2. EEG 防零崩塌正则化从未生效（`graph_native_system.py`）
+
+**问题**：`eeg_handler()` 返回的 `eeg_info['regularization_loss']`（熵损失 + 多样性损失 + 活动损失）一直被静默丢弃，从未加入 `total_loss`。`AntiCollapseRegularizer` 完全是死代码。EEG 有大量"静默通道"（低振幅/低方差），模型可以把这些通道的重建输出设为接近零——MSE 最低，梯度最小，通道彻底被忽略。
+
+**修复**：
+- 在 `train_step()` 中初始化 `eeg_info: dict = {}`（确保变量始终定义）。
+- 在自适应损失平衡后，提取 `eeg_reg = eeg_info.get('regularization_loss')` 并加入 `total_loss`。
+- EEG 正则化权重（0.01）已在 `AntiCollapseRegularizer` 初始化时配置，故额外开销可控。
+- AMP 和非 AMP 两条路径均已修复。
+
+#### 3. 跨模态预测时序对齐缺失（`main.py`）
+
+**问题**：`windowed_sampling` 默认使用 `fmri_window_size=50 TRs ≈ 100s` 和 `eeg_window_size=500 pts = 2s`，两者覆盖完全不同的实际时长。对于各模态预测自身未来（intra-modal）这没有问题；但若要用 EEG 上下文预测 fMRI 未来（cross-modal），必须让两个窗口覆盖相同时长。
+
+**修复**：在 `extract_windowed_samples()` 中新增 `cross_modal_align` 选项（默认 False）：
+- `True`：`ws_eeg = round(ws_fmri × T_eeg / T_fmri)`，强制时间对齐。
+- 配置项：`windowed_sampling.cross_modal_align: false`（见 `configs/default.yaml`）。
+
+---
+
+## [V5.8] 2026-02-23 — 动态功能连接（dFC）滑动窗口采样
+
+### ✨ 核心改进：从根源解决训练数据设计缺陷
+
+#### 背景：为什么 max_seq_len=300 是错误的训练单元
+
+此前代码将每条完整扫描（run）截断到 300 个时间步，作为单个训练样本。这引发两个根本性问题：
+
+1. **EEG 连通性估计不可靠**：300 样本在 250Hz 下 = 1.2 秒。从 1.2 秒 EEG 估计 Pearson 相关（用于构建图拓扑 edge_index）在统计上完全不可靠——图的 ST-GCN 消息传递建立在随机噪声之上。可靠估计需至少 10–30 秒（2500–7500 样本点）。
+
+2. **训练数据严重不足**：10 被试 × 3 任务 × 1 样本/run = 30 训练样本。深度学习模型无法从 30 个样本习得可泛化的脑动态表示。
+
+#### 解决方案：dFC 滑动窗口范式
+
+参见 Hutchison et al. 2013 (Nature Rev Neurosci); Chang & Glover 2010 (NeuroImage)。
+
+**设计原则**：
+- `edge_index`（图拓扑）= 完整 run 的相关矩阵 → 统计可靠的结构连通性
+- 节点特征 `x`（动态信号）= 时间窗口切片 → 每个窗口 = 一个脑状态快照 = 一个训练样本
+
+**数据量对比**（10 被试 × 3 任务 × 300 TRs fMRI run）：
+```
+旧方案（截断）: 10 × 3 × 1  =  30 训练样本
+新方案（窗口）: 10 × 3 × 11 = 330 训练样本（11×提升，无新数据）
+```
+
+#### 实现（`main.py`）
+
+- 新增 `extract_windowed_samples(full_graph, w_cfg, logger)` 函数：
+  - 以 fMRI 为参考模态（时间步最少），按 `fmri_window_size` + `stride_fraction` 生成窗口起始点
+  - EEG 窗口等比例对齐（`round(t_start_ref × T_eeg/T_fmri)`），确保跨模态时间对齐
+  - `edge_index` 在所有窗口间共享同一对象（节省内存）
+  - 末尾窗口越界时零填充，保持固定窗口大小
+- 更新 `build_graphs()`：
+  - 当 `windowed_sampling.enabled: true` 时，**跳过 max_seq_len 截断**（完整序列 → 可靠连通性）
+  - 缓存始终存储完整 run 图，窗口切分在缓存加载/新建后执行
+  - 更新缓存键（`windowed=True` 时不含 max_seq_len，因为截断不生效）
+- 更新日志：汇报"N 条 run → M 个窗口训练样本（平均 K 窗口/run）"
+
+#### 配置（`configs/default.yaml`）
+
+```yaml
+windowed_sampling:
+  enabled: false          # 设 true 启用（推荐研究使用）
+  fmri_window_size: 50    # 50 TRs × TR=2s = 100s ≈ 一个脑状态周期
+  eeg_window_size: 500    # 500pts ÷ 250Hz = 2s（覆盖主要 EEG 节律）
+  stride_fraction: 0.5    # 50% 重叠（标准 dFC 设置）
+```
+
+**推荐用法**（启用时）：
+```yaml
+training:
+  max_seq_len: null       # 关闭截断，使用完整 run 估计连通性
+windowed_sampling:
+  enabled: true
+```
+
+#### 兼容性
+
+- `enabled: false`（默认）= 与旧版行为完全一致，无 breaking change
+- 两种模式的缓存文件互不冲突（缓存键中包含 `windowed` 标志）
+
+---
+
+## [V5.7] 2026-02-23 — 多任务加载 + 图缓存
+
+### ✨ 新功能
+
+#### 多任务 / 多样本加载（`data/loaders.py`、`main.py`）
+
+**背景**：此前每个被试只加载一条数据（对应一个任务），多个被试直接混入训练会导致样本量少、无法捕捉被试内跨任务变化。
+
+**改进**：
+- `BrainDataLoader` 新增 `_discover_tasks(subject_id)` 方法，自动扫描 BIDS 文件名中的 `task-<name>` 标记，返回该被试下所有可用任务列表。
+- `load_all_subjects(tasks=None)` 参数由单任务字符串改为任务列表：  
+  - `None`（默认）→ 自动发现该被试所有任务；  
+  - `["rest", "wm"]` → 仅加载指定任务；  
+  - `[]` → 不过滤（加载首个匹配文件，与旧行为一致）。
+- 每个 `(被试, 任务)` 组合生成一个独立图样本，可显著增加训练数据量并捕捉跨任务脑动态。
+- 每条数据字典新增 `task` 字段，贯穿到图缓存键。
+
+**配置**（`configs/default.yaml`）：
+```yaml
+data:
+  tasks: null   # null=自动发现; []=不过滤; ["rest","wm"]=指定
+  task: null    # 旧版兼容，tasks 未设置时作为回退
+```
+
+#### 图缓存（`main.py`、`configs/default.yaml`）
+
+**背景**：每次训练都重新预处理 EEG/fMRI 并构建异质图，单被试数分钟、多被试数十分钟。
+
+**改进**：
+- `build_graphs()` 在图构建完成后自动将每个图保存为 `.pt` 文件（`torch.save`）。
+- 再次运行时，检查缓存文件是否存在并直接 `torch.load`，跳过所有预处理和图构建步骤。
+- **缓存键** = `{subject_id}_{task}_{config_hash}.pt`，其中 `config_hash` 是图参数（atlas、k近邻、阈值、max_seq_len 等）的 MD5 短哈希，修改这些参数后旧缓存自动失效并重建。
+- 缓存目录默认为 `outputs/graph_cache`，通过 `data.cache.dir` 配置，`.pt` 文件与可视化模块读取格式一致。
+
+**配置**：
+```yaml
+data:
+  cache:
+    enabled: true
+    dir: "outputs/graph_cache"
+```
+
+### 🔧 兼容性
+
+- 旧配置中的 `data.task` 字段仍然生效（自动升级为单元素列表并打印弃用提示）。
+- 缓存目录不可访问时自动降级为不缓存，不影响正常运行。
 
 ---
 

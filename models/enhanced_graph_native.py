@@ -15,6 +15,7 @@ the existing graph-native architecture.
 
 import torch
 import torch.nn as nn
+from contextlib import nullcontext
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -23,6 +24,14 @@ from .graph_native_system import GraphNativeBrainModel, GraphNativeTrainer
 from .consciousness_module import ConsciousnessModule
 from .advanced_attention import CrossModalAttention, SpatialTemporalAttention
 from .predictive_coding import HierarchicalPredictiveCoding, compute_free_energy_loss
+
+# AMP imports mirrored from graph_native_system
+try:
+    from torch.amp import autocast, GradScaler
+    USE_NEW_AMP_API = True
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
+    USE_NEW_AMP_API = False
 
 logger = logging.getLogger(__name__)
 
@@ -121,139 +130,150 @@ class ConsciousGraphNativeBrainModel(nn.Module):
             )
             logger.info("✓ Predictive coding hierarchy initialized")
     
+    # ── 与 GraphNativeBrainModel 的 API 兼容性属性 ──────────────
+    # GraphNativeTrainer.train_step() 通过这些属性控制前向传播路径。
+    # 必须代理到 base_model，否则父类 train_step() 中 AttributeError。
+
+    @property
+    def use_prediction(self) -> bool:
+        return self.base_model.use_prediction
+
+    @property
+    def loss_type(self) -> str:
+        return self.base_model.loss_type
+
+    def compute_loss(self, data, reconstructed, predictions=None, encoded=None):
+        """代理到 base_model.compute_loss（重建损失 + 潜空间预测损失）。"""
+        return self.base_model.compute_loss(
+            data, reconstructed, predictions=predictions, encoded=encoded
+        )
+
     def forward(
         self,
         data: HeteroData,
-        return_consciousness_metrics: bool = True,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        return_prediction: bool = False,
+        return_encoded: bool = False,
+        return_consciousness_metrics: bool = False,
+    ) -> Tuple:
         """
         Forward pass with consciousness and predictive coding.
+
+        API 与 GraphNativeBrainModel.forward() 完全兼容：
+        - 默认 (return_encoded=False, return_consciousness_metrics=False):
+            returns (reconstructed, predictions) — 2-tuple
+        - return_encoded=True:
+            returns (reconstructed, predictions, encoded_dict) — 3-tuple
+        - return_consciousness_metrics=True:
+            returns (reconstructed, predictions, info) — 3-tuple
+        - return_encoded=True AND return_consciousness_metrics=True:
+            returns (reconstructed, predictions, encoded_dict, info) — 4-tuple
         
         Args:
             data: Input heterogeneous graph
-            return_consciousness_metrics: Whether to return consciousness metrics
+            return_prediction: Pass to base_model
+            return_encoded: If True, 3rd element is the latent encoded dict
+            return_consciousness_metrics: If True, appends info dict at the end
         
         Returns:
-            Tuple of:
-                - Reconstructions dict
-                - Predictions dict
-                - Info dict with consciousness and attention metrics
+            See above; shape depends on flags.
         """
         # 1. Base model forward pass
-        reconstructions, predictions = self.base_model(data)
-        
+        # Always retrieve encoded representations so that:
+        #   a) cross-modal attention uses latent space (not signal-space recon)
+        #   b) compute_loss can train the predictor in latent space
+        base_fwd = self.base_model(
+            data, return_prediction=return_prediction, return_encoded=True
+        )
+        reconstructions, predictions, encoded = base_fwd
+
         info = {}
-        
-        # 2. Apply cross-modal attention if both modalities present
-        if self.enable_cross_modal_attention and 'eeg' in data.node_types and 'fmri' in data.node_types:
-            # Get encoded features from base model
-            # Note: This requires access to intermediate representations
-            # For now, we'll work with reconstructions as a proxy
-            
-            eeg_features = reconstructions.get('eeg')
-            fmri_features = reconstructions.get('fmri')
-            
-            if eeg_features is not None and fmri_features is not None:
-                # Ensure features have batch dimension
-                if len(eeg_features.shape) == 3:  # [nodes, time, channels]
-                    eeg_features = eeg_features.unsqueeze(0)  # [1, nodes, time, channels]
-                if len(fmri_features.shape) == 3:
-                    fmri_features = fmri_features.unsqueeze(0)
-                
-                # Apply spatial-temporal attention first
-                if len(eeg_features.shape) == 4:  # [batch, nodes, time, channels]
-                    eeg_attended, eeg_st_info = self.spatial_temporal_attention(eeg_features)
-                    fmri_attended, fmri_st_info = self.spatial_temporal_attention(fmri_features)
-                    
-                    info['eeg_st_attention'] = eeg_st_info
-                    info['fmri_st_attention'] = fmri_st_info
-                    
-                    # Aggregate time dimension for cross-modal attention
-                    eeg_agg = eeg_attended.mean(dim=2)  # [batch, nodes, channels]
-                    fmri_agg = fmri_attended.mean(dim=2)
-                else:
-                    eeg_agg = eeg_features
-                    fmri_agg = fmri_features
-                
-                # Apply cross-modal attention
+
+        # 2. Cross-modal attention using ENCODED latent features (NOT reconstructions).
+        # BUG in original: used reconstructions [N, T, 1] → CrossModalAttention received
+        # wrong channel dimension (1 instead of hidden_channels).  Fixed: use encoded [N, T, H].
+        if (
+            self.enable_cross_modal_attention
+            and 'eeg' in data.node_types
+            and 'fmri' in data.node_types
+        ):
+            eeg_feat = encoded.get('eeg')    # [N_eeg, T, H]
+            fmri_feat = encoded.get('fmri')  # [N_fmri, T, H]
+
+            if eeg_feat is not None and fmri_feat is not None:
+                # Aggregate temporal dim and add batch dim: [N, T, H] → [1, N, H]
+                eeg_agg = eeg_feat.mean(dim=1).unsqueeze(0)    # [1, N_eeg, H]
+                fmri_agg = fmri_feat.mean(dim=1).unsqueeze(0)  # [1, N_fmri, H]
+
+                # SpatialTemporalAttention expects [batch, nodes, T, H];
+                # we provide [1, N, 1, H] by unsqueezing the (missing) T dim.
+                eeg_4d = eeg_agg.unsqueeze(2)    # [1, N_eeg, 1, H]
+                fmri_4d = fmri_agg.unsqueeze(2)  # [1, N_fmri, 1, H]
+
+                eeg_attended, eeg_st_info = self.spatial_temporal_attention(eeg_4d)
+                fmri_attended, fmri_st_info = self.spatial_temporal_attention(fmri_4d)
+                info['eeg_st_attention'] = eeg_st_info
+                info['fmri_st_attention'] = fmri_st_info
+
+                # Remove dummy T dim before cross-modal attention
+                eeg_agg2 = eeg_attended.squeeze(2)   # [1, N_eeg, H]
+                fmri_agg2 = fmri_attended.squeeze(2)  # [1, N_fmri, H]
+
                 eeg_enhanced, fmri_enhanced, cm_info = self.cross_modal_attention(
-                    eeg_features=eeg_agg,
-                    fmri_features=fmri_agg,
+                    eeg_features=eeg_agg2,
+                    fmri_features=fmri_agg2,
                 )
-                
                 info['cross_modal_attention'] = cm_info
-                
-                # Update reconstructions with enhanced features
                 reconstructions['eeg_enhanced'] = eeg_enhanced
                 reconstructions['fmri_enhanced'] = fmri_enhanced
-        
-        # 3. Apply consciousness module
+
+        # 3. Consciousness module
         if self.enable_consciousness and return_consciousness_metrics:
-            # Aggregate features across modalities for consciousness computation
             all_features = []
-            
             for modality in ['eeg', 'fmri']:
-                if modality in reconstructions:
-                    feat = reconstructions[modality]
-                    
-                    # Ensure shape [batch, num_nodes, channels]
-                    if len(feat.shape) == 3:  # [nodes, time, channels]
-                        feat = feat.unsqueeze(0).mean(dim=2)  # [1, nodes, channels]
-                    elif len(feat.shape) == 4:  # [batch, nodes, time, channels]
-                        feat = feat.mean(dim=2)  # [batch, nodes, channels]
-                    
-                    all_features.append(feat)
-            
-            if len(all_features) > 0:
-                # Concatenate features from different modalities
-                combined_features = torch.cat(all_features, dim=1)  # [batch, total_nodes, channels]
-                
-                # Get edge index (use fMRI edges as default)
+                feat = encoded.get(modality)
+                if feat is not None:  # [N, T, H]
+                    feat_agg = feat.mean(dim=1).unsqueeze(0)  # [1, N, H]
+                    all_features.append(feat_agg)
+
+            if all_features:
+                combined_features = torch.cat(all_features, dim=1)  # [1, total_N, H]
+
                 if ('fmri', 'connects', 'fmri') in data.edge_types:
                     edge_index = data['fmri', 'connects', 'fmri'].edge_index
                 else:
-                    # Create a simple fully connected graph
                     num_nodes = combined_features.shape[1]
-                    edge_index = torch.combinations(torch.arange(num_nodes), r=2).T
+                    edge_index = torch.combinations(
+                        torch.arange(num_nodes), r=2
+                    ).T
                     edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
                     edge_index = edge_index.to(combined_features.device)
-                
-                # Apply consciousness module
+
                 conscious_features, consciousness_info = self.consciousness_module(
                     x=combined_features,
                     edge_index=edge_index,
                 )
-                
                 info['consciousness'] = consciousness_info
                 reconstructions['conscious_representation'] = conscious_features
-                
-                logger.debug(
-                    f"Consciousness metrics - Φ: {consciousness_info['phi'].mean():.4f}, "
-                    f"Level: {consciousness_info['consciousness_level'].mean():.4f}"
-                )
-        
-        # 4. Apply predictive coding
+
+        # 4. Predictive coding
         if self.enable_predictive_coding:
-            # Apply to aggregated features
             for modality in ['eeg', 'fmri']:
-                if modality in reconstructions:
-                    feat = reconstructions[modality]
-                    
-                    # Aggregate to [batch, channels]
-                    if len(feat.shape) == 3:  # [nodes, time, channels]
-                        feat_agg = feat.mean(dim=(0, 1)).unsqueeze(0)  # [1, channels]
-                    elif len(feat.shape) == 4:  # [batch, nodes, time, channels]
-                        feat_agg = feat.mean(dim=(1, 2))  # [batch, channels]
-                    else:
-                        feat_agg = feat.mean(dim=1)  # [batch, channels]
-                    
-                    # Apply predictive coding
+                feat = encoded.get(modality)
+                if feat is not None:  # [N, T, H]
+                    feat_agg = feat.mean(dim=0).unsqueeze(0)  # [1, H] (global avg)
                     pc_state, pc_predictions, pc_info = self.predictive_coding(feat_agg)
-                    
                     info[f'{modality}_predictive_coding'] = pc_info
                     reconstructions[f'{modality}_pc_state'] = pc_state
-        
-        return reconstructions, predictions, info
+
+        # Return format mirrors GraphNativeBrainModel.forward()
+        if return_encoded and return_consciousness_metrics:
+            return reconstructions, predictions, encoded, info
+        elif return_encoded:
+            return reconstructions, predictions, encoded
+        elif return_consciousness_metrics:
+            return reconstructions, predictions, info
+        else:
+            return reconstructions, predictions
 
 
 class EnhancedGraphNativeTrainer(GraphNativeTrainer):
@@ -292,7 +312,9 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
             predictive_coding_loss_weight: Weight for predictive coding loss
             **kwargs: Additional arguments for base trainer
         """
-        # Initialize base trainer with the base model
+        # Initialize base trainer with the base model.
+        # EEG handler is lazily initialised in _ensure_eeg_handler() on the first
+        # train_step() call, once the true N_eeg (electrode count) is known.
         super().__init__(
             model=model.base_model,
             node_types=node_types,
@@ -303,8 +325,21 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
             **kwargs
         )
         
-        # Replace model with conscious model
+        # Replace model with the full enhanced model.
         self.model = model
+        
+        # BUG FIX: re-create optimizer with FULL model parameters.
+        # super().__init__ created the optimizer with base_model.parameters() only.
+        # Consciousness module, cross-modal attention, and predictive coding parameters
+        # were therefore excluded from the optimizer — they received gradients but those
+        # gradients were never applied (parameter update step was a no-op for them).
+        # `learning_rate` and `weight_decay` are explicit parameters of this __init__,
+        # so they are in scope here (not shadowed by **kwargs).
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
         
         # Additional loss weights
         self.consciousness_loss_weight = consciousness_loss_weight
@@ -350,6 +385,111 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
                     additional_losses[f'{key}_free_energy'] = pc_loss
         
         return additional_losses
+
+    def train_step(self, data: HeteroData) -> Dict[str, float]:
+        """
+        Single training step for the enhanced model.
+
+        Extends the base train_step by:
+        1. Requesting consciousness metrics from forward()
+        2. Adding consciousness and free energy losses to total_loss
+
+        This override is necessary because:
+        - ConsciousGraphNativeBrainModel.forward() can return a 4-tuple
+          (recon, preds, encoded, info) when both return_encoded and
+          return_consciousness_metrics are True.
+        - compute_additional_losses() must be called WITHIN the same
+          forward/backward pass — calling it after super().train_step()
+          (which has already called backward()) would operate on a freed
+          computation graph.
+        """
+        self.model.train()
+        self.optimizer.zero_grad()
+        data = data.to(self.device)
+
+        eeg_info: dict = {}
+        original_eeg_x = None
+        if self.use_eeg_enhancement and 'eeg' in data.node_types:
+            original_eeg_x = data['eeg'].x          # [N_eeg, T, 1]
+            N_eeg = original_eeg_x.shape[0]
+            # Lazy-init handler with true electrode count (same pattern as base class).
+            self._ensure_eeg_handler(N_eeg)
+            if self.use_eeg_enhancement and self.eeg_handler is not None:
+                # Reshape [N_eeg, T, 1] → [1, T, N_eeg] before handler, then back.
+                eeg_x_t, eeg_info = self.eeg_handler(
+                    self._graph_to_handler_format(original_eeg_x), training=True
+                )
+                data['eeg'].x = self._handler_to_graph_format(eeg_x_t)
+
+        try:
+            # ── forward (inside AMP autocast when enabled) ──────────
+            if self.use_amp:
+                if USE_NEW_AMP_API:
+                    _amp_ctx = autocast(device_type=self.device_type)
+                else:
+                    _amp_ctx = autocast()
+            else:
+                _amp_ctx = nullcontext()
+
+            with _amp_ctx:
+                if self.model.use_prediction:
+                    reconstructed, _predictions, encoded, info = self.model(
+                        data,
+                        return_prediction=False,
+                        return_encoded=True,
+                        return_consciousness_metrics=True,
+                    )
+                else:
+                    reconstructed, _predictions, info = self.model(
+                        data,
+                        return_prediction=False,
+                        return_consciousness_metrics=True,
+                    )
+                    encoded = None
+
+                # ── losses ──────────────────────────────────────────────
+                losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
+
+                if self.use_adaptive_loss:
+                    total_loss, _ = self.loss_balancer(losses)
+                else:
+                    total_loss = sum(losses.values())
+
+                # EEG anti-collapse regularization
+                eeg_reg = eeg_info.get('regularization_loss')
+                if eeg_reg is not None:
+                    total_loss = total_loss + eeg_reg
+                    losses['eeg_reg'] = eeg_reg
+
+                # Consciousness + free-energy losses
+                additional_losses = self.compute_additional_losses(info)
+                for name, loss in additional_losses.items():
+                    total_loss = total_loss + loss
+                    losses[name] = loss
+
+            # ── backward ────────────────────────────────────────────
+            if self.use_amp:
+                self.scaler.scale(total_loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+            if self.use_adaptive_loss:
+                detached = {k: v.detach() for k, v in losses.items()}
+                self.loss_balancer.update_weights(detached)
+
+            loss_dict = {k: v.item() for k, v in losses.items()}
+            loss_dict['total'] = total_loss.item()
+            return loss_dict
+
+        finally:
+            if original_eeg_x is not None:
+                data['eeg'].x = original_eeg_x
 
 
 def create_enhanced_model(

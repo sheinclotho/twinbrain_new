@@ -12,11 +12,15 @@ TwinBrain V5 主程序
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import os
+import random
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 import yaml
 import torch
 import numpy as np
@@ -69,18 +73,194 @@ def prepare_data(config: dict, logger: logging.Logger):
         modalities=config['data']['modalities'],
     )
     
-    # 加载所有被试
+    # 解析任务列表配置
+    # 优先使用 tasks（列表），兼容旧版 task（单字符串）
+    tasks = config['data'].get('tasks')
+    if tasks is None:
+        legacy_task = config['data'].get('task')
+        if legacy_task is not None:
+            tasks = [legacy_task]
+            logger.info(
+                f"使用旧版 'task: {legacy_task}' 配置。"
+                f" 建议迁移到 'tasks: [{legacy_task}]'。"
+            )
+        # tasks 仍为 None → 自动发现所有任务
+    elif isinstance(tasks, str):
+        tasks = [tasks]
+
+    if tasks is None:
+        logger.info("tasks: null → 自动发现每个被试的所有任务")
+    else:
+        logger.info(f"将加载以下任务: {tasks}")
+    
+    # 加载所有被试（可跨多任务）
     all_data = data_loader.load_all_subjects(
-        task=config['data'].get('task'),
+        tasks=tasks,
         max_subjects=config['data'].get('max_subjects'),
     )
     
     if not all_data:
         raise ValueError("未加载到任何数据，请检查数据路径配置")
     
-    logger.info(f"成功加载 {len(all_data)} 个被试数据")
+    logger.info(f"成功加载 {len(all_data)} 个被试-任务组合")
     
     return all_data
+
+
+# ── 时间窗口默认值（神经影像经验值，可通过配置覆盖）──────────────
+# fMRI: 50 TRs × TR≈2s = 100s — 覆盖一个完整慢波脑状态周期（Hutchison 2013）
+# EEG: 500 pts ÷ 250Hz = 2s — 覆盖 alpha (8-12 Hz) + beta (13-30 Hz) 主要节律
+_DEFAULT_FMRI_WINDOW_SIZE = 50
+_DEFAULT_EEG_WINDOW_SIZE = 500
+
+
+def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
+    """为图缓存生成稳定的文件名。
+
+    文件名内嵌图相关配置参数的 MD5 短哈希（8位），修改 atlas、图拓扑参数或
+    max_seq_len 后，旧缓存文件名将不再匹配，系统自动重建。
+
+    当时间窗口采样（windowed_sampling）启用时，缓存存储的是完整 run 的图（
+    用全序列计算连通性），对应的缓存键不含 max_seq_len（不截断）。
+    """
+    w_enabled = config.get('windowed_sampling', {}).get('enabled', False)
+    relevant = {
+        'graph': config.get('graph', {}),
+        'atlas': config['data'].get('atlas', {}),
+        # 只有在 windowed_sampling 关闭时才截断，此时 max_seq_len 影响连通性估计
+        'max_seq_len': None if w_enabled else config['training'].get('max_seq_len'),
+        'modalities': sorted(config['data'].get('modalities', [])),
+        'windowed': w_enabled,
+    }
+    params_hash = hashlib.md5(
+        json.dumps(relevant, sort_keys=True).encode()
+    ).hexdigest()[:8]
+    task_str = task if task else 'notask'
+    return f"{subject_id}_{task_str}_{params_hash}.pt"
+
+
+def extract_windowed_samples(
+    full_graph: HeteroData,
+    w_cfg: dict,
+    logger: logging.Logger,
+) -> List[HeteroData]:
+    """将一条完整扫描的图切分为多个重叠时间窗口样本（动态功能连接，dFC）。
+
+    设计理念（参见 Hutchison 2013; Chang & Glover 2010）：
+    - 图拓扑（edge_index）= 完整 run 的相关性 → 稳定的结构连通性估计
+    - 节点特征（x）= 时间窗口切片 → 每个窗口代表一次脑状态快照
+    - 多个重叠窗口 = 多个训练样本，且每样本 T = window_size << T_full → 无 OOM
+
+    与朴素截断（max_seq_len）的关键区别：
+    - 截断：丢弃 run 末尾数据，且仅产生 1 个训练样本
+    - 窗口：覆盖完整 run，产生 N_windows 个样本，每样本均由完整连通性支撑
+
+    Args:
+        full_graph: 完整 run 构建的异质图（edge_index 来自全序列相关性估计）
+        w_cfg:      windowed_sampling 配置字典
+        logger:     日志记录器
+
+    Returns:
+        HeteroData 列表；关闭时返回 [full_graph]（与旧行为兼容）
+    """
+    if not w_cfg.get('enabled', False):
+        return [full_graph]
+
+    node_types = full_graph.node_types
+    T_per_type = {nt: full_graph[nt].x.shape[1] for nt in node_types}
+
+    # 各模态的窗口大小（单位：该模态的时间步数）
+    window_sizes: dict = {}
+    for nt in node_types:
+        ws = w_cfg.get(f'{nt}_window_size')
+        if ws is None:
+            # 神经影像经验默认值：fMRI 50 TRs ≈ 100s（一个脑状态周期）；
+            # EEG 500 pts = 2s（覆盖 alpha/beta/gamma 主要节律）
+            ws = _DEFAULT_FMRI_WINDOW_SIZE if nt == 'fmri' else _DEFAULT_EEG_WINDOW_SIZE
+        window_sizes[nt] = int(ws)
+
+    stride_fraction = w_cfg.get('stride_fraction', 0.5)
+
+    # 以 fMRI 作为参考模态（时间步最少，避免分数窗口）
+    # 若无 fMRI 则取节点数第一项
+    ref_type = 'fmri' if 'fmri' in node_types else node_types[0]
+
+    # ── 跨模态时间对齐（可选）────────────────────────────────────────
+    # 默认（cross_modal_align=False）：各模态使用各自的自然时间尺度。
+    #   fMRI 50 TRs ≈ 100s（慢血动力学），EEG 500 pts = 2s（快神经振荡）。
+    #   适用于：各模态预测自身未来（intra-modal prediction，默认场景）。
+    #
+    # cross_modal_align=True：强制所有模态窗口覆盖相同的实际时长。
+    #   ws_eeg = round(ws_fmri × T_eeg / T_fmri)
+    #   适用于：跨模态预测（EEG→fMRI、fMRI→EEG）。
+    #   ⚠ 注意：对齐后 EEG 窗口约 12500 pts（500s at 250Hz），
+    #            可能导致 CUDA OOM。确保 VRAM 足够后再启用。
+    if w_cfg.get('cross_modal_align', False) and ref_type == 'fmri' and 'eeg' in node_types:
+        T_fmri_ref = T_per_type['fmri']
+        if T_fmri_ref > 0:
+            T_eeg = T_per_type['eeg']
+            ws_fmri = window_sizes['fmri']
+            window_sizes['eeg'] = round(ws_fmri * (T_eeg / T_fmri_ref))
+            logger.debug(
+                f"跨模态时间对齐已启用: EEG 窗口调整为 {window_sizes['eeg']} pts"
+                f" (与 fMRI {ws_fmri} TRs 覆盖相同实际时长)"
+            )
+    ws_ref = window_sizes[ref_type]
+    T_ref = T_per_type[ref_type]
+    stride = max(1, int(ws_ref * stride_fraction))
+
+    if ws_ref >= T_ref:
+        # 窗口覆盖完整序列：无法再分割，退化为原始单样本
+        logger.debug(
+            f"窗口大小 ({ref_type}: {ws_ref}) ≥ 序列长度 ({T_ref})，"
+            f" 窗口采样退化为单样本。若需多窗口，请减小 window_size 或"
+            f" 增大序列（设 max_seq_len: null）。"
+        )
+        return [full_graph]
+
+    window_starts = list(range(0, T_ref - ws_ref + 1, stride))
+
+    windows: List[HeteroData] = []
+    for t_start_ref in window_starts:
+        win = HeteroData()
+
+        # 共享图拓扑（所有窗口使用相同的 edge_index，来自全序列连通性估计）
+        for edge_type in full_graph.edge_types:
+            win[edge_type].edge_index = full_graph[edge_type].edge_index
+            if hasattr(full_graph[edge_type], 'edge_attr'):
+                win[edge_type].edge_attr = full_graph[edge_type].edge_attr
+
+        # 按比例对齐各模态的窗口切片
+        for nt in node_types:
+            T_nt = T_per_type[nt]
+            ws_nt = window_sizes[nt]
+            # 根据参考模态时间步比例，等比例定位该模态的起始点
+            # 使用 int() 而非 round()：数组索引用整数截断语义更可预期
+            t_start_nt = int(t_start_ref * (T_nt / T_ref))
+            t_end_nt = t_start_nt + ws_nt
+
+            x_full = full_graph[nt].x  # [N, T, C]
+            if t_end_nt > T_nt:
+                # 末尾窗口越界：用零填充保持固定 T=ws_nt
+                x_slice = x_full[:, t_start_nt:, :]
+                pad_len = ws_nt - x_slice.shape[1]
+                pad = torch.zeros(
+                    x_slice.shape[0], pad_len, x_slice.shape[2],
+                    dtype=x_slice.dtype,
+                )
+                x_slice = torch.cat([x_slice, pad], dim=1)
+            else:
+                x_slice = x_full[:, t_start_nt:t_end_nt, :]
+
+            win[nt].x = x_slice
+            # 复制静态属性（节点数、空间坐标、采样率）
+            for attr in ('num_nodes', 'pos', 'sampling_rate'):
+                if hasattr(full_graph[nt], attr):
+                    setattr(win[nt], attr, getattr(full_graph[nt], attr))
+
+        windows.append(win)
+
+    return windows
 
 
 def build_graphs(all_data, config: dict, logger: logging.Logger):
@@ -194,12 +374,75 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             f"Atlas file not found at {atlas_file}; fMRI will use single-node fallback."
         )
     
-    # 为每个被试构建图
+    # ── 图缓存设置 ──────────────────────────────────────────────
+    cache_cfg = config['data'].get('cache', {})
+    cache_enabled = cache_cfg.get('enabled', False)
+    cache_dir: Optional[Path] = None
+    if cache_enabled:
+        cache_dir = Path(cache_cfg.get('dir', 'outputs/graph_cache'))
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"图缓存已启用: {cache_dir}")
+        except OSError as e:
+            logger.warning(f"无法创建缓存目录 {cache_dir}: {e}，缓存已禁用")
+            cache_dir = None
+
+    # ── 时间窗口采样配置 ────────────────────────────────────────
+    w_cfg = config.get('windowed_sampling', {})
+    windowed = w_cfg.get('enabled', False)
+
+    # 当时间窗口采样开启时，连通性由完整 run 估计（不截断）；
+    # 截断仅在单样本训练模式（windowed=False）下保留，用于防 OOM。
     max_seq_len = config['training'].get('max_seq_len', None)
-    if max_seq_len is not None:
-        logger.info(f"Sequence truncation enabled: max_seq_len={max_seq_len} (prevents CUDA OOM)")
-    graphs = []
+    if windowed:
+        if max_seq_len is not None:
+            logger.info(
+                f"时间窗口采样已启用 (fMRI_ws={w_cfg.get('fmri_window_size', 50)}, "
+                f"EEG_ws={w_cfg.get('eeg_window_size', 500)}, "
+                f"stride={w_cfg.get('stride_fraction', 0.5)}×ws)。"
+                f" 图构建将使用完整序列以获得可靠连通性估计"
+                f"（max_seq_len={max_seq_len} 仅在单样本模式下生效）。"
+                f" 建议设 max_seq_len: null 以完全利用全序列。"
+            )
+        else:
+            logger.info(
+                f"时间窗口采样已启用 (fMRI_ws={w_cfg.get('fmri_window_size', 50)}, "
+                f"EEG_ws={w_cfg.get('eeg_window_size', 500)}, "
+                f"stride={w_cfg.get('stride_fraction', 0.5)}×ws)。"
+                f" 图构建将使用完整序列。"
+            )
+    else:
+        if max_seq_len is not None:
+            logger.info(f"序列截断已启用: max_seq_len={max_seq_len} (防止 CUDA OOM)")
+
+    graphs: List[HeteroData] = []
+    n_cached = 0
+    n_windows_total = 0
     for subject_data in all_data:
+        subject_id = subject_data.get('subject_id', 'unknown')
+        task = subject_data.get('task')
+
+        # 计算一次缓存 key，供本次迭代的"读"和"写"共用，避免重复计算。
+        cache_key = _graph_cache_key(subject_id, task, config) if cache_dir is not None else None
+
+        # ── 尝试从缓存加载 ──────────────────────────────────────
+        if cache_dir is not None and cache_key is not None:
+            cache_path = cache_dir / cache_key
+            if cache_path.exists():
+                try:
+                    full_graph = torch.load(cache_path, map_location='cpu', weights_only=False)
+                    win_samples = extract_windowed_samples(full_graph, w_cfg, logger)
+                    graphs.extend(win_samples)
+                    n_windows_total += len(win_samples)
+                    n_cached += 1
+                    logger.debug(
+                        f"从缓存加载图: {cache_key}"
+                        + (f" → {len(win_samples)} 个窗口" if windowed else "")
+                    )
+                    continue
+                except Exception as e:
+                    logger.warning(f"缓存加载失败 ({cache_key}): {e}，重新构建")
+
         graph_list = []
         
         # fMRI图
@@ -219,8 +462,9 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                     logger.warning(f"fMRI processing failed: {error}, skipping subject")
                     continue
             
-            # Truncate to max_seq_len to prevent CUDA OOM with long sequences
-            if max_seq_len is not None:
+            # 截断仅在单样本训练模式下启用（防 CUDA OOM）。
+            # 窗口模式下不截断，以使连通性估计来自完整 run。
+            if not windowed and max_seq_len is not None:
                 fmri_ts = truncate_timeseries(fmri_ts, max_seq_len)
             
             logger.debug(f"fMRI timeseries shape: {fmri_ts.shape} → {fmri_ts.shape[0]} nodes")
@@ -250,8 +494,9 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 logger.warning("EEG contains NaN or Inf values, skipping")
                 continue
             
-            # Truncate to max_seq_len to prevent CUDA OOM with long sequences
-            if max_seq_len is not None:
+            # 截断仅在单样本训练模式下启用（防 CUDA OOM）。
+            # 窗口模式下不截断，以使连通性估计来自完整 run。
+            if not windowed and max_seq_len is not None:
                 eeg_data = truncate_timeseries(eeg_data, max_seq_len)
             
             eeg_graph = mapper.map_eeg_to_graph(
@@ -266,40 +511,78 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         if len(graph_list) > 0:
             if len(graph_list) == 1:
                 # Single modality: use as-is
-                graphs.append(graph_list[0][1])
+                built_graph = graph_list[0][1]
             else:
                 # Multi-modal: merge into heterograph
-                merged_graph = HeteroData()
+                built_graph = HeteroData()
                 for modality, graph in graph_list:
-                    # Copy node features and structure
+                    # Copy node features, structure, AND metadata
                     for key in graph.node_types:
-                        merged_graph[key].x = graph[key].x
+                        built_graph[key].x = graph[key].x
                         if hasattr(graph[key], 'num_nodes'):
-                            merged_graph[key].num_nodes = graph[key].num_nodes
+                            built_graph[key].num_nodes = graph[key].num_nodes
                         if hasattr(graph[key], 'pos'):
-                            merged_graph[key].pos = graph[key].pos
+                            built_graph[key].pos = graph[key].pos
+                        # sampling_rate used by log_training_summary; omitting it
+                        # causes silent fallback to wrong defaults (250 Hz / 0.5 Hz)
+                        if hasattr(graph[key], 'sampling_rate'):
+                            built_graph[key].sampling_rate = graph[key].sampling_rate
                     
                     # Copy edge structure
                     for edge_type in graph.edge_types:
-                        merged_graph[edge_type].edge_index = graph[edge_type].edge_index
+                        built_graph[edge_type].edge_index = graph[edge_type].edge_index
                         if hasattr(graph[edge_type], 'edge_attr'):
-                            merged_graph[edge_type].edge_attr = graph[edge_type].edge_attr
+                            built_graph[edge_type].edge_attr = graph[edge_type].edge_attr
                 
                 # 跨模态边：EEG → fMRI
                 # 设计理念：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。
                 # create_simple_cross_modal_edges 会验证 N_eeg < N_fmri 并在违反时给出警告。
-                if 'fmri' in merged_graph.node_types and 'eeg' in merged_graph.node_types:
-                    cross_edges = mapper.create_simple_cross_modal_edges(merged_graph)
+                if 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
+                    cross_edges = mapper.create_simple_cross_modal_edges(built_graph)
                     if cross_edges is not None:
-                        merged_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
-                
-                graphs.append(merged_graph)
-    
+                        built_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
+            
+            # ── 保存到缓存（始终保存完整 run 图） ──────────────────
+            if cache_dir is not None and cache_key is not None:
+                try:
+                    cache_path = cache_dir / cache_key
+                    torch.save(built_graph, cache_path)
+                    logger.debug(f"图已缓存: {cache_key}")
+                except Exception as e:
+                    logger.warning(f"缓存保存失败 ({subject_id}/{task}): {e}")
+
+            # ── 加入训练列表 ─────────────────────────────────────
+            # 窗口模式：切分为多个短窗口样本；单样本模式：直接加入完整图。
+            if windowed:
+                win_samples = extract_windowed_samples(built_graph, w_cfg, logger)
+                graphs.extend(win_samples)
+                n_windows_total += len(win_samples)
+                logger.debug(
+                    f"  {subject_id}/{task}: {len(win_samples)} 个时间窗口样本"
+                )
+            else:
+                graphs.append(built_graph)
+
     if len(graphs) == 0:
         raise ValueError("No valid graphs constructed. Check data quality and preprocessing.")
-    
-    logger.info(f"成功构建 {len(graphs)} 个图")
-    
+
+    # ── 汇总日志 ────────────────────────────────────────────────
+    n_runs = len(all_data)
+    if windowed:
+        avg_win = n_windows_total / max(n_runs, 1)
+        logger.info(
+            f"图构建完成: {n_runs} 条 run → {n_windows_total} 个时间窗口训练样本"
+            f" (平均 {avg_win:.1f} 个窗口/run)"
+            + (f"，其中 {n_cached} 条 run 来自缓存" if n_cached else "")
+        )
+    elif n_cached > 0:
+        logger.info(
+            f"图构建完成: {len(graphs)} 个图"
+            f" (其中 {n_cached} 个来自缓存，{len(graphs) - n_cached} 个新建)"
+        )
+    else:
+        logger.info(f"成功构建 {len(graphs)} 个图")
+
     return graphs, mapper
 
 
@@ -342,6 +625,9 @@ def create_model(config: dict, logger: logging.Logger):
         dropout=config['model']['dropout'],
         loss_type=config['model'].get('loss_type', 'mse'),
         use_gradient_checkpointing=config['training'].get('use_gradient_checkpointing', False),
+        predictor_config=config.get('v5_optimization', {}).get('advanced_prediction'),
+        use_dynamic_graph=config['model'].get('use_dynamic_graph', False),
+        k_dynamic_neighbors=config['model'].get('k_dynamic_neighbors', 10),
     )
     
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
@@ -501,20 +787,27 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         logger.error("提示: 请增加数据量或调整 max_subjects 配置")
         raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个。请检查数据配置。")
     
+    # 打乱后再划分，避免以下偏差：
+    # 1. 窗口采样时序列前段全入训练集、后段全入验证集（不同脑状态）
+    # 2. 被试按字母顺序排列时最后几个被试全部只出现在验证集中
+    # 使用 seed 保证复现性
+    shuffled = graphs.copy()
+    rng = random.Random(42)
+    rng.shuffle(shuffled)
+    
     # Use at least 10% or 1 sample for validation, ensure both train and val have at least 1
-    min_val_samples = max(1, len(graphs) // 10)
-    n_train = len(graphs) - min_val_samples
+    min_val_samples = max(1, len(shuffled) // 10)
+    n_train = len(shuffled) - min_val_samples
     
     # Safety check: ensure both sets have at least 1 sample
     if n_train < 1:
         n_train = 1
-        min_val_samples = len(graphs) - 1
+        min_val_samples = len(shuffled) - 1
     
-    train_graphs = graphs[:n_train]
-    val_graphs = graphs[n_train:]
+    train_graphs = shuffled[:n_train]
+    val_graphs = shuffled[n_train:]
     
-    logger.info(f"训练集: {len(train_graphs)} 个样本")
-    logger.info(f"验证集: {len(val_graphs)} 个样本")
+    logger.info(f"训练集: {len(train_graphs)} 个样本 | 验证集: {len(val_graphs)} 个样本 (seed=42 随机打乱, 结果可复现)")
     
     if len(train_graphs) < 5:
         logger.warning("⚠️ 训练样本较少，模型可能过拟合。建议使用更多数据。")
@@ -538,6 +831,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         use_torch_compile=config['device'].get('use_torch_compile', True),
         compile_mode=config['device'].get('compile_mode', 'reduce-overhead'),
         device=config['device']['type'],
+        optimization_config=config.get('v5_optimization'),
     )
     logger.info("✅ 训练器初始化完成")
     logger.info("=" * 60)
@@ -545,7 +839,6 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("=" * 60)
     
     # 训练循环
-    import time
     best_val_loss = float('inf')
     patience_counter = 0
     no_improvement_warning_shown = False

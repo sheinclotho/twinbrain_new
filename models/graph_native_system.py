@@ -43,7 +43,7 @@ except ImportError:
         autocast = None
         GradScaler = None
 
-from .graph_native_mapper import GraphNativeBrainMapper, TemporalGraphFeatureExtractor
+from .graph_native_mapper import GraphNativeBrainMapper
 from .graph_native_encoder import GraphNativeEncoder, SpatialTemporalGraphConv
 from .adaptive_loss_balancer import AdaptiveLossBalancer
 from .eeg_channel_handler import EnhancedEEGHandler
@@ -163,6 +163,12 @@ class GraphNativeBrainModel(nn.Module):
     NO sequence conversions - pure graph operations throughout.
     """
     
+    # 潜空间预测切分比例：前 CONTEXT_RATIO 作为 context，余下部分为 future target。
+    # context ≥ 2/3 确保 StratifiedWindowSampler 能在 context 内取到至少 1 个完整窗口。
+    _PRED_CONTEXT_RATIO: float = 2 / 3
+    # 潜空间预测所需最小序列长度（= 保证 T_ctx ≥ 1 且 T_fut ≥ 1）
+    _PRED_MIN_SEQ_LEN: int = 4
+    
     def __init__(
         self,
         node_types: List[str],
@@ -176,6 +182,9 @@ class GraphNativeBrainModel(nn.Module):
         dropout: float = 0.1,
         loss_type: str = 'mse',
         use_gradient_checkpointing: bool = False,
+        predictor_config: Optional[Dict] = None,
+        use_dynamic_graph: bool = False,
+        k_dynamic_neighbors: int = 10,
     ):
         """
         Initialize complete model.
@@ -193,6 +202,12 @@ class GraphNativeBrainModel(nn.Module):
             loss_type: Loss function type ('mse', 'huber', 'smooth_l1')
             use_gradient_checkpointing: Free intermediate activations per timestep
                 to avoid MemoryError on long sequences (trades memory for compute)
+            predictor_config: Optional dict from config['v5_optimization']['advanced_prediction'].
+                Keys: use_hierarchical, use_transformer, use_uncertainty, num_scales,
+                num_windows, sampling_strategy.  Defaults used when None.
+            use_dynamic_graph: Enable self-iterating graph structure learning
+                (DynamicGraphConstructor per ST-GCN layer, intra-modal edges only).
+            k_dynamic_neighbors: k-nearest neighbours for the dynamic adjacency.
         """
         super().__init__()
         
@@ -210,6 +225,8 @@ class GraphNativeBrainModel(nn.Module):
             num_layers=num_encoder_layers,
             use_gradient_checkpointing=use_gradient_checkpointing,
             dropout=dropout,
+            use_dynamic_graph=use_dynamic_graph,
+            k_dynamic_neighbors=k_dynamic_neighbors,
         )
         
         # Decoder: Reconstruct temporal signals
@@ -222,29 +239,43 @@ class GraphNativeBrainModel(nn.Module):
         
         # Predictor: Future prediction (optional)
         if use_prediction:
+            pred_cfg = predictor_config or {}
             self.predictor = EnhancedMultiStepPredictor(
                 input_dim=hidden_channels,
                 hidden_dim=hidden_channels * 2,
                 prediction_steps=prediction_steps,
-                use_hierarchical=True,
-                use_transformer=True,
+                use_hierarchical=pred_cfg.get('use_hierarchical', True),
+                use_transformer=pred_cfg.get('use_transformer', True),
+                use_uncertainty=pred_cfg.get('use_uncertainty', True),
+                num_scales=pred_cfg.get('num_scales', 3),
+                num_windows=pred_cfg.get('num_windows', 3),
+                sampling_strategy=pred_cfg.get('sampling_strategy', 'uniform'),
             )
     
     def forward(
         self,
         data: HeteroData,
         return_prediction: bool = False,
-    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+        return_encoded: bool = False,
+    ) -> Tuple:
         """
         Forward pass with input validation.
         
         Args:
             data: Input HeteroData with temporal features
             return_prediction: Whether to return future predictions
+            return_encoded: Whether to return latent encoded representations
+                {node_type: h[N, T, H]} — needed by compute_loss for
+                the latent-space self-supervised prediction loss.
             
         Returns:
-            reconstructed: Reconstructed signals per modality
-            predictions: Future predictions (if return_prediction=True)
+            When return_encoded=False (default):
+                (reconstructed, predictions) — 2-tuple
+            When return_encoded=True:
+                (reconstructed, predictions, encoded_dict) — 3-tuple
+            reconstructed: {node_type: tensor[N, T, C]}
+            predictions: {node_type: tensor[N, steps, H]} or None
+            encoded_dict: {node_type: tensor[N, T, H]}
         """
         # Input validation (use explicit checks, not assertions)
         for node_type in self.node_types:
@@ -282,6 +313,15 @@ class GraphNativeBrainModel(nn.Module):
                     # Average across sampled windows → [N, prediction_steps, H]
                     predictions[node_type] = pred_windows.mean(dim=0)
         
+        # 4. Optionally return latent encoded dict for compute_loss prediction loss
+        if return_encoded:
+            encoded_dict = {
+                nt: encoded_data[nt].x
+                for nt in self.node_types
+                if nt in encoded_data.node_types
+            }
+            return reconstructed, predictions, encoded_dict
+
         return reconstructed, predictions
     
     def compute_loss(
@@ -289,6 +329,7 @@ class GraphNativeBrainModel(nn.Module):
         data: HeteroData,
         reconstructed: Dict[str, torch.Tensor],
         predictions: Optional[Dict[str, torch.Tensor]] = None,
+        encoded: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute training loss.
@@ -296,7 +337,12 @@ class GraphNativeBrainModel(nn.Module):
         Args:
             data: Original data
             reconstructed: Reconstructed signals
-            predictions: Predicted future signals (currently unused in loss)
+            predictions: Unused (kept for API compatibility)
+            encoded: Latent representations {node_type: h[N, T, H]}.
+                When provided together with use_prediction=True, a
+                self-supervised prediction loss is computed entirely in
+                latent space (first 2/3 → predict last 1/3), giving the
+                predictor a real training signal for the first time.
             
         Returns:
             Dictionary of losses
@@ -342,11 +388,47 @@ class GraphNativeBrainModel(nn.Module):
                 
                 losses[f'recon_{node_type}'] = recon_loss
         
-        # Prediction loss: pred is in latent space H while data[node_type].x is in
-        # original space C.  Comparing them directly is undefined and produces
-        # meaningless gradients.  A proper prediction loss requires encoding the
-        # future window and comparing in latent space — implement as future work.
-        # For now, the predictor is used for inference only.
+        # ── 潜空间自监督预测损失 ─────────────────────────────────────────
+        # 将编码器潜空间序列切分为 context（前 2/3）→ 预测 future（后 1/3）。
+        # 与旧代码（仅推理时运行预测头）的关键区别：
+        #   旧：预测头参数从不接收梯度信号 → 实为死代码
+        #   新：context/future 均在潜空间 H，可直接 MSE/Huber 比较，预测头真正被训练
+        # 注：该 loss 隐式包含跨模态信息——编码器的 ST-GCN 跨模态边使 fMRI 潜向量中
+        #     已包含 EEG 信息（反之亦然），故"预测 fMRI 潜向量未来"等价于用混合了
+        #     EEG 信息的表征预测混合了 EEG 信息的未来表征。
+        if encoded is not None and self.use_prediction:
+            for node_type in self.node_types:
+                if node_type not in encoded:
+                    continue
+                h = encoded[node_type]  # [N, T, H]
+                T = h.shape[1]
+                if T < self._PRED_MIN_SEQ_LEN:
+                    # 序列过短，无法切分 (需 ≥ _PRED_MIN_SEQ_LEN 才能得到非空 context 和 future)
+                    continue
+                T_ctx = int(T * self._PRED_CONTEXT_RATIO)
+                context = h[:, :T_ctx, :]           # [N, T_ctx, H]
+                future_target = h[:, T_ctx:, :]     # [N, T_fut, H]
+
+                # EnhancedMultiStepPredictor 期望输入 [batch, seq_len, H]；
+                # 以 N 节点为 batch 维度（与 forward() 一致）
+                # 返回 (pred_windows[num_windows, N, pred_steps, H], targets, unc)
+                pred_windows, _, _ = self.predictor(context, return_uncertainty=False)
+                pred_mean = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+
+                aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
+                if aligned_steps > 0:
+                    if self.loss_type == 'huber':
+                        pred_loss = F.huber_loss(
+                            pred_mean[:, :aligned_steps, :],
+                            future_target[:, :aligned_steps, :],
+                            delta=1.0,
+                        )
+                    else:
+                        pred_loss = F.mse_loss(
+                            pred_mean[:, :aligned_steps, :],
+                            future_target[:, :aligned_steps, :],
+                        )
+                    losses[f'pred_{node_type}'] = pred_loss
         
         return losses
 
@@ -379,6 +461,7 @@ class GraphNativeTrainer:
         use_torch_compile: bool = True,
         compile_mode: str = 'reduce-overhead',
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        optimization_config: Optional[Dict] = None,
     ):
         """
         Initialize trainer.
@@ -397,7 +480,11 @@ class GraphNativeTrainer:
             use_torch_compile: Use torch.compile() for 20-40% speedup (PyTorch 2.0+)
             compile_mode: Compilation mode ('default', 'reduce-overhead', 'max-autotune')
             device: Device to train on
+            optimization_config: Optional dict from config['v5_optimization'].
+                Contains sub-dicts 'adaptive_loss' and 'eeg_enhancement' with
+                fine-grained hyperparameters.  Defaults used when None.
         """
+        self._optimization_config = optimization_config or {}
         self.model = model.to(device)
         self.device = device
         self.node_types = node_types
@@ -478,14 +565,40 @@ class GraphNativeTrainer:
         self.scheduler = None
         if use_scheduler:
             if scheduler_type == 'cosine':
-                # Cosine annealing with warm restarts
-                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                    self.optimizer,
-                    T_0=10,  # Restart every 10 epochs
-                    T_mult=2,  # Double period after each restart
-                    eta_min=learning_rate * 0.01
+                # Linear warm-up for the first `warmup_epochs` epochs, then
+                # CosineAnnealingWarmRestarts.  Without warm-up, the full LR
+                # is applied from epoch 1, which often causes large gradient
+                # steps on a freshly initialised model — particularly harmful
+                # when training on small neuroimaging datasets (N < 100 samples).
+                #
+                # SequentialLR chains two schedulers: LinearLR ramps from
+                # start_factor × lr up to lr over warmup_epochs steps, then
+                # hands off to CosineAnnealingWarmRestarts.
+                warmup_epochs = self._optimization_config.get(
+                    'warmup_epochs',
+                    3,  # safe minimum; v5_optimization.warmup_epochs in default.yaml is 5
                 )
-                logger.info(f"Learning rate scheduler enabled: CosineAnnealingWarmRestarts")
+                warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=0.1,   # start at 10% of target LR
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    self.optimizer,
+                    T_0=10,    # restart every 10 epochs
+                    T_mult=2,  # double period after each restart
+                    eta_min=learning_rate * 0.01,
+                )
+                self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_sched, cosine_sched],
+                    milestones=[warmup_epochs],
+                )
+                logger.info(
+                    f"LR scheduler: Linear warmup ({warmup_epochs} epochs) "
+                    f"→ CosineAnnealingWarmRestarts(T_0=10, T_mult=2)"
+                )
             elif scheduler_type == 'onecycle':
                 # OneCycle (will need total_steps, set in train_epoch)
                 self.scheduler_type = 'onecycle'
@@ -515,38 +628,83 @@ class GraphNativeTrainer:
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
             
+            al_cfg = self._optimization_config.get('adaptive_loss', {})
             self.loss_balancer = AdaptiveLossBalancer(
                 task_names=task_names,
                 modality_names=node_types,
-                modality_energy_ratios={'eeg': 0.02, 'fmri': 1.0},
+                alpha=al_cfg.get('alpha', 1.5),
+                update_frequency=al_cfg.get('update_frequency', 10),
+                learning_rate=al_cfg.get('learning_rate', 0.025),
+                warmup_epochs=al_cfg.get('warmup_epochs', 5),
+                modality_energy_ratios=al_cfg.get('modality_energy_ratios', {'eeg': 0.02, 'fmri': 1.0}),
             )
         
         # EEG enhancement
-        self.use_eeg_enhancement = use_eeg_enhancement
-        if use_eeg_enhancement and 'eeg' in node_types:
-            try:
-                # Get EEG channel count from model (with safety checks)
-                if hasattr(model.encoder, 'input_proj') and 'eeg' in model.encoder.input_proj:
-                    eeg_channels = model.encoder.input_proj['eeg'].in_features
-                    self.eeg_handler = EnhancedEEGHandler(
-                        num_channels=eeg_channels,
-                        enable_monitoring=True,
-                        enable_attention=True,
-                        enable_regularization=True,
-                    ).to(self.device)  # Move to device to prevent device mismatch errors
-                else:
-                    logger.warning("EEG enhancement requested but no EEG encoder found. Disabling.")
-                    self.use_eeg_enhancement = False
-            except (AttributeError, KeyError) as e:
-                logger.warning(f"Failed to initialize EEG handler: {e}. Disabling EEG enhancement.")
-                self.use_eeg_enhancement = False
+        # DESIGN NOTE: EEG graph data has shape [N_eeg, T, 1] — each graph node is
+        # one electrode, with 1-dimensional feature (signal amplitude).
+        # EnhancedEEGHandler was designed for [batch, time, channels] where 'channels'
+        # are individual EEG electrodes.  The correct mapping is:
+        #   graph format: [N_eeg, T, 1]  →  handler format: [1, T, N_eeg]
+        # N_eeg is only known at data-loading time (varies per dataset/subject), so
+        # we use lazy initialisation: the handler is created on the first training step.
+        self.use_eeg_enhancement = use_eeg_enhancement and 'eeg' in node_types
+        self.eeg_handler = None          # created lazily in train_step()
+        self._eeg_handler_cfg = self._optimization_config.get('eeg_enhancement', {})
         
         # Training history
         self.history = {
             'train_loss': [],
             'val_loss': [],
         }
+
+    def _ensure_eeg_handler(self, n_eeg_channels: int) -> None:
+        """Lazily initialise EnhancedEEGHandler once N_eeg is known from real data.
+
+        Called from train_step() on the first forward pass so that the handler
+        is built with the correct num_channels = N_eeg (number of electrodes),
+        not the graph feature dimension (always 1).
+        """
+        if self.eeg_handler is not None:
+            return  # already initialised
+        cfg = self._eeg_handler_cfg
+        try:
+            self.eeg_handler = EnhancedEEGHandler(
+                num_channels=n_eeg_channels,
+                enable_monitoring=cfg.get('enable_monitoring', True),
+                enable_dropout=cfg.get('enable_dropout', True),
+                enable_attention=cfg.get('enable_attention', True),
+                enable_regularization=cfg.get('enable_regularization', True),
+                dropout_rate=cfg.get('dropout_rate', 0.1),
+                attention_hidden_dim=cfg.get('attention_hidden_dim', 64),
+                entropy_weight=cfg.get('entropy_weight', 0.01),
+                diversity_weight=cfg.get('diversity_weight', 0.01),
+                activity_weight=cfg.get('activity_weight', 0.01),
+            ).to(self.device)
+            logger.info(f"EEG handler initialised for {n_eeg_channels} channels.")
+        except Exception as e:
+            logger.warning(f"Failed to initialise EEG handler: {e}. Disabling EEG enhancement.")
+            self.use_eeg_enhancement = False
     
+    @staticmethod
+    def _graph_to_handler_format(eeg_x: torch.Tensor) -> torch.Tensor:
+        """Reshape EEG graph tensor for EnhancedEEGHandler.
+
+        EnhancedEEGHandler expects ``[batch, time, channels]`` where *channels*
+        are individual EEG electrodes.  Graph node features are stored as
+        ``[N_eeg, T, 1]``.  This helper converts between the two formats.
+
+        ``[N_eeg, T, 1]`` → ``[1, T, N_eeg]``
+        """
+        return eeg_x.squeeze(-1).permute(1, 0).unsqueeze(0)
+
+    @staticmethod
+    def _handler_to_graph_format(eeg_x: torch.Tensor) -> torch.Tensor:
+        """Inverse of :meth:`_graph_to_handler_format`.
+
+        ``[1, T, N_eeg]`` → ``[N_eeg, T, 1]``
+        """
+        return eeg_x.squeeze(0).permute(1, 0).unsqueeze(-1)
+
     def train_step(self, data: HeteroData) -> Dict[str, float]:
         """
         Single training step with optional mixed precision.
@@ -564,6 +722,11 @@ class GraphNativeTrainer:
         data = data.to(self.device)
         
         # Apply EEG enhancement if enabled.
+        # Graph data shape: [N_eeg, T, 1] (N_eeg nodes, each with a 1-dim feature).
+        # EnhancedEEGHandler expects [batch, time, channels] where 'channels' are
+        # individual EEG electrodes.  We therefore reshape:
+        #   graph format: [N_eeg, T, 1]  →  handler format: [1, T, N_eeg]
+        # After processing we reshape back.
         # IMPORTANT: Save original eeg_x and restore it in a finally block.
         # eeg_x_enhanced is part of the current computation graph (requires_grad=True).
         # If we leave data['eeg'].x pointing to it, the next epoch's forward pass
@@ -571,11 +734,21 @@ class GraphNativeTrainer:
         # "Trying to backward through the graph a second time".
         # Using try-finally guarantees restoration even if an exception is raised
         # anywhere inside the forward/backward path.
+        eeg_info: dict = {}  # 初始为空；仅当 EEG handler 激活时（下方 if 块）被填充
         original_eeg_x = None
         if self.use_eeg_enhancement and 'eeg' in data.node_types:
-            original_eeg_x = data['eeg'].x
-            eeg_x_enhanced, eeg_info = self.eeg_handler(original_eeg_x, training=True)
-            data['eeg'].x = eeg_x_enhanced
+            original_eeg_x = data['eeg'].x  # [N_eeg, T, 1]
+            N_eeg = original_eeg_x.shape[0]
+            # Lazy-initialise handler with true electrode count (N_eeg).
+            # Previous approach used in_features=1 (graph feature dim), which
+            # made all channel-specific processing trivially useless.
+            self._ensure_eeg_handler(N_eeg)
+            if self.use_eeg_enhancement and self.eeg_handler is not None:
+                eeg_x_t, eeg_info = self.eeg_handler(
+                    self._graph_to_handler_format(original_eeg_x), training=True
+                )
+                eeg_x_enhanced = self._handler_to_graph_format(eeg_x_t)
+                data['eeg'].x = eeg_x_enhanced
         
         try:
             # Forward and backward pass with optional mixed precision
@@ -589,19 +762,35 @@ class GraphNativeTrainer:
                     amp_context = autocast()
                 
                 with amp_context:
-                    # Forward pass: skip prediction during training — the predictor
-                    # operates in latent space and has no training loss (see compute_loss).
-                    # This also saves the compute of running the full prediction head.
-                    reconstructed, _ = self.model(data, return_prediction=False)
+                    # Forward pass.
+                    # When use_prediction=True, retrieve encoded latent representations
+                    # so compute_loss can train the predictor in latent space.
+                    if self.model.use_prediction:
+                        reconstructed, _, encoded = self.model(
+                            data, return_prediction=False, return_encoded=True
+                        )
+                    else:
+                        reconstructed, _ = self.model(data, return_prediction=False)
+                        encoded = None
                     
-                    # Compute losses
-                    losses = self.model.compute_loss(data, reconstructed, None)
+                    # Compute losses (reconstruction + optional latent prediction)
+                    losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
                     
                     # Adaptive loss balancing
                     if self.use_adaptive_loss:
                         total_loss, weights = self.loss_balancer(losses)
                     else:
                         total_loss = sum(losses.values())
+                    
+                    # ── EEG 防零崩塌正则化 ───────────────────────────────
+                    # eeg_handler 计算的熵+多样性+活动损失之前从未加入总损失
+                    # （eeg_info 被静默丢弃）。此处补全，确保其梯度信号生效。
+                    # 注：权重已在 AntiCollapseRegularizer 初始化时配置
+                    # (entropy_weight, diversity_weight, activity_weight)，默认 0.01。
+                    eeg_reg = eeg_info.get('regularization_loss')
+                    if eeg_reg is not None:
+                        total_loss = total_loss + eeg_reg
+                        losses['eeg_reg'] = eeg_reg
                 
                 # Backward pass with gradient scaling
                 self.scaler.scale(total_loss).backward()
@@ -611,16 +800,28 @@ class GraphNativeTrainer:
                 self.scaler.update()
             else:
                 # Standard training without AMP
-                reconstructed, _ = self.model(data, return_prediction=False)
+                if self.model.use_prediction:
+                    reconstructed, _, encoded = self.model(
+                        data, return_prediction=False, return_encoded=True
+                    )
+                else:
+                    reconstructed, _ = self.model(data, return_prediction=False)
+                    encoded = None
                 
-                # Compute losses
-                losses = self.model.compute_loss(data, reconstructed, None)
+                # Compute losses (reconstruction + optional latent prediction)
+                losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
                 
                 # Adaptive loss balancing
                 if self.use_adaptive_loss:
                     total_loss, weights = self.loss_balancer(losses)
                 else:
                     total_loss = sum(losses.values())
+                
+                # EEG 防零崩塌正则化（同 AMP 路径）
+                eeg_reg = eeg_info.get('regularization_loss')
+                if eeg_reg is not None:
+                    total_loss = total_loss + eeg_reg
+                    losses['eeg_reg'] = eeg_reg
                 
                 # Backward pass
                 total_loss.backward()
@@ -634,7 +835,7 @@ class GraphNativeTrainer:
             # graph access that would raise "backward through the graph a second time".
             if self.use_adaptive_loss:
                 detached_losses = {k: v.detach() for k, v in losses.items()}
-                self.loss_balancer.update_weights(detached_losses, self.model)
+                self.loss_balancer.update_weights(detached_losses)
             
             # Return loss values
             loss_dict = {k: v.item() for k, v in losses.items()}
@@ -722,6 +923,11 @@ class GraphNativeTrainer:
         """
         Validation pass.
         
+        Computes the same loss terms as training (reconstruction + prediction)
+        so that early stopping is driven by the actual optimisation objective.
+        Previously this only computed reconstruction loss, making val_loss
+        artificially lower than train_loss regardless of overfitting.
+        
         Args:
             data_list: List of validation data
             
@@ -734,11 +940,18 @@ class GraphNativeTrainer:
         for data in data_list:
             data = data.to(self.device)
             
-            # Forward pass: skip prediction (compute_loss doesn't use it)
-            reconstructed, _ = self.model(data, return_prediction=False)
+            # Request encoded representations when prediction is enabled so that
+            # compute_loss() can include the latent-space prediction loss —
+            # the same terms that are optimised during training.
+            if self.model.use_prediction:
+                reconstructed, _, encoded = self.model(
+                    data, return_prediction=False, return_encoded=True
+                )
+            else:
+                reconstructed, _ = self.model(data, return_prediction=False)
+                encoded = None
             
-            # Compute losses
-            losses = self.model.compute_loss(data, reconstructed, None)
+            losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
             total_loss += sum(losses.values()).item()
         
         avg_loss = total_loss / len(data_list)
