@@ -8,10 +8,10 @@ Implements GradNorm-inspired adaptive loss weighting to handle:
 3. Dynamic loss weight adjustment based on training dynamics
 
 Key Features:
-- Per-modality gradient normalization
-- Automatic loss weight adaptation
-- Energy-aware scaling for EEG/fMRI balance
-- Gradient magnitude-based weighting
+- Energy-aware initial task weights (EEG tasks start with higher weight to
+  counteract the ~50x lower signal amplitude relative to fMRI)
+- Automatic loss weight adaptation after warmup
+- Gradient-free weight update using loss magnitudes as proxy
 
 References:
     - GradNorm: Gradient Normalization for Adaptive Loss Balancing (Chen et al., 2018)
@@ -29,12 +29,11 @@ logger = logging.getLogger(__name__)
 
 class AdaptiveLossBalancer(nn.Module):
     """
-    Adaptive loss balancing using gradient normalization.
-    
-    Dynamically adjusts loss weights based on:
-    1. Relative training rates across tasks
-    2. Gradient magnitudes per task
-    3. Modality-specific energy characteristics
+    Adaptive loss balancing for multi-modal multi-task learning.
+
+    Dynamically adjusts loss weights based on relative task difficulty, with
+    energy-aware initialisation to handle the EEG/fMRI amplitude imbalance
+    from the very first training step (including warmup where adaptation is off).
     """
     
     def __init__(
@@ -52,18 +51,25 @@ class AdaptiveLossBalancer(nn.Module):
     ):
         """
         Initialize adaptive loss balancer.
-        
+
         Args:
-            task_names: List of task names (e.g., ['recon_eeg', 'recon_fmri', 'pred_eeg', 'pred_fmri'])
-            modality_names: List of modality names (e.g., ['eeg', 'fmri'])
-            initial_weights: Initial task weights (defaults to 1.0 for all)
-            alpha: Restoring force for balancing (higher = more aggressive)
-            update_frequency: Update weights every N steps
-            learning_rate: Learning rate for weight updates
-            warmup_epochs: Number of epochs before enabling adaptation
-            modality_energy_ratios: Energy ratio for each modality (e.g., {'eeg': 0.01, 'fmri': 1.0})
-            min_weight: Minimum allowed weight
-            max_weight: Maximum allowed weight
+            task_names: Task names, e.g. ['recon_eeg', 'recon_fmri', 'pred_eeg', 'pred_fmri'].
+                Task names ending with a modality name (e.g. '_eeg') are matched to that
+                modality's energy ratio for initial weight seeding.
+            modality_names: Modality names, e.g. ['eeg', 'fmri'].
+            initial_weights: Explicit initial task weights.  When None (default), weights
+                are seeded from the inverse of ``modality_energy_ratios`` so that low-energy
+                modalities (EEG) receive a higher initial weight.  This implements the valid
+                design intent of the removed ``ModalityGradientScaler`` without any
+                post-backward graph manipulation.
+            alpha: Restoring force for balancing (higher = more aggressive).
+            update_frequency: Update weights every N steps.
+            learning_rate: Learning rate for weight updates.
+            warmup_epochs: Number of epochs before enabling adaptation.
+            modality_energy_ratios: Relative signal energy per modality.
+                Default: {'eeg': 0.02, 'fmri': 1.0} (fMRI ≈50× more energy than EEG).
+            min_weight: Minimum allowed weight.
+            max_weight: Maximum allowed weight.
         """
         super().__init__()
         
@@ -75,41 +81,43 @@ class AdaptiveLossBalancer(nn.Module):
         self.warmup_epochs = warmup_epochs
         self.min_weight = min_weight
         self.max_weight = max_weight
-        
-        # Initialize task weights
+
+        # ── Energy-aware initial task weights ──────────────────────────────
+        # Design note (rescues ModalityGradientScaler's valid intent):
+        # EEG has ~50x lower signal amplitude than fMRI.  All tasks at weight=1.0
+        # means fMRI reconstruction loss dominates from step 1, and the model treats
+        # EEG as noise during warmup (when adaptation is disabled).
+        # Setting initial_weight ∝ 1/energy means:
+        #   recon_eeg starts at 50×, recon_fmri at 1× (normalised to mean=1)
+        # No autograd.grad() needed — pure init-time arithmetic, zero runtime overhead.
         if initial_weights is None:
-            initial_weights = {name: 1.0 for name in task_names}
-        
-        # Create learnable weights (in log space for stability)
-        log_weights = {
-            name: torch.log(torch.tensor(initial_weights.get(name, 1.0)))
-            for name in task_names
-        }
-        self.log_weights = nn.ParameterDict({
-            name: nn.Parameter(w) for name, w in log_weights.items()
-        })
-        
-        # Modality energy ratios (stored for reference; used by modality_energy_ratios dict)
-        if modality_energy_ratios is None:
-            # Default: fMRI has ~50x more energy than EEG
+            if modality_energy_ratios is None:
+                modality_energy_ratios = {'eeg': 0.02, 'fmri': 1.0}
+            raw: Dict[str, float] = {}
+            for name in task_names:
+                # Match task name suffix to a known modality (e.g. 'recon_eeg' → 'eeg')
+                matched = next((m for m in self.modality_names if name.endswith(m)), None)
+                energy = modality_energy_ratios.get(matched, 1.0) if matched else 1.0
+                raw[name] = 1.0 / (energy + 1e-8)
+            mean_w = sum(raw.values()) / len(raw)
+            initial_weights = {k: v / mean_w for k, v in raw.items()}
+            logger.debug(f"Energy-seeded initial task weights: {initial_weights}")
+        elif modality_energy_ratios is None:
             modality_energy_ratios = {'eeg': 0.02, 'fmri': 1.0}
-        
-        self.register_buffer(
-            'modality_energy_ratios',
-            torch.tensor([modality_energy_ratios.get(m, 1.0) for m in self.modality_names])
-            if self.modality_names else None
-        )
-        
-        # Track training dynamics (buffers will be moved to device with .to(device))
+
+        # Learnable weights stored in log space for numerical stability.
+        self.log_weights = nn.ParameterDict({
+            name: nn.Parameter(torch.log(torch.tensor(initial_weights.get(name, 1.0))))
+            for name in task_names
+        })
+
+        # Track training dynamics
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
         self.register_buffer('epoch_count', torch.tensor(0, dtype=torch.long))
         
-        # Track initial loss values for normalization
+        # Track initial loss values for per-task scale normalisation
         self.register_buffer('initial_losses', torch.zeros(len(task_names), dtype=torch.float32))
         self.register_buffer('initial_losses_set', torch.tensor(False, dtype=torch.bool))
-        
-        # Track loss history for adaptive adjustment
-        self.loss_history = {name: [] for name in task_names}
         
     def forward(
         self,
@@ -165,12 +173,7 @@ class AdaptiveLossBalancer(nn.Module):
         
         return total_loss, weight_dict
     
-    def update_weights(
-        self,
-        losses: Dict[str, torch.Tensor],
-        model: nn.Module,
-        shared_params: Optional[List[nn.Parameter]] = None,
-    ):
+    def update_weights(self, losses: Dict[str, torch.Tensor]):
         """
         Update loss weights based on relative loss magnitudes.
 
@@ -243,7 +246,3 @@ class AdaptiveLossBalancer(nn.Module):
             name: torch.exp(self.log_weights[name]).clamp(self.min_weight, self.max_weight).item()
             for name in self.task_names
         }
-    
-    def reset_history(self):
-        """Reset loss history."""
-        self.loss_history = {name: [] for name in self.task_names}

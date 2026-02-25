@@ -15,6 +15,7 @@ the existing graph-native architecture.
 
 import torch
 import torch.nn as nn
+from contextlib import nullcontext
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -428,7 +429,6 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
                 else:
                     _amp_ctx = autocast()
             else:
-                from contextlib import nullcontext
                 _amp_ctx = nullcontext()
 
             with _amp_ctx:
@@ -481,7 +481,7 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
 
             if self.use_adaptive_loss:
                 detached = {k: v.detach() for k, v in losses.items()}
-                self.loss_balancer.update_weights(detached, self.model)
+                self.loss_balancer.update_weights(detached)
 
             loss_dict = {k: v.item() for k, v in losses.items()}
             loss_dict['total'] = total_loss.item()

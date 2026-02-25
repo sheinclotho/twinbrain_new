@@ -1,12 +1,42 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-25  
-**版本**：V5.12  
+**版本**：V5.13  
 **状态**：生产就绪
 
 ---
 
-## [V5.12] 2026-02-25 — 第三轮审查：修复增强路径 EEG Crash + 大规模死代码清理
+## [V5.13] 2026-02-25 — 设计回顾：拯救死代码的正确设计意图 + 最终残余清理
+
+### 哲学问题回答：被移除的死代码是好设计还是坏设计？
+
+| 组件 | 设计意图 | 为何被移除 | 设计本身是否正确 |
+|------|---------|-----------|--------------|
+| `ModalityGradientScaler` | EEG/fMRI 幅值相差 ~50x，需要平衡梯度贡献 | `autograd.grad()` 在 `backward()` 后调用 → 崩溃 | ✅ 问题真实存在；实现方式错误 |
+| `_apply_modality_scaling()` | 对损失施加 per-modality 能量缩放 | `modality_losses` 参数从未传入 → 代码永不执行 | ❌ 与 initial_weights 机制重复；正确移除 |
+| `get_temporal_pooling()` | 静态节点嵌入用于分类等下游任务 | 当前流水线不需要 | ✅ 未来有用；但 YAGNI，正确移除 |
+
+### 🟢 DESIGN RESCUE: `AdaptiveLossBalancer` — 正确实现 ModalityGradientScaler 的设计意图
+
+**根本问题**：`modality_energy_ratios` 存储为 buffer 但**从未用于计算任何内容**。所有任务（`recon_eeg`, `recon_fmri`, `pred_eeg`, `pred_fmri`）以相同初始权重 1.0 开始。这意味着 fMRI 重建损失（~50× 更大）在预热阶段（前 5 个 epoch，权重自适应关闭）完全主导，模型基本忽略 EEG 重建。
+
+**正确实现**（无任何 `autograd.grad()` 调用，零运行时开销）：
+```
+initial_weight(recon_eeg) ∝ 1/energy_eeg = 1/0.02 = 50
+initial_weight(recon_fmri) ∝ 1/energy_fmri = 1/1.0 = 1
+（归一化到 mean=1.0 保持总损失尺度稳定）
+```
+通过在 `__init__` 时匹配任务名后缀与模态名（e.g. `recon_eeg` → `eeg`）实现，任务权重随训练动态自适应调整（warmup 后），但初始条件从第一步就是平衡的。
+
+### 🧹 残余清理（无功能意义的死属性）
+
+- `AdaptiveLossBalancer.update_weights(model, shared_params)` — `model`/`shared_params` 参数接受但从不使用（GradNorm 梯度计算被移除时遗留）；从签名移除；更新两处调用方
+- `AdaptiveLossBalancer.loss_history` 属性 — 创建但从不 append；`reset_history()` 方法只重置空 dict；两者均移除
+- `AdaptiveLossBalancer.modality_energy_ratios` buffer — 不再需要在 forward 时访问（只在 `__init__` 用于计算初始权重）；从 `register_buffer` 改为本地变量
+- `enhanced_graph_native.py` — `from contextlib import nullcontext` 从函数体内移到文件顶层（PEP 8）
+
+---
+
 
 ### 🔴 BUG (CRASH, enhanced path): `enhanced_graph_native.py` `EnhancedGraphNativeTrainer.train_step()` — EEG handler 为 None + 形状错误
 

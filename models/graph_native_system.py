@@ -828,7 +828,7 @@ class GraphNativeTrainer:
             # graph access that would raise "backward through the graph a second time".
             if self.use_adaptive_loss:
                 detached_losses = {k: v.detach() for k, v in losses.items()}
-                self.loss_balancer.update_weights(detached_losses, self.model)
+                self.loss_balancer.update_weights(detached_losses)
             
             # Return loss values
             loss_dict = {k: v.item() for k, v in losses.items()}

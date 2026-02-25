@@ -278,6 +278,20 @@ key 是 `'eeg__projects_to__fmri'`（字符串），不是 tuple。`GraphNativeE
 
 ---
 
+### [2026-02-25] 好的设计意图被错误实现后移除，正确意图也随之消失
+
+**思维误区**：移除崩溃的 `ModalityGradientScaler` 之后，认为"EEG/fMRI 能量不平衡问题已经被 `AdaptiveLossBalancer` 的 `initial_losses` 归一化处理"。没有追问：`initial_losses` 归一化是第一次 forward 后才生效的，**warmup 阶段（前 5 个 epoch）weight 自适应被禁用，归一化也未启动**，此时 fMRI 的 50× 更大的 MSE 完全主导梯度。
+
+**根因**：`modality_energy_ratios` buffer 被存入 `AdaptiveLossBalancer` 但从不参与任何计算——这是"代码声明了意图，但从未执行意图"的另一个例子（AGENTS.md §2021-02-21 的重现）。
+
+**正确思路**：对每一个"存储但从不使用"的参数/属性，问：**这个值应该在什么时候、以什么方式被使用？** `modality_energy_ratios` 的正确使用时机是 `__init__` 时：用它来计算 energy-aware initial task weights，使 EEG 任务从第一个 gradient step 就得到合理的权重。
+
+**实现原则**：能量平衡应在 **损失空间** 的初始权重中实现（init-time 纯 Python 算术），而非在 **梯度空间** 中通过 post-backward `autograd.grad()` 实现（ModalityGradientScaler 的错误之处）。
+
+**修复**：`AdaptiveLossBalancer.__init__` 中，当 `initial_weights=None` 时，通过解析任务名后缀（`recon_eeg` → `eeg`）查找对应模态能量，计算 `initial_weight ∝ 1/energy`，归一化到 mean=1.0。
+
+---
+
 **TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 
 **核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡。
