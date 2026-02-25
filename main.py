@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 import yaml
@@ -420,9 +421,11 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         subject_id = subject_data.get('subject_id', 'unknown')
         task = subject_data.get('task')
 
+        # 计算一次缓存 key，供本次迭代的"读"和"写"共用，避免重复计算。
+        cache_key = _graph_cache_key(subject_id, task, config) if cache_dir is not None else None
+
         # ── 尝试从缓存加载 ──────────────────────────────────────
-        if cache_dir is not None:
-            cache_key = _graph_cache_key(subject_id, task, config)
+        if cache_dir is not None and cache_key is not None:
             cache_path = cache_dir / cache_key
             if cache_path.exists():
                 try:
@@ -539,9 +542,8 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                         built_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
             
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
-            if cache_dir is not None:
+            if cache_dir is not None and cache_key is not None:
                 try:
-                    cache_key = _graph_cache_key(subject_id, task, config)
                     cache_path = cache_dir / cache_key
                     torch.save(built_graph, cache_path)
                     logger.debug(f"图已缓存: {cache_key}")
@@ -835,7 +837,6 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("=" * 60)
     
     # 训练循环
-    import time
     best_val_loss = float('inf')
     patience_counter = 0
     no_improvement_warning_shown = False

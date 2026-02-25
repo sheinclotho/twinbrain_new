@@ -1,14 +1,47 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-24  
-**版本**：V5.11  
+**最后更新**：2026-02-25  
+**版本**：V5.12  
 **状态**：生产就绪
 
 ---
 
-## [V5.11] 2026-02-24 — 第二轮全面审查：4 处残余 Bug + LR 预热 + 参数注释
+## [V5.12] 2026-02-25 — 第三轮审查：修复增强路径 EEG Crash + 大规模死代码清理
 
-### 🔴 BUG-1 (CRASH): `advanced_prediction.py` — `HierarchicalPredictor` 上采样器 LayerNorm 形状错误
+### 🔴 BUG (CRASH, enhanced path): `enhanced_graph_native.py` `EnhancedGraphNativeTrainer.train_step()` — EEG handler 为 None + 形状错误
+
+**问题**：`EnhancedGraphNativeTrainer.train_step()` 覆盖了基类方法，但**未移植** V5.11 的三项 EEG 修复：
+1. 未调用 `_ensure_eeg_handler(N_eeg)` — `self.eeg_handler = None`（基类懒初始化）→ `TypeError: 'NoneType' object is not callable`
+2. 传入 `original_eeg_x = [N_eeg, T, 1]` 而非 handler 期望的 `[1, T, N_eeg]`
+
+**修复**：调用 `_ensure_eeg_handler(N_eeg)` + 使用 `_graph_to_handler_format()` / `_handler_to_graph_format()` 静态方法（与基类完全一致）。
+
+---
+
+### 🧹 大规模死代码清理（-223 行）
+
+#### `adaptive_loss_balancer.py`: 移除 `ModalityGradientScaler` 类（-152 行）
+
+**为何删除**：从未被实例化，内部调用 `torch.autograd.grad(loss, ...)` 会在 `backward()` 释放计算图后崩溃（与 AGENTS.md §2021-02-21 记录的完全相同错误）。
+
+#### `adaptive_loss_balancer.py`: 移除 `_apply_modality_scaling()` 死代码路径（-50 行）
+
+调用者 `self.loss_balancer(losses)` 从不传 `modality_losses` 参数（始终为 `None`），`if self.enable_modality_scaling and modality_losses is not None:` 永远为假。同时移除 `enable_modality_scaling` 参数、`grad_norm_history` 跟踪、`return_weighted` 分支（始终为 True）。
+
+#### `graph_native_encoder.py`: 移除 `GraphNativeEncoder.get_temporal_pooling()`（-36 行）
+
+从未从任何调用方调用。
+
+---
+
+### 🧹 次要清理
+
+- `graph_native_system.py`: 移除死导入 `TemporalGraphFeatureExtractor`（从未使用）
+- `main.py`: 将 `import time` 从函数体内移到文件顶部（PEP 8 规范）
+- `main.py` `build_graphs()`: `_graph_cache_key()` 每次迭代只计算一次，供读缓存和写缓存共用（原先各自独立调用）
+
+---
+
 
 **问题**：`HierarchicalPredictor.__init__()` 的 `upsamplers` 序列中包含 `nn.LayerNorm(input_dim)`。`ConvTranspose1d` 输出形状为 `[N, input_dim, T_up]`，但 `LayerNorm(input_dim)` 标准化的是**最后一维**（= `T_up`），而非 `input_dim`。当 `T_up ≠ input_dim` 时触发 `RuntimeError: normalized_shape does not match input shape`。预测头首次被调用（V5.9 修复死代码后）即崩溃。
 

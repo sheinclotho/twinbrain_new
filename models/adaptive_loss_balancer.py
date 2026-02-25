@@ -46,7 +46,6 @@ class AdaptiveLossBalancer(nn.Module):
         update_frequency: int = 10,
         learning_rate: float = 0.025,
         warmup_epochs: int = 5,
-        enable_modality_scaling: bool = True,
         modality_energy_ratios: Optional[Dict[str, float]] = None,
         min_weight: float = 0.01,
         max_weight: float = 100.0,
@@ -55,14 +54,13 @@ class AdaptiveLossBalancer(nn.Module):
         Initialize adaptive loss balancer.
         
         Args:
-            task_names: List of task names (e.g., ['recon', 'temp_pred', 'align'])
+            task_names: List of task names (e.g., ['recon_eeg', 'recon_fmri', 'pred_eeg', 'pred_fmri'])
             modality_names: List of modality names (e.g., ['eeg', 'fmri'])
             initial_weights: Initial task weights (defaults to 1.0 for all)
             alpha: Restoring force for balancing (higher = more aggressive)
             update_frequency: Update weights every N steps
             learning_rate: Learning rate for weight updates
             warmup_epochs: Number of epochs before enabling adaptation
-            enable_modality_scaling: Enable per-modality gradient scaling
             modality_energy_ratios: Energy ratio for each modality (e.g., {'eeg': 0.01, 'fmri': 1.0})
             min_weight: Minimum allowed weight
             max_weight: Maximum allowed weight
@@ -75,7 +73,6 @@ class AdaptiveLossBalancer(nn.Module):
         self.update_frequency = update_frequency
         self.learning_rate = learning_rate
         self.warmup_epochs = warmup_epochs
-        self.enable_modality_scaling = enable_modality_scaling
         self.min_weight = min_weight
         self.max_weight = max_weight
         
@@ -92,7 +89,7 @@ class AdaptiveLossBalancer(nn.Module):
             name: nn.Parameter(w) for name, w in log_weights.items()
         })
         
-        # Modality energy ratios (for EEG-fMRI balancing)
+        # Modality energy ratios (stored for reference; used by modality_energy_ratios dict)
         if modality_energy_ratios is None:
             # Default: fMRI has ~50x more energy than EEG
             modality_energy_ratios = {'eeg': 0.02, 'fmri': 1.0}
@@ -113,22 +110,17 @@ class AdaptiveLossBalancer(nn.Module):
         
         # Track loss history for adaptive adjustment
         self.loss_history = {name: [] for name in task_names}
-        self.grad_norm_history = {name: [] for name in task_names}
         
     def forward(
         self,
         losses: Dict[str, torch.Tensor],
-        modality_losses: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
-        return_weighted: bool = True,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute weighted loss.
-        
+
         Args:
             losses: Dictionary of task losses {task_name: loss_value}
-            modality_losses: Optional nested dict {modality: {task: loss}} for per-modality scaling
-            return_weighted: If True, return weighted sum; else return per-task weighted losses
-            
+
         Returns:
             total_loss: Weighted sum of losses
             weight_dict: Current weights for logging
@@ -166,70 +158,12 @@ class AdaptiveLossBalancer(nn.Module):
             else:
                 weighted_losses[name] = torch.tensor(0.0, device=list(losses.values())[0].device)
         
-        # Apply modality-specific scaling if enabled
-        if self.enable_modality_scaling and modality_losses is not None:
-            weighted_losses = self._apply_modality_scaling(
-                weighted_losses, modality_losses
-            )
-        
-        # Compute total loss
-        if return_weighted:
-            total_loss = sum(weighted_losses.values())
-        else:
-            total_loss = weighted_losses
+        total_loss = sum(weighted_losses.values())
         
         # Return weights for logging (already detached above)
         weight_dict = {name: w.item() for name, w in weights.items()}
         
         return total_loss, weight_dict
-    
-    def _apply_modality_scaling(
-        self,
-        weighted_losses: Dict[str, torch.Tensor],
-        modality_losses: Dict[str, Dict[str, torch.Tensor]],
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Apply per-modality energy scaling to handle EEG-fMRI imbalance.
-        
-        Args:
-            weighted_losses: Current weighted losses
-            modality_losses: Per-modality losses {modality: {task: loss}}
-            
-        Returns:
-            scaled_losses: Losses with modality scaling applied
-        """
-        if self.modality_energy_ratios is None or len(self.modality_names) == 0:
-            return weighted_losses
-        
-        scaled_losses = {}
-        
-        for task_name, loss_val in weighted_losses.items():
-            # Check if we have modality breakdown for this task
-            task_modality_losses = {}
-            for i, modality in enumerate(self.modality_names):
-                if modality in modality_losses and task_name in modality_losses[modality]:
-                    task_modality_losses[modality] = modality_losses[modality][task_name]
-            
-            if len(task_modality_losses) > 0:
-                # Apply energy scaling to each modality component
-                scaled_components = []
-                for i, modality in enumerate(self.modality_names):
-                    if modality in task_modality_losses:
-                        # Scale by inverse of energy ratio to balance contributions
-                        # EEG (low energy) gets higher weight, fMRI (high energy) gets lower weight
-                        scale = 1.0 / (self.modality_energy_ratios[i] + 1e-8)
-                        scaled_components.append(task_modality_losses[modality] * scale)
-                
-                # Average scaled components
-                if len(scaled_components) > 0:
-                    scaled_losses[task_name] = torch.stack(scaled_components).mean()
-                else:
-                    scaled_losses[task_name] = loss_val
-            else:
-                # No modality breakdown, use original
-                scaled_losses[task_name] = loss_val
-        
-        return scaled_losses
     
     def update_weights(
         self,
@@ -311,162 +245,5 @@ class AdaptiveLossBalancer(nn.Module):
         }
     
     def reset_history(self):
-        """Reset loss and gradient history."""
+        """Reset loss history."""
         self.loss_history = {name: [] for name in self.task_names}
-        self.grad_norm_history = {name: [] for name in self.task_names}
-
-
-class ModalityGradientScaler:
-    """
-    Per-modality gradient scaling to handle energy imbalances.
-    
-    Scales gradients for each modality based on their relative energy levels.
-    This ensures EEG (low energy) and fMRI (high energy) contribute equally to training.
-    """
-    
-    def __init__(
-        self,
-        modality_names: List[str],
-        energy_ratios: Optional[Dict[str, float]] = None,
-        scale_method: str = 'inverse',  # 'inverse' or 'sqrt_inverse'
-        adaptive: bool = True,
-        update_frequency: int = 100,
-    ):
-        """
-        Initialize modality gradient scaler.
-        
-        Args:
-            modality_names: List of modality names
-            energy_ratios: Relative energy for each modality
-            scale_method: How to compute scale from energy ratio
-            adaptive: Adapt scales based on gradient statistics
-            update_frequency: Update adaptive scales every N steps
-        """
-        self.modality_names = modality_names
-        self.scale_method = scale_method
-        self.adaptive = adaptive
-        self.update_frequency = update_frequency
-        
-        # Initialize energy ratios
-        if energy_ratios is None:
-            # Default: fMRI 50x more energy than EEG
-            energy_ratios = {'eeg': 0.02, 'fmri': 1.0}
-        
-        self.energy_ratios = energy_ratios
-        
-        # Compute initial scales
-        self.scales = self._compute_scales(energy_ratios)
-        
-        # Track gradient statistics for adaptive scaling
-        self.grad_stats = {name: {'mean': 0.0, 'count': 0} for name in modality_names}
-        self.step_count = 0
-    
-    def _compute_scales(self, energy_ratios: Dict[str, float]) -> Dict[str, float]:
-        """Compute gradient scales from energy ratios."""
-        scales = {}
-        
-        for name in self.modality_names:
-            energy = energy_ratios.get(name, 1.0)
-            
-            if self.scale_method == 'inverse':
-                # Inverse: low energy -> high scale
-                scale = 1.0 / (energy + 1e-8)
-            elif self.scale_method == 'sqrt_inverse':
-                # Square root inverse: softer scaling
-                scale = 1.0 / (energy ** 0.5 + 1e-8)
-            else:
-                scale = 1.0
-            
-            scales[name] = scale
-        
-        # Normalize scales to have mean = 1.0
-        mean_scale = sum(scales.values()) / len(scales)
-        scales = {name: s / mean_scale for name, s in scales.items()}
-        
-        return scales
-    
-    def scale_gradients(
-        self,
-        modality_losses: Dict[str, torch.Tensor],
-        model: nn.Module,
-        modality_params: Dict[str, List[nn.Parameter]],
-    ):
-        """
-        Scale gradients for each modality.
-        
-        Args:
-            modality_losses: Loss for each modality
-            model: Model
-            modality_params: Parameters associated with each modality
-        """
-        self.step_count += 1
-        
-        for modality, loss in modality_losses.items():
-            if modality not in self.modality_names:
-                continue
-            
-            # Get scale for this modality
-            scale = self.scales.get(modality, 1.0)
-            
-            # Get parameters for this modality
-            params = modality_params.get(modality, [])
-            if len(params) == 0:
-                continue
-            
-            # Compute gradients
-            grads = torch.autograd.grad(
-                loss,
-                params,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True
-            )
-            
-            # Scale gradients
-            for param, grad in zip(params, grads):
-                if grad is not None and param.grad is not None:
-                    param.grad.data.mul_(scale)
-            
-            # Track gradient statistics
-            if self.adaptive:
-                grad_norm = sum(g.norm().item() for g in grads if g is not None)
-                self._update_grad_stats(modality, grad_norm)
-        
-        # Update scales adaptively
-        if self.adaptive and self.step_count % self.update_frequency == 0:
-            self._update_scales()
-    
-    def _update_grad_stats(self, modality: str, grad_norm: float):
-        """Update gradient statistics for adaptive scaling."""
-        stats = self.grad_stats[modality]
-        stats['mean'] = (stats['mean'] * stats['count'] + grad_norm) / (stats['count'] + 1)
-        stats['count'] += 1
-    
-    def _update_scales(self):
-        """Update scales based on gradient statistics."""
-        # Compute average gradient norm across modalities
-        grad_norms = {name: stats['mean'] for name, stats in self.grad_stats.items()}
-        avg_grad = sum(grad_norms.values()) / max(len(grad_norms), 1)
-        
-        # Adjust scales to balance gradient norms
-        for modality in self.modality_names:
-            if grad_norms[modality] < 1e-8:
-                continue
-            
-            # If gradient too small, increase scale; if too large, decrease scale
-            rel_grad = grad_norms[modality] / (avg_grad + 1e-8)
-            
-            # Exponential moving average update
-            adjust = 1.0 / (rel_grad + 1e-8)
-            self.scales[modality] = 0.9 * self.scales[modality] + 0.1 * adjust
-        
-        # Normalize scales
-        mean_scale = sum(self.scales.values()) / len(self.scales)
-        self.scales = {name: s / mean_scale for name, s in self.scales.items()}
-        
-        # Reset statistics
-        self.grad_stats = {name: {'mean': 0.0, 'count': 0} for name in self.modality_names}
-    
-    def get_scales(self) -> Dict[str, float]:
-        """Get current gradient scales."""
-        return self.scales.copy()

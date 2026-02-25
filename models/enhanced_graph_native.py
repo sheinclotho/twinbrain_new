@@ -311,8 +311,9 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
             predictive_coding_loss_weight: Weight for predictive coding loss
             **kwargs: Additional arguments for base trainer
         """
-        # Initialize base trainer with the base model so that the EEG handler
-        # can introspect model.encoder.input_proj['eeg'] correctly.
+        # Initialize base trainer with the base model.
+        # EEG handler is lazily initialised in _ensure_eeg_handler() on the first
+        # train_step() call, once the true N_eeg (electrode count) is known.
         super().__init__(
             model=model.base_model,
             node_types=node_types,
@@ -408,9 +409,16 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
         eeg_info: dict = {}
         original_eeg_x = None
         if self.use_eeg_enhancement and 'eeg' in data.node_types:
-            original_eeg_x = data['eeg'].x
-            eeg_x_enhanced, eeg_info = self.eeg_handler(original_eeg_x, training=True)
-            data['eeg'].x = eeg_x_enhanced
+            original_eeg_x = data['eeg'].x          # [N_eeg, T, 1]
+            N_eeg = original_eeg_x.shape[0]
+            # Lazy-init handler with true electrode count (same pattern as base class).
+            self._ensure_eeg_handler(N_eeg)
+            if self.use_eeg_enhancement and self.eeg_handler is not None:
+                # Reshape [N_eeg, T, 1] → [1, T, N_eeg] before handler, then back.
+                eeg_x_t, eeg_info = self.eeg_handler(
+                    self._graph_to_handler_format(original_eeg_x), training=True
+                )
+                data['eeg'].x = self._handler_to_graph_format(eeg_x_t)
 
         try:
             # ── forward (inside AMP autocast when enabled) ──────────

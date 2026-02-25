@@ -43,7 +43,7 @@ except ImportError:
         autocast = None
         GradScaler = None
 
-from .graph_native_mapper import GraphNativeBrainMapper, TemporalGraphFeatureExtractor
+from .graph_native_mapper import GraphNativeBrainMapper
 from .graph_native_encoder import GraphNativeEncoder, SpatialTemporalGraphConv
 from .adaptive_loss_balancer import AdaptiveLossBalancer
 from .eeg_channel_handler import EnhancedEEGHandler

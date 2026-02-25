@@ -532,39 +532,3 @@ class GraphNativeEncoder(nn.Module):
             encoded_data[node_type].x = x
         
         return encoded_data
-    
-    def get_temporal_pooling(
-        self,
-        data: HeteroData,
-        method: str = 'mean',
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Pool temporal dimension to get static node features.
-        
-        Useful for tasks that need per-node representations.
-        
-        Args:
-            data: Encoded HeteroData
-            method: Pooling method ('mean', 'max', 'last')
-            
-        Returns:
-            Dict of pooled features per node type [N, H]
-        """
-        pooled_dict = {}
-        
-        for node_type in self.node_types:
-            if node_type in data.node_types:
-                x = data[node_type].x  # [N, T, H]
-                
-                if method == 'mean':
-                    pooled = x.mean(dim=1)
-                elif method == 'max':
-                    pooled = x.max(dim=1)[0]
-                elif method == 'last':
-                    pooled = x[:, -1, :]
-                else:
-                    raise ValueError(f"Unknown pooling method: {method}")
-                
-                pooled_dict[node_type] = pooled
-        
-        return pooled_dict
