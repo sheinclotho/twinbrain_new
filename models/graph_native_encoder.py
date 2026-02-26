@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from torch_geometric.nn import MessagePassing
 from torch_geometric.data import HeteroData
+from torch_geometric.utils import softmax as pyg_softmax
 from typing import Dict, Optional, Tuple, List
 import math
 
@@ -239,65 +240,97 @@ class SpatialTemporalGraphConv(MessagePassing):
             out: Updated features [N_dst, T, C_out]  (N_dst = size[1] if given)
         """
         N, T, C_in = x.shape
-        
-        # 1. Temporal convolution (process time dimension)
-        # [N, T, C_in] -> [N, C_in, T]
-        x_t = x.permute(0, 2, 1)
-        x_t = self.temporal_conv(x_t)  # [N, C_out, T]
-        x_t = x_t.permute(0, 2, 1)  # [N, T, C_out]
-        
-        # 2. Spatial message passing (along graph)
-        # Process each timestep independently.
-        # Gradient checkpointing frees intermediate activations (attention,
-        # messages, etc.) between timesteps, trading recomputation for memory.
-        # Without it, all T propagation graphs stay in memory for backprop,
-        # causing MemoryError on long sequences.
-        out_list = []
-        for t in range(T):
-            x_t_slice = x_t[:, t, :].contiguous()   # [N, C_out]
-            x_orig_slice = x[:, t, :].contiguous()  # [N, C_in]
-            
-            if self.use_gradient_checkpointing and self.training:
-                # Wrap propagate in gradient checkpoint to release intermediate
-                # activations immediately; they are recomputed during backward.
-                # Pass edge_index and edge_attr explicitly (use_reentrant=False
-                # supports non-tensor arguments such as None edge_attr).
-                # `size` is a plain immutable tuple (or None) captured by the
-                # closure — compatible with gradient_checkpoint's non-tensor
-                # argument handling under use_reentrant=False.
-                def _propagate(xt_s, xo_s, ei, ea):
-                    # For bipartite (cross-modal) edges where N_src != N_dst,
-                    # PyG requires x to be a (x_src, x_dst) tuple so it can
-                    # validate each tensor's size independently.  Provide a
-                    # zero-filled destination placeholder; att_dst is inactive
-                    # for cross-modal (source-only attention applies).
-                    if size is not None and size[0] != size[1]:
-                        x_in = (xt_s, xt_s.new_zeros(size[1], xt_s.shape[-1]))
-                    else:
-                        x_in = xt_s
-                    return self.propagate(ei, x=x_in, x_self=xo_s, edge_attr=ea, size=size)
-                out_t = gradient_checkpoint(
-                    _propagate, x_t_slice, x_orig_slice, edge_index, edge_attr,
-                    use_reentrant=False,
-                )
+        # N_src is always x.shape[0] (the input tensor is the source node tensor).
+        # N_dst is inferred from size[1] when given (cross-modal edges), or equals
+        # N_src for same-modal edges.  Callers MUST pass size=(N_src, N_dst) for
+        # cross-modal edges — this is enforced by GraphNativeEncoder.forward().
+        N_src = N  # x is always the source tensor
+        N_dst = size[1] if size is not None else N
+
+        # 1. Temporal convolution (all T timesteps at once — already vectorised)
+        x_t = x.permute(0, 2, 1)          # [N_src, C_in, T]
+        x_t = self.temporal_conv(x_t)     # [N_src, C_out, T]
+        x_t = x_t.permute(0, 2, 1)        # [N_src, T, C_out]
+
+        # 2. Vectorised spatial message passing across ALL T timesteps.
+        #
+        #    Previous approach: Python ``for t in range(T)`` loop — T separate
+        #    propagate() calls, each launching its own small CUDA kernels.
+        #    With T=300, 4 encoder layers and 3 edge types this is ~3 600 kernel
+        #    launches per forward pass, keeping GPU utilisation very low.
+        #
+        #    New approach: "temporal virtual-node" trick.
+        #      Create T independent copies of the graph by expanding edge_index:
+        #        virtual source node (n, t) → global index  t * N_src + n
+        #        virtual dest   node (m, t) → global index  t * N_dst + m
+        #      A single propagate() call then processes all T*E messages in
+        #      parallel on the GPU — much better hardware utilisation.
+        #
+        #    Attention normalisation (see message()): uses pyg_softmax with the
+        #      virtual-node index, which correctly normalises per (m, t), i.e.
+        #      per-node per-timestep — same semantics as the old per-step loop.
+        #
+        #    Memory: identical total (T*E*H floats for messages) but fused into
+        #      one CUDA launch; gradient checkpointing still available for the
+        #      single large propagate call.
+        E = edge_index.shape[1]
+
+        # Build temporal offsets once on the correct device
+        t_idx   = torch.arange(T, device=edge_index.device)   # [T]
+        src_off = (t_idx * N_src).unsqueeze(1)                # [T, 1]
+        dst_off = (t_idx * N_dst).unsqueeze(1)                # [T, 1]
+
+        # Expand edge_index: [2, E] → [2, T*E]
+        ei_src_exp = edge_index[0].unsqueeze(0) + src_off     # [T, E]
+        ei_dst_exp = edge_index[1].unsqueeze(0) + dst_off     # [T, E]
+        edge_index_exp = torch.stack([
+            ei_src_exp.reshape(-1),   # [T*E]
+            ei_dst_exp.reshape(-1),   # [T*E]
+        ], dim=0)                                             # [2, T*E]
+
+        # Expand edge attributes (same weight for every copy of each edge)
+        edge_attr_exp: Optional[torch.Tensor]
+        if edge_attr is not None:
+            edge_attr_exp = edge_attr.repeat(T, 1)            # [T*E, feat_dim]
+        else:
+            edge_attr_exp = None
+
+        # Flatten temporal dim: virtual node (n, t) occupies row t*N_src + n
+        x_t_flat    = x_t.reshape(N_src * T, -1)             # [N_src*T, C_out]
+        x_orig_flat = x.reshape(N_src * T, -1)               # [N_src*T, C_in]
+
+        exp_size = (N_src * T, N_dst * T)
+
+        def _do_propagate(xt_f, xo_f, ei, ea):
+            # For bipartite (cross-modal) edges where N_src != N_dst, PyG
+            # requires x as a (x_src, x_dst) 2-tuple so it can validate sizes
+            # independently.  Use a zero-filled destination placeholder.
+            if N_src != N_dst:
+                x_in = (xt_f, xt_f.new_zeros(N_dst * T, xt_f.shape[-1]))
             else:
-                # Same bipartite-tuple fix for the non-checkpoint path.
-                if size is not None and size[0] != size[1]:
-                    x_in = (x_t_slice, x_t_slice.new_zeros(size[1], x_t_slice.shape[-1]))
-                else:
-                    x_in = x_t_slice
-                out_t = self.propagate(
-                    edge_index,
-                    x=x_in,
-                    x_self=x_orig_slice,
-                    edge_attr=edge_attr,
-                    size=size,
-                )
-            out_list.append(out_t)
-        
-        # Stack timesteps
-        out = torch.stack(out_list, dim=1)  # [N, T, C_out]
-        
+                x_in = xt_f
+            return self.propagate(ei, x=x_in, x_self=xo_f, edge_attr=ea,
+                                  size=exp_size)
+
+        if self.use_gradient_checkpointing and self.training:
+            out_flat = gradient_checkpoint(
+                _do_propagate,
+                x_t_flat, x_orig_flat, edge_index_exp, edge_attr_exp,
+                use_reentrant=False,
+            )
+        else:
+            out_flat = _do_propagate(
+                x_t_flat, x_orig_flat, edge_index_exp, edge_attr_exp
+            )
+
+        # out_flat[t * N_dst + m] = aggregated features for (node m, timestep t)
+        # Reshape [N_dst*T, C_out] → [T, N_dst, C_out] → [N_dst, T, C_out]
+        assert out_flat.shape[0] == T * N_dst, (
+            f"propagate() output has {out_flat.shape[0]} rows, expected T*N_dst={T * N_dst}. "
+            f"Ensure size=(N_src*T, N_dst*T) was passed correctly."
+        )
+        out = out_flat.view(T, N_dst, -1).permute(1, 0, 2).contiguous()
+
         return self.dropout(out)
     
     def message(
@@ -331,7 +364,22 @@ class SpatialTemporalGraphConv(MessagePassing):
         if self.use_attention:
             alpha = self.att_src(x_j) + self.att_dst(x_i)  # [E, 1]
             alpha = F.leaky_relu(alpha, 0.2)
-            alpha = torch.softmax(alpha, dim=0)  # Normalize per target node
+            # Per-destination-node softmax via PyG's scatter-based implementation.
+            # The previous code used torch.softmax(alpha, dim=0) which normalised
+            # over ALL edges globally, making every weight ≈ 1/E (≈ 0.00025 for
+            # E≈4000).  This effectively zeroed out all neighbour messages,
+            # leaving only the self-connection dominant — the GNN was not doing
+            # any meaningful message passing.
+            # pyg_softmax(alpha, index) normalises within each destination node's
+            # incoming edges (scatter-softmax), so weights sum to 1 per node
+            # (typically over ~20 in-edges for k=20 nearest-neighbour graphs).
+            # NOTE: in PyG's MessagePassing, 'index' is automatically set to
+            # edge_index[1] (destination node indices for each edge) by propagate().
+            # In the vectorised temporal propagation, edge_index has been expanded
+            # so 'index' contains virtual-node indices (t*N_dst + m); softmax per
+            # unique index value gives per-node per-timestep normalisation — the
+            # correct attention semantics for this architecture.
+            alpha = pyg_softmax(alpha, index, num_nodes=size_i)
             msg = msg * alpha
         
         return msg
