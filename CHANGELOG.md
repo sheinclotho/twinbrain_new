@@ -1,10 +1,169 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.16  
+**版本**：V5.20  
 **状态**：生产就绪
 
 ---
+
+## [V5.20] 2026-02-26 — 第三轮系统审查：缓存命中路径 subject_idx 补写 + 启动日志个性化状态 + SPEC.md 更新
+
+### 🔍 审查方法
+遍历所有代码路径，重点问："每个 `continue`/`break` 之前，有没有遗漏的必要副作用？" + "用户怎么知道这个功能是否真的在运行？"
+
+### 🐛 修复：缓存命中路径绕过 subject_idx 赋值（沉默回归）
+
+**根因**：缓存命中路径的 `continue` 使 `built_graph.subject_idx = torch.tensor(...)` 从未执行：
+- **老缓存（V5.18）**：`full_graph` 无 `subject_idx`，所有窗口/图样本无此属性 → subject embedding 完全禁用
+- **新缓存（V5.19）**：虽保存时有 `subject_idx`，但若同一 session 内先加载老缓存，`continue` 仍绕过赋值
+
+**修复位置**：`build_graphs()` 缓存加载块，在调用 `extract_windowed_samples()` 之前，显式写入 `full_graph.subject_idx`（从当前 session 的 `subject_to_idx` 推导，与新建图时的值一致）。
+
+**AGENTS.md 教训**：任何 `continue` 前必须问："循环尾部有没有必须执行的副作用？"
+
+### ✨ 改进：log_training_summary 报告个性化状态
+
+`log_training_summary` 新增【被试特异性嵌入】信息块：
+- 显示 `num_subjects × H_dim = N 个个性化参数`（当 > 0 时）
+- 实时检查 `graphs[0].subject_idx` 是否存在，若缺失则警告"请清除缓存重建"（直接提示用户该怎么做）
+- 当禁用时明确输出 `num_subjects=0` 以避免歧义
+
+### 📄 文档：SPEC.md 更新至 V5.20
+
+- §九表格：Gap 2 状态更新为 ✅ 已实现
+- 新增 §2.4（被试特异性嵌入设计意图、完整调用链、推理工作流）
+- 数据流图：新增 `subject_idx` 节点和 `subject_embed` 节点
+- 设计决策表：新增 `subject_embed` 注入位置选择的理由
+
+**影响文件**：`main.py`、`AGENTS.md`、`CHANGELOG.md`、`SPEC.md`
+
+## [V5.19] 2026-02-26 — 第二轮系统审查：cache key修复 + 个性化被试嵌入（Gap 2实现）
+
+### 🔍 审查方法
+对照 AGENTS.md 中每一个功能声明，逐项追踪从 `main()` 入口到 `forward()` 的完整调用链，主动提问"前提条件是否已满足？"
+
+### 🐛 修复：cache key 遗漏 dti_structural_edges
+
+`_graph_cache_key()` 的哈希计算不包含 `dti_structural_edges`：切换该选项后旧缓存仍被命中，DTI 结构边的变更形同虚设。
+
+```python
+# After: hash changes whenever DTI setting changes
+'dti_structural_edges': config['data'].get('dti_structural_edges', False),
+```
+
+### ✨ 新功能：被试特异性嵌入（AGENTS.md §九 Gap 2，全链路首次完整实现）
+
+**目标**：让每个被试学习一个唯一的 `[H]` 潜空间偏移量，无需独立模型即可实现个性化数字孪生。
+
+**全链路变更**：
+
+| 组件 | 变更 |
+|------|------|
+| `build_graphs()` | 预扫描 `subject_to_idx`；`built_graph.subject_idx = tensor(idx)` |
+| `extract_windowed_samples()` | 将 `subject_idx` 从完整 run 图复制到所有窗口样本 |
+| `build_graphs()` 返回值 | `(graphs, mapper, subject_to_idx)` 三元组 |
+| `create_model(num_subjects=N)` | 新参数，传递给 `GraphNativeBrainModel` |
+| `GraphNativeBrainModel.__init__` | `num_subjects: int = 0` → `nn.Embedding(N, H)`, `N(0,0.02)` init |
+| `GraphNativeBrainModel.forward` | 读 `data.subject_idx` → `[H]` embed → 传给 encoder；越界警告 |
+| `GraphNativeEncoder.forward` | `subject_embed: Optional[Tensor]=None` → 投影后 broadcast 加到 `[N,T,H]` |
+
+**个性化推理工作流**（完整调用链）：
+```
+data.subject_idx (built_graph/window) 
+→ model.subject_embed(idx) → [H]
+→ encoder.forward(subject_embed=[H])
+→ x_proj += embed.view(1,1,-1)  # broadcast to [N,T,H]
+→ ST-GCN 层处理个性化特征
+→ 损失正常反向传播
+```
+
+**兼容性**：`num_subjects=0`（默认）完全禁用，与 V5.18 行为一致。
+
+**影响文件**：`main.py`、`models/graph_native_system.py`、`models/graph_native_encoder.py`
+
+## [V5.18] 2026-02-26 — 异质图充分利用：DTI接口 + 跨模态边权重修复
+
+### 🔍 背景：系统性异质图使用审查
+
+通过 SET/READ 追踪脚本全面审查 `HeteroData` 属性的设置方与读取方，发现三处结构性缺陷：
+
+| 缺陷 | 现象 | 影响 |
+|------|------|------|
+| 跨模态边无 edge_attr | `create_simple_cross_modal_edges` 只返回 `edge_index` | 跨模态消息无加权，与同模态边不一致 |
+| DTI接口缺失 | 无任何 DTI 相关代码 | 承诺的"DTI层接口"从未实现 |
+| `labels` 在窗口样本中丢失 | `extract_windowed_samples` 不复制 `labels` | 窗口样本无法用于可解释性分析 |
+
+### 🐛 修复：跨模态边添加 edge_attr
+
+`create_simple_cross_modal_edges()` 返回类型从 `Optional[torch.Tensor]` 改为 `Optional[Tuple[torch.Tensor, torch.Tensor]]`，新增均匀权重 `edge_attr`（值=1.0）：
+
+```python
+# Before: edge_attr=None → message() skips weighting
+return edge_index
+
+# After: uniform weights consistent with intra-modal edges
+return edge_index, edge_attr  # edge_attr all 1.0
+```
+
+`build_graphs()` 调用点同步更新，将 `edge_attr` 存入图对象。
+
+### 🐛 修复：windowed_samples 保留 labels
+
+`extract_windowed_samples()` 复制的静态属性列表加入 `'labels'`：
+```python
+for attr in ('num_nodes', 'pos', 'sampling_rate', 'labels'):
+```
+
+### ✨ 新功能：DTI结构连通性接口
+
+**设计原则**：DTI 不作为独立节点类型（DTI 无时序特征），而是在已有 fMRI 节点上
+新增一套结构连通性边 `('fmri','structural','fmri')`，与功能连通性边 `('fmri','connects','fmri')` 并存。
+编码器通过两套边同时利用结构和功能信息——这是异质图「多边类型」的核心价值。
+
+**新增 API**（`GraphNativeBrainMapper`）：
+```python
+mapper.add_dti_structural_edges(data, connectivity_matrix)
+# → data[('fmri','structural','fmri')].edge_index / .edge_attr
+```
+
+**新增数据加载**（`BrainDataLoader._load_dti()`）：
+- 自动搜索被试目录下的预计算 DTI 矩阵：
+  `sub-XX_*connmat*.npy/.csv/.tsv`、`sub-XX_*connectivity*.npy/.csv`
+- 静默跳过（无文件时不报错）
+
+**配置开关**（`configs/default.yaml`）：
+```yaml
+data:
+  dti_structural_edges: false  # 改为 true 启用（需要预计算矩阵文件）
+```
+
+当 `dti_structural_edges: true` 时，编码器预注册该边类型；当某被试无 DTI 文件时，编码器自动降级（`if edge_type in edge_index_dict` 保护），无需修改模型。
+
+### 当前异质图边类型全集
+
+| 边类型 | 来源 | 条件 |
+|--------|------|------|
+| `('eeg','connects','eeg')` | EEG 时序相关矩阵 | 始终 |
+| `('fmri','connects','fmri')` | fMRI 时序相关矩阵 | 始终 |
+| `('eeg','projects_to','fmri')` | 随机连接 / 距离加权（未来） | EEG+fMRI 同时存在 |
+| `('fmri','structural','fmri')` | DTI 白质纤维束矩阵 | `dti_structural_edges: true` + 文件存在 |
+
+**影响文件**：`models/graph_native_mapper.py`、`data/loaders.py`、`main.py`、`configs/default.yaml`
+
+## [V5.17] 2026-02-26 — 编码器前向传播 KeyError 根治
+
+### 🐛 修复：`KeyError: 'eeg__connects__eeg'` in GraphNativeEncoder
+
+**症状**：每次启动训练时，第一步 `forward()` 即报 `KeyError: 'eeg__connects__eeg'`，训练从未真正运行。
+
+**根本原因**：`GraphNativeEncoder.forward()` 从不调用 `HeteroConv.forward()`，却用 `HeteroConv` 来存储 `SpatialTemporalGraphConv` 参数。`HeteroConv.convs` 是 PyG 的自定义 `ModuleDict` 子类，其 `to_internal_key()` 方法在不同 PyG 版本中对字符串 key 有不同的二次变换，导致写入时的内部 key 与查找时不一致。
+
+**修复**：
+- 将每层的 `HeteroConv` 替换为 `nn.ModuleDict`（标准 Python dict 语义），key 为 `'__'.join(edge_type)` 字符串
+- `forward()` 中访问改为 `stgcn['__'.join(edge_type)]`（直接查找，无隐式转换）
+- 移除不再使用的 `HeteroConv`、`GCNConv`、`GATConv` 导入
+
+**影响文件**：`models/graph_native_encoder.py`
 
 ## [V5.16] 2026-02-26 — Atlas 路径修正 + ON/OFF 任务自动对齐
 

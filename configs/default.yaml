@@ -52,13 +52,48 @@ data:
 
   # 最大被试数 (用于测试, 0 或 null 表示处理所有)
   max_subjects: 0
-  
+
   # Atlas配置（fMRI 空间分区）
   # Schaefer200: 200 ROI，性价比最高；400 ROI 精度更高但内存翻倍
   atlas:
     name: "schaefer200"
     file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.nii"
     label_file: "atlases/schaefer200_mask_ready.json"
+
+  # DTI 结构连通性边（可选）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 设为 true 时，若被试目录下存在预计算的 DTI 连通性矩阵文件，则在 fMRI 节点上
+  # 额外建立一套结构连通性边 ('fmri','structural','fmri')，使编码器同时利用：
+  #   • ('fmri','connects','fmri')   — fMRI 时序相关（功能连通性）
+  #   • ('fmri','structural','fmri') — DTI 白质纤维束（结构连通性）
+  #
+  # 支持的矩阵文件命名（BIDS兼容，放在被试任意子目录下）：
+  #   sub-XX_*connmat*.npy  /  sub-XX_*connmat*.csv  /  sub-XX_*connmat*.tsv
+  #   sub-XX_*connectivity*.npy / .csv
+  #
+  # DTI 预处理需要外部工具，本系统只读取其输出矩阵（[N_rois, N_rois]）。
+  # 矩阵尺寸必须与 fMRI 图谱 ROI 数量完全一致（如 Schaefer200 → 200×200）。
+  #
+  # 如何生成（推荐流程）：
+  #   ① 纤维跟踪（MRtrix3 示例）：
+  #      tckgen dwi.mif tracks.tck -algorithm iFOD2 -select 1M
+  #      tcksift2 tracks.tck fod.mif weights.txt  # SIFT2 权重归一化（推荐）
+  #   ② 图谱分区（MRtrix3，与 fMRI 使用同一 atlas）：
+  #      tck2connectome tracks.tck Schaefer200.nii connmat.csv \
+  #          -tck_weights_in weights.txt -stat_edge mean
+  #   ③ 保存（Python）：
+  #      import numpy as np
+  #      mat = np.log1p(np.loadtxt('connmat.csv', delimiter=','))  # log1p 归一化
+  #      np.save('sub-01_connmat.npy', mat.astype('float32'))
+  #
+  #   Dipy 替代方案（参见 dipy.tracking.utils.connectivity_matrix）：
+  #      from dipy.tracking.utils import connectivity_matrix
+  #      M, grouping = connectivity_matrix(streamlines, affine, label_volume,
+  #                                        return_mapping=True)
+  #      np.save('sub-01_connmat.npy', M.astype('float32'))
+  #
+  # false（默认）：不使用 DTI，与旧版本行为一致。
+  dti_structural_edges: false
 
   # 图缓存配置
   # 每个 (被试, 任务) 的异质图构建完成后自动保存为 .pt 文件。

@@ -490,27 +490,34 @@ class GraphNativeBrainMapper:
         self,
         merged_data: HeteroData,
         connection_ratio: float = 0.1,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Create simple cross-modal edges for merged heterograph using random connections.
-        
-        This is a simplified helper that creates random connections when no 
-        explicit mapping is available. For more sophisticated distance-based
-        connections, use add_cross_modal_edges() instead.
-        
+
+        Returns both edge_index AND uniform edge_attr (weight=1.0) so that
+        cross-modal messages are treated consistently with intra-modal edges
+        (which carry correlation-based edge_attr from build_graph_structure).
+        Without edge_attr the SpatialTemporalGraphConv.message() skips the
+        weighting step entirely, silently treating all cross-modal connections
+        as equally important regardless of spatial proximity.
+
+        This is a simplified helper that creates random connections when no
+        explicit mapping is available. For distance-based connections with
+        anatomically meaningful weights, use create_cross_modal_edges() instead.
+
         Args:
             merged_data: HeteroData with 'eeg' and 'fmri' nodes
             connection_ratio: Fraction of possible edges to create
-            
+
         Returns:
-            edge_index tensor [2, E] with edges from EEG to fMRI, or None if modalities not present
+            (edge_index [2, E], edge_attr [E, 1]) or None if modalities not present
         """
         if 'eeg' not in merged_data.node_types or 'fmri' not in merged_data.node_types:
             return None
-        
+
         N_eeg = merged_data['eeg'].num_nodes
         N_fmri = merged_data['fmri'].num_nodes
-        
+
         # Design intent validation: EEG (electrodes) should have FEWER nodes than
         # fMRI (atlas ROIs).  With Schaefer200: N_fmri=200, N_eeg≈32–64.
         # If N_eeg > N_fmri this almost always means atlas parcellation failed and
@@ -524,19 +531,106 @@ class GraphNativeBrainMapper:
                 f"collapsed to {N_fmri} node(s). Check that the atlas file exists "
                 f"and nilearn is installed."
             )
-        
+
         # Use helper method to determine device
         target_device = self._get_graph_device(merged_data)
-        
+
         # Create random connections (can be improved with anatomical mapping)
         num_edges = max(1, int(N_eeg * N_fmri * connection_ratio))
-        
+
         # Random pairs - use target device to match existing graph
         eeg_indices = torch.randint(0, N_eeg, (num_edges,), device=target_device)
         fmri_indices = torch.randint(0, N_fmri, (num_edges,), device=target_device)
-        
+
         edge_index = torch.stack([eeg_indices, fmri_indices], dim=0)
-        
-        logger.info(f"Created {num_edges} random cross-modal edges")
-        
-        return edge_index
+
+        # Uniform edge weights (1.0): consistent with the fill_value=1.0 used by
+        # add_self_loops() in build_graph_structure.  The encoder's message() fn
+        # multiplies messages by edge_attr when present; providing uniform weights
+        # keeps cross-modal messages on the same scale as intra-modal messages and
+        # allows future upgrades (e.g. distance-based weights) to work transparently.
+        edge_attr = torch.ones(num_edges, 1, dtype=torch.float32, device=target_device)
+
+        logger.info(f"Created {num_edges} random cross-modal edges (uniform weight=1.0)")
+
+        return edge_index, edge_attr
+
+    def add_dti_structural_edges(
+        self,
+        data: HeteroData,
+        connectivity_matrix: np.ndarray,
+        threshold: Optional[float] = None,
+        k_nearest: Optional[int] = None,
+    ) -> HeteroData:
+        """Add DTI structural connectivity as a new edge type on fMRI nodes.
+
+        DTI tractography provides white-matter structural connectivity (number
+        of streamlines or FA-weighted connectivity) between the same atlas ROIs
+        used for fMRI.  This adds a second edge type
+        ``('fmri', 'structural', 'fmri')`` alongside the functional edges
+        ``('fmri', 'connects', 'fmri')``, enabling the ST-GCN encoder to exploit
+        both structural and functional connectivity simultaneously.
+
+        Design rationale (why structural edges on fMRI nodes, not a separate DTI
+        node type):
+        - DTI tractography inherently describes connectivity *between* brain
+          regions (already defined by the fMRI atlas parcellation).
+        - DTI does not carry its own temporal dynamics — it is a static
+          connectivity scaffold, not a time series.
+        - Adding a structural edge type is the minimal, correct change: same
+          nodes, richer edge set.  A separate ``dti`` node type would require
+          its own feature representation and temporal model.
+
+        Interface contract (future DTI layer):
+        - ``connectivity_matrix``: any [N_rois, N_rois] non-negative matrix.
+          Accepted sources: streamline counts, FA-weighted connectivity,
+          log-normalised tract density, etc.
+        - The method reuses ``build_graph_structure`` so K-NN + threshold
+          filtering is consistent with intra-modal edges.
+        - If DTI files are absent, simply do not call this method; the encoder
+          handles missing edge types gracefully.
+
+        Args:
+            data: HeteroData containing 'fmri' nodes (from map_fmri_to_graph).
+            connectivity_matrix: [N_rois, N_rois] DTI connectivity weights.
+            threshold: Min connectivity strength to create an edge.
+                Defaults to self.threshold_fmri.
+            k_nearest: K-nearest structural neighbours per ROI.
+                Defaults to self.k_nearest_fmri.
+
+        Returns:
+            The same HeteroData with ('fmri', 'structural', 'fmri') edges added.
+        """
+        if 'fmri' not in data.node_types:
+            logger.warning("add_dti_structural_edges: no 'fmri' nodes in graph, skipping")
+            return data
+
+        N_fmri = data['fmri'].num_nodes
+        if connectivity_matrix.shape[0] != N_fmri or connectivity_matrix.shape[1] != N_fmri:
+            # This almost always indicates atlas version mismatch (e.g., DTI matrix was
+            # computed with a different parcellation or different software version).
+            # Raise an error rather than silently padding with zeros: zero-padded rows
+            # would produce phantom structural disconnections that corrupt training.
+            # Fix: re-parcellate DTI tractography with the same atlas used for fMRI.
+            raise ValueError(
+                f"DTI matrix shape {connectivity_matrix.shape} does not match the number of "
+                f"fMRI ROIs ({N_fmri}, {N_fmri}). "
+                f"Ensure the DTI connectivity matrix was computed with the same atlas "
+                f"parcellation as the fMRI graph (e.g., Schaefer200). "
+                f"Re-run tractography parcellation to produce a [{N_fmri}, {N_fmri}] matrix."
+            )
+
+        edge_index, edge_attr = self.build_graph_structure(
+            connectivity_matrix,
+            threshold=threshold if threshold is not None else self.threshold_fmri,
+            k_nearest=k_nearest if k_nearest is not None else self.k_nearest_fmri,
+        )
+
+        data['fmri', 'structural', 'fmri'].edge_index = edge_index
+        data['fmri', 'structural', 'fmri'].edge_attr = edge_attr
+
+        logger.info(
+            f"Added DTI structural edges: {edge_index.shape[1]} connections "
+            f"between {N_fmri} fMRI ROIs ('fmri','structural','fmri')"
+        )
+        return data

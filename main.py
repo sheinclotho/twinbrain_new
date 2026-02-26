@@ -141,6 +141,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         'max_seq_len': None if w_enabled else config['training'].get('max_seq_len'),
         'modalities': sorted(config['data'].get('modalities', [])),
         'windowed': w_enabled,
+        # DTI 开关影响图结构（是否含 ('fmri','structural','fmri') 边）；
+        # 修改此选项必须使旧缓存失效，否则切换 DTI 后仍加载无 DTI 边的旧图。
+        'dti_structural_edges': config['data'].get('dti_structural_edges', False),
     }
     params_hash = hashlib.md5(
         json.dumps(relevant, sort_keys=True).encode()
@@ -263,12 +266,28 @@ def extract_windowed_samples(
                 x_slice = x_full[:, t_start_nt:t_end_nt, :]
 
             win[nt].x = x_slice
-            # 复制静态属性（节点数、空间坐标、采样率）
-            for attr in ('num_nodes', 'pos', 'sampling_rate'):
+            # 复制「窗口静态」属性：在同一 run 的所有窗口间不随时间变化。
+            # - num_nodes: 节点数，用于 PyG 内部图构建
+            # - pos: 空间坐标（EEG 电极坐标 / fMRI ROI 质心），用于可视化和距离加权边
+            # - sampling_rate: 采样率，用于日志摘要（不随窗口变化）
+            # - labels: ROI/通道名称，用于可解释性分析（例如 visualization.py）
+            # 有意不复制的属性（非窗口静态或当前未读取）：
+            # - atlas_mapping: EEG→atlas ROI 映射，SET 后从未被 READ，暂不传播
+            # - temporal_length: 全序列长度，窗口中应使用 x.shape[1] 动态获取
+            for attr in ('num_nodes', 'pos', 'sampling_rate', 'labels'):
                 if hasattr(full_graph[nt], attr):
                     setattr(win[nt], attr, getattr(full_graph[nt], attr))
 
         windows.append(win)
+
+    # 复制图级属性（不属于任何节点类型，但对整个样本共享的元数据）
+    # 当前图级属性：
+    #   subject_idx: 被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
+    # 未来可扩展：task_id（任务类型编码）、session_id（纵向会话索引，支持跨会话预测）
+    for attr in ('subject_idx',):
+        if hasattr(full_graph, attr):
+            for win in windows:
+                setattr(win, attr, getattr(full_graph, attr))
 
     return windows
 
@@ -425,6 +444,17 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         if max_seq_len is not None:
             logger.info(f"序列截断已启用: max_seq_len={max_seq_len} (防止 CUDA OOM)")
 
+    # 被试 ID → 整数索引映射（用于 subject embedding，AGENTS.md §九 Gap 2）
+    # 在构建图之前先扫描所有被试 ID，保证索引在整个数据集中全局唯一且确定性。
+    # 若 subject_id 缺失，用唯一占位符 f'unknown_{i}' 而非共用 'unknown'，
+    # 避免将多个匿名被试混合到同一个嵌入向量中（违反个性化设计意图）。
+    all_subject_ids = sorted(set(
+        d.get('subject_id') or f'unknown_{j}'
+        for j, d in enumerate(all_data)
+    ))
+    subject_to_idx = {sid: i for i, sid in enumerate(all_subject_ids)}
+    logger.info(f"被试索引映射已建立: {len(subject_to_idx)} 个被试")
+
     graphs: List[HeteroData] = []
     n_cached = 0
     n_windows_total = 0
@@ -441,6 +471,19 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             if cache_path.exists():
                 try:
                     full_graph = torch.load(cache_path, map_location='cpu', weights_only=False)
+                    # 被试索引（AGENTS.md §九 Gap 2）：
+                    # 缓存图可能由 V5.18 或更早版本保存，不含 subject_idx。
+                    # 使用当前运行时的 subject_to_idx 补写，保证嵌入对缓存图同样生效。
+                    # 即使图由 V5.19 保存（已含 subject_idx），此处覆写也无害——
+                    # subject_to_idx 由当前数据集的 subject_id 确定性推导，与保存时一致。
+                    if subject_id not in subject_to_idx:
+                        logger.warning(
+                            f"subject_id='{subject_id}' not found in subject_to_idx "
+                            f"(cache load path). Falling back to index 0."
+                        )
+                    full_graph.subject_idx = torch.tensor(
+                        subject_to_idx.get(subject_id, 0), dtype=torch.long
+                    )
                     win_samples = extract_windowed_samples(full_graph, w_cfg, logger)
                     graphs.extend(win_samples)
                     n_windows_total += len(win_samples)
@@ -546,12 +589,43 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 
                 # 跨模态边：EEG → fMRI
                 # 设计理念：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。
-                # create_simple_cross_modal_edges 会验证 N_eeg < N_fmri 并在违反时给出警告。
+                # create_simple_cross_modal_edges 返回 (edge_index, edge_attr)，
+                # 其中 edge_attr 为均匀权重（1.0），保持与同模态边一致的加权语义。
                 if 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
-                    cross_edges = mapper.create_simple_cross_modal_edges(built_graph)
-                    if cross_edges is not None:
+                    cross_result = mapper.create_simple_cross_modal_edges(built_graph)
+                    if cross_result is not None:
+                        cross_edges, cross_weights = cross_result
                         built_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
-            
+                        built_graph['eeg', 'projects_to', 'fmri'].edge_attr = cross_weights
+
+            # DTI 结构连通性边（可选）
+            # 当被试有预计算 DTI 连通性矩阵且配置启用时，
+            # 在 fMRI 节点上新增 ('fmri','structural','fmri') 边类型。
+            # 此举使编码器能同时利用 fMRI 功能连通性（相关性边）
+            # 和 DTI 结构连通性（白质纤维边），体现异质图"多边类型"的核心价值。
+            dti_cfg = config['data'].get('dti_structural_edges', False)
+            dti_subject = subject_data.get('dti')
+            if dti_cfg and dti_subject is not None and 'fmri' in built_graph.node_types:
+                mapper.add_dti_structural_edges(
+                    built_graph,
+                    dti_subject['connectivity'],
+                )
+
+            # 被试索引（AGENTS.md §九 Gap 2：个性化 subject embedding）
+            # graph-level 属性：每个图（全序列图和窗口样本）均携带，
+            # 供 GraphNativeBrainModel.forward() 查询 subject embedding。
+            # subject_id 必须在 subject_to_idx 中（上方预扫描保证）；
+            # 若 KeyError 发生，说明 subject_id 在预扫描和此处使用之间不一致（逻辑 bug）。
+            if subject_id not in subject_to_idx:
+                logger.warning(
+                    f"subject_id='{subject_id}' not found in subject_to_idx. "
+                    f"This indicates a logic bug — subject_id changed between pre-scan and use. "
+                    f"Falling back to index 0; this subject's embedding will be shared with another."
+                )
+            built_graph.subject_idx = torch.tensor(
+                subject_to_idx.get(subject_id, 0), dtype=torch.long
+            )
+
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
             if cache_dir is not None and cache_key is not None:
                 try:
@@ -593,11 +667,20 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
     else:
         logger.info(f"成功构建 {len(graphs)} 个图")
 
-    return graphs, mapper
+    return graphs, mapper, subject_to_idx
 
 
-def create_model(config: dict, logger: logging.Logger):
-    """创建模型"""
+def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
+    """创建模型
+
+    Args:
+        config: 配置字典
+        logger: 日志记录器
+        num_subjects: 数据集中的总被试数（由 build_graphs 返回的 subject_to_idx 推导）。
+            > 0 时在模型中创建 nn.Embedding(num_subjects, hidden_channels) 实现
+            个性化被试嵌入（AGENTS.md §九 Gap 2）。
+            0 = 禁用（默认，兼容旧行为）。
+    """
     logger.info("=" * 60)
     logger.info("步骤 3/4: 创建模型")
     logger.info("=" * 60)
@@ -605,10 +688,10 @@ def create_model(config: dict, logger: logging.Logger):
     # 确定节点和边类型
     node_types = config['data']['modalities']
     edge_types = []
-    
+
     for modality in node_types:
         edge_types.append((modality, 'connects', modality))
-    
+
     # 跨模态边：设计理念是 EEG → fMRI
     # EEG 电极（通常 32–64 通道）节点数 < fMRI ROI（如 Schaefer200 的 200 个），
     # 因此由 EEG 向 fMRI 投射消息符合"少节点向多节点传播"的图卷积语义。
@@ -618,7 +701,16 @@ def create_model(config: dict, logger: logging.Logger):
     elif len(node_types) > 1:
         # 非 EEG/fMRI 模态组合的通用回退
         edge_types.append((node_types[0], 'projects_to', node_types[1]))
-    
+
+    # DTI 结构连通性边（可选）
+    # 当 dti_structural_edges: true 时，编码器预先注册 ('fmri','structural','fmri')
+    # 边类型。若某个图实际不含该边（DTI 文件缺失），编码器会安静跳过
+    # （GraphNativeEncoder.forward 中 `if edge_type in edge_index_dict` 保护）。
+    # 这是异质图扩展性的核心体现：模型知道该边类型，但不强依赖其存在。
+    if config['data'].get('dti_structural_edges', False) and 'fmri' in node_types:
+        edge_types.append(('fmri', 'structural', 'fmri'))
+        logger.info("DTI结构连通性边已启用: ('fmri','structural','fmri') 已加入边类型列表")
+
     # 输入通道
     in_channels_dict = {modality: 1 for modality in node_types}
     
@@ -638,8 +730,14 @@ def create_model(config: dict, logger: logging.Logger):
         predictor_config=config.get('v5_optimization', {}).get('advanced_prediction'),
         use_dynamic_graph=config['model'].get('use_dynamic_graph', False),
         k_dynamic_neighbors=config['model'].get('k_dynamic_neighbors', 10),
+        num_subjects=num_subjects,
     )
-    
+
+    if num_subjects > 0:
+        logger.info(
+            f"被试特异性嵌入已启用: {num_subjects} 个被试 × "
+            f"{config['model']['hidden_channels']} 维 (AGENTS.md §九 Gap 2)"
+        )
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     
     return model
@@ -762,6 +860,32 @@ def log_training_summary(
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"  总参数量: {total_params:,}")
     logger.info(f"  损失函数: {config['model'].get('loss_type', 'mse')}")
+
+    # 被试特异性嵌入（AGENTS.md §九 Gap 2 个性化数字孪生）
+    # 直接从模型属性读取运行时值，而非 config，以覆盖 num_subjects=0 等默认情形。
+    num_subjects_rt = getattr(model, 'num_subjects', 0)
+    if num_subjects_rt > 0:
+        H = config['model']['hidden_channels']
+        embed_params = num_subjects_rt * H
+        logger.info(
+            f"  被试特异性嵌入: ✅ 已启用 | "
+            f"{num_subjects_rt} 个被试 × {H} 维 = {embed_params:,} 个个性化参数"
+        )
+        logger.info(
+            f"  个性化原理: 每个被试学习一个 [H={H}] 潜空间偏移，"
+            f"施加于所有节点特征（编码器输入投影之后）"
+        )
+        # Verify that graphs carry subject_idx so embedding is actually activated
+        has_sidx = graphs and hasattr(graphs[0], 'subject_idx')
+        if not has_sidx:
+            logger.warning(
+                "  ⚠️  graphs[0] 缺少 subject_idx 属性！"
+                " 被试嵌入在 forward() 中将被跳过。"
+                " 这通常意味着图缓存来自 V5.18 或更早版本，"
+                " 请清除缓存目录后重新运行以重建含 subject_idx 的图。"
+            )
+    else:
+        logger.info("  被试特异性嵌入: ❌ 未启用 (num_subjects=0)")
 
     # ── 训练 ────────────────────────────────────────────────────
     logger.info("【训练】")
@@ -1000,12 +1124,13 @@ def main():
     try:
         # 步骤1: 准备数据
         all_data = prepare_data(config, logger)
-        
+
         # 步骤2: 构建图
-        graphs, mapper = build_graphs(all_data, config, logger)
-        
+        # subject_to_idx: {subject_id_str → int_idx}，传给 create_model 以创建正确大小的 Embedding
+        graphs, mapper, subject_to_idx = build_graphs(all_data, config, logger)
+
         # 步骤3: 创建模型
-        model = create_model(config, logger)
+        model = create_model(config, logger, num_subjects=len(subject_to_idx))
         
         # 启动前打印一次人类可读的配置核对表，方便快速验证参数
         log_training_summary(config, graphs, model, logger)

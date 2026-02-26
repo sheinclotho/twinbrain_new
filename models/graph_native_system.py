@@ -185,6 +185,7 @@ class GraphNativeBrainModel(nn.Module):
         predictor_config: Optional[Dict] = None,
         use_dynamic_graph: bool = False,
         k_dynamic_neighbors: int = 10,
+        num_subjects: int = 0,
     ):
         """
         Initialize complete model.
@@ -208,6 +209,15 @@ class GraphNativeBrainModel(nn.Module):
             use_dynamic_graph: Enable self-iterating graph structure learning
                 (DynamicGraphConstructor per ST-GCN layer, intra-modal edges only).
             k_dynamic_neighbors: k-nearest neighbours for the dynamic adjacency.
+            num_subjects: Total number of subjects in the dataset.
+                > 0 creates nn.Embedding(num_subjects, hidden_channels) for
+                per-subject personalization (AGENTS.md §九 Gap 2).
+                Each subject learns a unique latent offset added to all node
+                features after input projection, enabling the model to capture
+                individual brain differences without a separate model per subject.
+                At inference time, fine-tune only the subject embedding (frozen
+                encoder) for few-shot personalization.
+                0 = disabled (default, backward-compatible).
         """
         super().__init__()
         
@@ -215,6 +225,16 @@ class GraphNativeBrainModel(nn.Module):
         self.hidden_channels = hidden_channels
         self.use_prediction = use_prediction
         self.loss_type = loss_type
+        self.num_subjects = num_subjects
+
+        # 被试特异性嵌入 (AGENTS.md §九 Gap 2)
+        # num_subjects > 0: each subject gets a learnable [H] offset added to
+        # all node features after input projection, capturing individual differences.
+        # Initialized with small Gaussian noise (std=0.02) to avoid disrupting
+        # the shared pre-training signal in early epochs.
+        if num_subjects > 0:
+            self.subject_embed = nn.Embedding(num_subjects, hidden_channels)
+            nn.init.normal_(self.subject_embed.weight, std=0.02)
         
         # Encoder: Graph-native spatial-temporal encoding
         self.encoder = GraphNativeEncoder(
@@ -289,7 +309,29 @@ class GraphNativeBrainModel(nn.Module):
                     raise ValueError(f"Inf detected in {node_type} input")
         
         # 1. Encode: Graph-native spatial-temporal encoding
-        encoded_data = self.encoder(data)
+        # Subject embedding (AGENTS.md §九 Gap 2):
+        # If num_subjects > 0 and data carries a subject_idx scalar, look up the
+        # per-subject [H] offset and pass it to the encoder.  The encoder adds it
+        # to all node features after input projection, capturing individual brain
+        # differences while sharing the rest of the model weights.
+        subject_embed = None
+        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
+            s_idx = data.subject_idx
+            if not isinstance(s_idx, torch.Tensor):
+                s_idx = torch.tensor(s_idx, dtype=torch.long)
+            # Validate range; out-of-range usually means a stale cache was loaded
+            # after num_subjects changed — warn instead of silently remapping.
+            if s_idx.item() < 0 or s_idx.item() >= self.num_subjects:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    f"subject_idx={s_idx.item()} out of range [0, {self.num_subjects-1}]. "
+                    f"This likely means a cached graph was built with a different "
+                    f"num_subjects.  Clearing the graph cache and re-running will fix this. "
+                    f"Falling back to subject 0 for this sample."
+                )
+                s_idx = s_idx.clamp(0, self.num_subjects - 1)
+            subject_embed = self.subject_embed(s_idx)  # [H]
+        encoded_data = self.encoder(data, subject_embed=subject_embed)
         
         # 2. Decode: Reconstruct signals
         reconstructed = self.decoder(encoded_data)
