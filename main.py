@@ -292,11 +292,33 @@ def extract_windowed_samples(
     return windows
 
 
-def build_graphs(all_data, config: dict, logger: logging.Logger):
-    """构建图结构"""
+def build_graphs(config: dict, logger: logging.Logger):
+    """加载数据并构建图结构（含缓存感知的按需数据加载）。
+
+    将原先拆成两步的「准备数据」+「构建图」合并为一步：
+    对每个 (被试, 任务) 组合先检查图缓存，命中则直接加载缓存图（完全跳过
+    EEG/fMRI 原始数据的读取与预处理），未命中才调用 BrainDataLoader 加载
+    原始数据、执行预处理并构建图后写入缓存。
+
+    这解决了之前「即使图缓存已存在，每次运行仍会从头预处理所有原始数据」的问题。
+    """
     logger.info("=" * 60)
-    logger.info("步骤 2/4: 构建图结构")
+    logger.info("步骤 1-2/4: 加载数据 & 构建图结构")
     logger.info("=" * 60)
+
+    # ── 初始化数据加载器 ───────────────────────────────────────────
+    fmri_task_mapping = config['data'].get('fmri_task_mapping') or {}
+    if fmri_task_mapping:
+        logger.info(f"fMRI 任务映射: {fmri_task_mapping}")
+        logger.info(
+            "  说明：配置了映射后，任务发现仅扫描 EEG 文件，"
+            "fMRI 文件由映射关系确定（避免 fMRI-only 任务产生无 EEG 的单模态图）。"
+        )
+    data_loader = BrainDataLoader(
+        data_root=config['data']['root_dir'],
+        modalities=config['data']['modalities'],
+        fmri_task_mapping=fmri_task_mapping if fmri_task_mapping else None,
+    )
     
     _MIN_VOLUMES = 10  # Shared threshold for minimum valid fMRI timepoints
 
@@ -439,7 +461,16 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
     cache_enabled = cache_cfg.get('enabled', False)
     cache_dir: Optional[Path] = None
     if cache_enabled:
-        cache_dir = Path(cache_cfg.get('dir', 'outputs/graph_cache'))
+        # 相对路径相对于项目根目录（即 main.py 所在目录）解析，
+        # 而非运行时工作目录（CWD）——这保证了无论用户从哪个目录启动
+        # 脚本，缓存路径始终固定一致，不会因 CWD 不同导致「找不到缓存」。
+        _cache_dir_cfg = cache_cfg.get('dir', 'outputs/graph_cache')
+        _cache_dir_path = Path(_cache_dir_cfg)
+        cache_dir = (
+            _cache_dir_path
+            if _cache_dir_path.is_absolute()
+            else Path(__file__).parent / _cache_dir_path
+        )
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"图缓存已启用: {cache_dir}")
@@ -475,28 +506,75 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         if max_seq_len is not None:
             logger.info(f"序列截断已启用: max_seq_len={max_seq_len} (防止 CUDA OOM)")
 
+    # ── 被试/任务发现（纯文件扫描，无数据加载）──────────────────────
+    # 在任何数据加载之前先枚举所有 (被试, 任务) 对，用于：
+    # 1. 建立全局 subject_to_idx（subject embedding 索引必须在全数据集中唯一且稳定）
+    # 2. 逐对检查缓存，命中则跳过原始数据加载，大幅缩短二次运行启动时间
+    tasks_cfg = config['data'].get('tasks')
+    if tasks_cfg is None:
+        legacy_task = config['data'].get('task')
+        if legacy_task is not None:
+            tasks_cfg = [legacy_task]
+            logger.info(
+                f"使用旧版 'task: {legacy_task}' 配置。"
+                f" 建议迁移到 'tasks: [{legacy_task}]'。"
+            )
+        # tasks_cfg 仍为 None → 自动发现所有任务
+    elif isinstance(tasks_cfg, str):
+        tasks_cfg = [tasks_cfg]
+
+    if tasks_cfg is None:
+        logger.info("tasks: null → 自动发现每个被试的所有任务")
+    else:
+        logger.info(f"将加载以下任务: {tasks_cfg}")
+
+    # 0 和 null 均表示"不限制被试数"（与 load_all_subjects 行为一致）。
+    # 使用显式 None 检查而非 or None，避免意外将合法的 0 解释为"不限制"的语义混淆。
+    _max_sub = config['data'].get('max_subjects')
+    max_subjects_cfg = int(_max_sub) if _max_sub else None  # 0 / null → None
+
+    subject_dirs = sorted(data_loader.data_root.glob("sub-*"))
+    if max_subjects_cfg:
+        subject_dirs = subject_dirs[:max_subjects_cfg]
+
+    # 第一遍：仅扫描文件名，不加载任何原始数据
+    all_pairs: List[tuple] = []  # [(subject_id, task), ...]
+    for subject_dir in subject_dirs:
+        subject_id = subject_dir.name
+        if tasks_cfg is None:
+            subject_tasks = data_loader._discover_tasks(subject_id)
+        elif len(tasks_cfg) == 0:
+            # 空列表 = 不过滤任务，直接加载首个匹配文件（与 load_all_subjects 行为一致）
+            subject_tasks = [None]
+        else:
+            subject_tasks = list(tasks_cfg)
+        for t in subject_tasks:
+            all_pairs.append((subject_id, t))
+
+    if not all_pairs:
+        raise ValueError(
+            "未发现任何被试-任务组合，请检查数据路径配置。"
+            f" data.root_dir={config['data']['root_dir']!r}"
+        )
+
+    logger.info(f"发现 {len(all_pairs)} 个被试-任务组合")
+
     # 被试 ID → 整数索引映射（用于 subject embedding，AGENTS.md §九 Gap 2）
-    # 在构建图之前先扫描所有被试 ID，保证索引在整个数据集中全局唯一且确定性。
-    # 若 subject_id 缺失，用唯一占位符 f'unknown_{i}' 而非共用 'unknown'，
-    # 避免将多个匿名被试混合到同一个嵌入向量中（违反个性化设计意图）。
-    all_subject_ids = sorted(set(
-        d.get('subject_id') or f'unknown_{j}'
-        for j, d in enumerate(all_data)
-    ))
+    # 由文件系统发现结果确定性推导，与数据加载顺序无关，保证全局唯一。
+    all_subject_ids = sorted(set(sid for sid, _ in all_pairs))
     subject_to_idx = {sid: i for i, sid in enumerate(all_subject_ids)}
     logger.info(f"被试索引映射已建立: {len(subject_to_idx)} 个被试")
 
     graphs: List[HeteroData] = []
     n_cached = 0
     n_windows_total = 0
-    for subject_data in all_data:
-        subject_id = subject_data.get('subject_id', 'unknown')
-        task = subject_data.get('task')
-
+    for subject_id, task in all_pairs:
         # 计算一次缓存 key，供本次迭代的"读"和"写"共用，避免重复计算。
         cache_key = _graph_cache_key(subject_id, task, config) if cache_dir is not None else None
 
         # ── 尝试从缓存加载 ──────────────────────────────────────
+        # 缓存命中时直接加载 .pt 文件，完全跳过 EEG/fMRI 原始数据的读取与预处理。
+        # 这是「缓存感知加载」的核心：原始数据仅在缓存缺失时才会被读取。
         if cache_dir is not None and cache_key is not None:
             cache_path = cache_dir / cache_key
             if cache_path.exists():
@@ -527,8 +605,23 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 except Exception as e:
                     logger.warning(f"缓存加载失败 ({cache_key}): {e}，重新构建")
 
+        # ── 缓存未命中：加载原始数据并构建图 ─────────────────────
+        # 只有在缓存中找不到预构建图时，才执行耗时的 EEG/fMRI 原始数据加载与预处理。
+        logger.debug(f"缓存未命中，加载原始数据: {subject_id}/{task}")
+        subject_data = data_loader.load_subject(subject_id, task)
+        if not subject_data:
+            logger.warning(f"跳过被试 {subject_id}/{task}: 数据加载失败")
+            continue
+        # 确保 task 字段一致：load_subject() 不设置 'task'，此处补写。
+        # （旧版 load_all_subjects 在 subject_data 加入 all_data 前才添加 task 字段，
+        #  此处维持相同语义。）
+        subject_data['task'] = task
+        if 'fmri' not in subject_data and 'eeg' not in subject_data:
+            logger.warning(f"跳过被试 {subject_id}/{task}: 无有效模态数据")
+            continue
+
         graph_list = []
-        
+
         # fMRI图
         if 'fmri' in subject_data:
             fmri_data = subject_data['fmri']['data']
@@ -682,7 +775,7 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         raise ValueError("No valid graphs constructed. Check data quality and preprocessing.")
 
     # ── 汇总日志 ────────────────────────────────────────────────
-    n_runs = len(all_data)
+    n_runs = len(all_pairs)
     if windowed:
         avg_win = n_windows_total / max(n_runs, 1)
         logger.info(
@@ -1153,12 +1246,9 @@ def main():
     logger.info("=" * 60)
     
     try:
-        # 步骤1: 准备数据
-        all_data = prepare_data(config, logger)
-
-        # 步骤2: 构建图
+        # 步骤1-2: 加载数据 & 构建图（缓存感知，命中时跳过原始数据加载）
         # subject_to_idx: {subject_id_str → int_idx}，传给 create_model 以创建正确大小的 Embedding
-        graphs, mapper, subject_to_idx = build_graphs(all_data, config, logger)
+        graphs, mapper, subject_to_idx = build_graphs(config, logger)
 
         # 步骤3: 创建模型
         model = create_model(config, logger, num_subjects=len(subject_to_idx))
