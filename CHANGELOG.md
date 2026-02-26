@@ -1,10 +1,25 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.16  
+**版本**：V5.17  
 **状态**：生产就绪
 
 ---
+
+## [V5.17] 2026-02-26 — 编码器前向传播 KeyError 根治
+
+### 🐛 修复：`KeyError: 'eeg__connects__eeg'` in GraphNativeEncoder
+
+**症状**：每次启动训练时，第一步 `forward()` 即报 `KeyError: 'eeg__connects__eeg'`，训练从未真正运行。
+
+**根本原因**：`GraphNativeEncoder.forward()` 从不调用 `HeteroConv.forward()`，却用 `HeteroConv` 来存储 `SpatialTemporalGraphConv` 参数。`HeteroConv.convs` 是 PyG 的自定义 `ModuleDict` 子类，其 `to_internal_key()` 方法在不同 PyG 版本中对字符串 key 有不同的二次变换，导致写入时的内部 key 与查找时不一致。
+
+**修复**：
+- 将每层的 `HeteroConv` 替换为 `nn.ModuleDict`（标准 Python dict 语义），key 为 `'__'.join(edge_type)` 字符串
+- `forward()` 中访问改为 `stgcn['__'.join(edge_type)]`（直接查找，无隐式转换）
+- 移除不再使用的 `HeteroConv`、`GCNConv`、`GATConv` 导入
+
+**影响文件**：`models/graph_native_encoder.py`
 
 ## [V5.16] 2026-02-26 — Atlas 路径修正 + ON/OFF 任务自动对齐
 

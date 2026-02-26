@@ -230,15 +230,36 @@
 
 **思维误区**：看到 `HeteroConv(conv_dict)` 接受 `{(src, rel, dst): conv}` 形式的字典，就以为内部存储也是用 tuple 作为 key。
 
-**根因**：PyG 的 `HeteroConv.__init__` 将卷积存入 `nn.ModuleDict`：
+**根因**：PyG 的 `HeteroConv.__init__` 将卷积存入 PyG 自定义 `ModuleDict`，内部 key 为 `'__'.join(tuple)`。`GraphNativeEncoder.forward()` 用 `stgcn.convs[edge_type]`（tuple）访问，必然 `KeyError`。
+
+**正确思路**：每次在自定义 forward 中绕过 `HeteroConv.forward()` 手动访问其内部卷积时，必须问：**内部 dict 的 key 格式是什么？更深一步：这个 dict 是标准 Python dict 吗？** 若不是，key 访问语义可能与预期不同。
+
+**最终修复**：完全不使用 `HeteroConv` — 用 `nn.ModuleDict` 直接存储 conv，避免任何第三方 key 转换。详见下方 [2026-02-26]。
+
+---
+
+### [2026-02-26] PyG 自定义 ModuleDict 的 to_internal_key() 导致字符串 key 查找仍然失败
+
+**症状**：将 key 改为 `'__'.join(edge_type)` 字符串后，仍然 `KeyError: 'eeg__connects__eeg'`。
+
+**根因**：`HeteroConv.convs` 是 `torch_geometric.nn.module_dict.ModuleDict`（PyG 自定义子类），其 `__getitem__` 和 `__setitem__` 都调用 `to_internal_key()` 进行 key 转换。不同版本的 PyG 该方法实现不同，可能对字符串 key 有额外替换，导致**存入时 key=A，读取时因转换不对称得到 B**，查找失败。
+
+**思维误区**：以为"用字符串 key 就一定能查到"。没有追问：**这个 dict 的 `__getitem__` 是 PyG 重载的，to_internal_key() 到底做了什么变换？** 对任何第三方库的容器，不能假设其访问语义与标准 Python dict 相同。
+
+**更深层的设计误区**：`GraphNativeEncoder.forward()` 从不调用 `HeteroConv.forward()`——手动迭代边类型、手动查找 conv、手动调用。`HeteroConv` 在此仅作参数容器使用，这是错误的抽象。**用来做参数容器的，应该用参数容器；用来做消息传递的，才用 HeteroConv。**
+
+**正确思路**：
 ```python
-self.convs = nn.ModuleDict({'__'.join(key): module for key, module in convs.items()})
+# 错误：用 HeteroConv 存参数 — PyG 版本敏感，key 转换不可预期
+hetero_conv = HeteroConv({edge_type: conv for edge_type in edge_types})
+conv = stgcn.convs['__'.join(edge_type)]  # KeyError in some PyG versions
+
+# 正确：nn.ModuleDict，string key 写入后 string key 读取，无任何隐式转换
+nn.ModuleDict({'__'.join(et): conv for et in edge_types})
+conv = stgcn['__'.join(edge_type)]  # always works
 ```
-key 是 `'eeg__projects_to__fmri'`（字符串），不是 tuple。`GraphNativeEncoder.forward()` 用 `stgcn.convs[edge_type]`（tuple）访问，必然 `KeyError`。这意味着编码器从未成功运行过。
 
-**正确思路**：每次在自定义 forward 中绕过 `HeteroConv.forward()` 手动访问其内部卷积时，必须问：**内部 dict 的 key 格式是什么？** PyG 约定是 `'__'.join(edge_type_tuple)`。
-
-**修复**：`stgcn.convs['__'.join(edge_type)]`
+**影响文件**：`models/graph_native_encoder.py`（移除 `HeteroConv`、`GCNConv`、`GATConv` 导入）、`AGENTS.md`、`CHANGELOG.md`
 
 ---
 

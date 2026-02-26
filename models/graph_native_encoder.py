@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
-from torch_geometric.nn import MessagePassing, GCNConv, GATConv
+from torch_geometric.nn import MessagePassing
 from torch_geometric.data import HeteroData
 from typing import Dict, Optional, Tuple, List
 import math
