@@ -1,10 +1,41 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.19  
+**版本**：V5.20  
 **状态**：生产就绪
 
 ---
+
+## [V5.20] 2026-02-26 — 第三轮系统审查：缓存命中路径 subject_idx 补写 + 启动日志个性化状态 + SPEC.md 更新
+
+### 🔍 审查方法
+遍历所有代码路径，重点问："每个 `continue`/`break` 之前，有没有遗漏的必要副作用？" + "用户怎么知道这个功能是否真的在运行？"
+
+### 🐛 修复：缓存命中路径绕过 subject_idx 赋值（沉默回归）
+
+**根因**：缓存命中路径的 `continue` 使 `built_graph.subject_idx = torch.tensor(...)` 从未执行：
+- **老缓存（V5.18）**：`full_graph` 无 `subject_idx`，所有窗口/图样本无此属性 → subject embedding 完全禁用
+- **新缓存（V5.19）**：虽保存时有 `subject_idx`，但若同一 session 内先加载老缓存，`continue` 仍绕过赋值
+
+**修复位置**：`build_graphs()` 缓存加载块，在调用 `extract_windowed_samples()` 之前，显式写入 `full_graph.subject_idx`（从当前 session 的 `subject_to_idx` 推导，与新建图时的值一致）。
+
+**AGENTS.md 教训**：任何 `continue` 前必须问："循环尾部有没有必须执行的副作用？"
+
+### ✨ 改进：log_training_summary 报告个性化状态
+
+`log_training_summary` 新增【被试特异性嵌入】信息块：
+- 显示 `num_subjects × H_dim = N 个个性化参数`（当 > 0 时）
+- 实时检查 `graphs[0].subject_idx` 是否存在，若缺失则警告"请清除缓存重建"（直接提示用户该怎么做）
+- 当禁用时明确输出 `num_subjects=0` 以避免歧义
+
+### 📄 文档：SPEC.md 更新至 V5.20
+
+- §九表格：Gap 2 状态更新为 ✅ 已实现
+- 新增 §2.4（被试特异性嵌入设计意图、完整调用链、推理工作流）
+- 数据流图：新增 `subject_idx` 节点和 `subject_embed` 节点
+- 设计决策表：新增 `subject_embed` 注入位置选择的理由
+
+**影响文件**：`main.py`、`AGENTS.md`、`CHANGELOG.md`、`SPEC.md`
 
 ## [V5.19] 2026-02-26 — 第二轮系统审查：cache key修复 + 个性化被试嵌入（Gap 2实现）
 

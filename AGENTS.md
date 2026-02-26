@@ -429,11 +429,50 @@ conv = stgcn['__'.join(edge_type)]  # always works
 
 ---
 
+### [2026-02-26] 缓存路径绕过 subject_idx 赋值（第三轮系统审查）
+
+**思维误区**：V5.19 在"新建图"路径中加了 `built_graph.subject_idx = ...`，就认为所有图都会有 subject_idx。没有追问：**缓存命中路径是否也执行了这行代码？**
+
+**根因**：缓存命中路径：
+```python
+full_graph = torch.load(cache_path, ...)
+extract_windowed_samples(full_graph, ...)
+continue  ← 直接跳过 built_graph.subject_idx = torch.tensor(...)
+```
+`continue` 将执行跳回到 `for subject_data in all_data:` 的下一次迭代，完全绕过赋值语句。结果：
+- 老缓存（V5.18 以前）：`full_graph` 无 `subject_idx`，`extract_windowed_samples` 的 `hasattr` 检查为 False，所有窗口样本无 `subject_idx`
+- 新缓存（V5.19）：`full_graph` 有 `subject_idx`（在保存前赋值），但如果 `continue` 之前**先**调用了旧缓存，该调用链依然绕过赋值，subject embedding 对该被试静默禁用
+
+**正确思路**：任何 `continue`/`return`/`break` 都是"提前退出"。**每次在主循环中加 `continue`，都必须问：循环尾部有没有必须执行的副作用（如 metadata 写入、索引赋值）？如果有，必须在 `continue` 前补全。**
+
+**修复**：在缓存命中路径的 `extract_windowed_samples` 调用之前，先写入 `full_graph.subject_idx`。这样：
+1. 老缓存在加载后立即获得正确的 `subject_idx`
+2. 新缓存被冗余覆写（值相同，无害）
+3. `extract_windowed_samples` 的 `hasattr` 检查必然为 True，所有窗口样本正确获得 `subject_idx`
+
+**影响文件**：`main.py`
+
+---
+
+### [2026-02-26] log_training_summary 未报告个性化状态（第三轮）
+
+**思维误区**：实现了被试特异性嵌入之后，以为"代码里有了就够了"。没有追问：**用户怎么知道这个功能是否真的在运行？**
+
+**设计原则**：任何需要用户确认"是否生效"的功能，都必须在启动时的摘要日志中出现——包括：是否启用、启用了多少个被试、有没有告警。不能让用户在没有报错的情况下，却在默默运行一个禁用了个性化的模型。
+
+**修复**：`log_training_summary` 新增"被试特异性嵌入"一节：
+- 显示 `num_subjects × H 维 = N 个个性化参数`
+- 检查 `graphs[0]` 是否有 `subject_idx` 属性，若无则警告"请清除缓存重建"
+
+**影响文件**：`main.py`
+
+---
+
 **TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 
 **核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡，被试特异性嵌入（个性化数字孪生）。
 
-**当前状态**：V5.19，生产就绪。详见 `SPEC.md`。
+**当前状态**：V5.20，生产就绪。详见 `SPEC.md`。
 
 ---
 
@@ -550,32 +589,29 @@ ST-GCN 编码器含 EEG→fMRI 跨模态边。因此：
 
 ---
 
-## 九、数字孪生脑的根本目的与当前架构差距（V5.14 深度分析）
+## 九、数字孪生脑的根本目的与当前架构差距（持续更新）
 
 ### 数字孪生脑应该是什么
 
-| 维度 | 数字孪生定义 | 当前 V5.14 实现 | 差距 |
-|------|-------------|-----------------|------|
-| **个性化** | 特定于某一个体大脑 | 所有被试共享模型参数 | 未实现 |
-| **动态拓扑** | 连接模式随认知状态改变 | V5.14 新增 DynamicGraphConstructor | **已实现** |
-| **跨会话预测** | 预测下次扫描的脑状态 | 在同一 run 内预测未来窗口 | 部分实现 |
-| **干预响应** | 模拟刺激/药物对脑活动的影响 | 未实现 | 未实现 |
-| **自我演化** | 随学习/发育更新模型 | 需要纵向数据 + 持续学习 | 未实现 |
+| 维度 | 数字孪生定义 | 当前实现 | 状态 |
+|------|-------------|---------|------|
+| **个性化** | 特定于某一个体大脑 | V5.19 被试特异性嵌入 | **✅ 已实现** |
+| **动态拓扑** | 连接模式随认知状态改变 | V5.14 DynamicGraphConstructor | **✅ 已实现** |
+| **跨会话预测** | 预测下次扫描的脑状态 | 在同一 run 内预测未来窗口 | ⚡ 部分实现 |
+| **干预响应** | 模拟刺激/药物对脑活动的影响 | 未实现 | ❌ Future work |
+| **自我演化** | 随学习/发育更新模型 | 需要纵向数据 + 持续学习 | ❌ Future work |
 
 ### 三个最重要的架构差距（按优先级排序）
 
-**Gap 1（已修复）：动态图拓扑** ← V5.14 DynamicGraphConstructor
+**Gap 1（✅ 已实现）：动态图拓扑** ← V5.14 DynamicGraphConstructor
 - 原问题：edge_index 在数据预处理阶段固定，无法反映认知状态的动态变化
 - 解决：每个 ST-GCN 层从当前节点特征动态推算软邻接，与静态拓扑混合
 
-**Gap 2（未实现）：被试特异性嵌入（真正的个性化）**
-- 每个被试学一个可学习的嵌入向量 `subject_embed[subject_id]`，在 forward() 开始时加到节点特征上
+**Gap 2（✅ V5.19 已完整实现）：被试特异性嵌入（真正的个性化）**
+- 每个被试的唯一 `[H]` 潜空间偏移，在编码器输入投影后施加到所有节点特征
 - 推理时只需 fine-tune 该嵌入（frozen encoder），即"few-shot personalization"
-- 实现要点：
-  1. `GraphNativeBrainModel` 加 `nn.Embedding(num_subjects, hidden_channels)`
-  2. `data` 中存储 `subject_idx` (int)
-  3. `forward()` 开始时 `x += self.subject_embed(subject_idx)`
-  4. `create_model()` 从图列表推断 num_subjects
+- 完整调用链：`subject_to_idx` → `built_graph.subject_idx` → 窗口样本复制 → `nn.Embedding(N,H)` → `x_proj += embed.view(1,1,-1)`
+- **⚠️ 注意**：缓存命中路径须在 `extract_windowed_samples` 前先写入 `subject_idx`（V5.20 修复）
 
 **Gap 3（未实现）：跨会话预测（真正的"孪生"预测力）**
 - 当前 pred_loss 是 within-run（context→future in same scan）

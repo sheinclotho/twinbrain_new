@@ -471,6 +471,19 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
             if cache_path.exists():
                 try:
                     full_graph = torch.load(cache_path, map_location='cpu', weights_only=False)
+                    # 被试索引（AGENTS.md §九 Gap 2）：
+                    # 缓存图可能由 V5.18 或更早版本保存，不含 subject_idx。
+                    # 使用当前运行时的 subject_to_idx 补写，保证嵌入对缓存图同样生效。
+                    # 即使图由 V5.19 保存（已含 subject_idx），此处覆写也无害——
+                    # subject_to_idx 由当前数据集的 subject_id 确定性推导，与保存时一致。
+                    if subject_id not in subject_to_idx:
+                        logger.warning(
+                            f"subject_id='{subject_id}' not found in subject_to_idx "
+                            f"(cache load path). Falling back to index 0."
+                        )
+                    full_graph.subject_idx = torch.tensor(
+                        subject_to_idx.get(subject_id, 0), dtype=torch.long
+                    )
                     win_samples = extract_windowed_samples(full_graph, w_cfg, logger)
                     graphs.extend(win_samples)
                     n_windows_total += len(win_samples)
@@ -847,6 +860,32 @@ def log_training_summary(
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"  总参数量: {total_params:,}")
     logger.info(f"  损失函数: {config['model'].get('loss_type', 'mse')}")
+
+    # 被试特异性嵌入（AGENTS.md §九 Gap 2 个性化数字孪生）
+    # 直接从模型属性读取运行时值，而非 config，以覆盖 num_subjects=0 等默认情形。
+    num_subjects_rt = getattr(model, 'num_subjects', 0)
+    if num_subjects_rt > 0:
+        H = config['model']['hidden_channels']
+        embed_params = num_subjects_rt * H
+        logger.info(
+            f"  被试特异性嵌入: ✅ 已启用 | "
+            f"{num_subjects_rt} 个被试 × {H} 维 = {embed_params:,} 个个性化参数"
+        )
+        logger.info(
+            f"  个性化原理: 每个被试学习一个 [H={H}] 潜空间偏移，"
+            f"施加于所有节点特征（编码器输入投影之后）"
+        )
+        # Verify that graphs carry subject_idx so embedding is actually activated
+        has_sidx = graphs and hasattr(graphs[0], 'subject_idx')
+        if not has_sidx:
+            logger.warning(
+                "  ⚠️  graphs[0] 缺少 subject_idx 属性！"
+                " 被试嵌入在 forward() 中将被跳过。"
+                " 这通常意味着图缓存来自 V5.18 或更早版本，"
+                " 请清除缓存目录后重新运行以重建含 subject_idx 的图。"
+            )
+    else:
+        logger.info("  被试特异性嵌入: ❌ 未启用 (num_subjects=0)")
 
     # ── 训练 ────────────────────────────────────────────────────
     logger.info("【训练】")
