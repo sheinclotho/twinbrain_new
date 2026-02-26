@@ -19,6 +19,7 @@ import os
 import random
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional
 import yaml
@@ -283,8 +284,11 @@ def extract_windowed_samples(
     # 复制图级属性（不属于任何节点类型，但对整个样本共享的元数据）
     # 当前图级属性：
     #   subject_idx: 被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
+    #   run_idx: 扫描 run 的全局整数索引（由 build_graphs 按 all_pairs 顺序赋值），
+    #            供 train_model 的 run-level 训练/验证集划分使用，防止同一 run 的重叠
+    #            窗口同时出现在训练集和验证集中（窗口级划分会引入数据泄漏）。
     # 未来可扩展：task_id（任务类型编码）、session_id（纵向会话索引，支持跨会话预测）
-    for attr in ('subject_idx',):
+    for attr in ('subject_idx', 'run_idx'):
         if hasattr(full_graph, attr):
             for win in windows:
                 setattr(win, attr, getattr(full_graph, attr))
@@ -568,6 +572,7 @@ def build_graphs(config: dict, logger: logging.Logger):
     graphs: List[HeteroData] = []
     n_cached = 0
     n_windows_total = 0
+    run_idx_counter = 0  # 每个 (subject, task) run 的全局整数索引，用于 run-level 训练/验证集划分
     for subject_id, task in all_pairs:
         # 计算一次缓存 key，供本次迭代的"读"和"写"共用，避免重复计算。
         cache_key = _graph_cache_key(subject_id, task, config) if cache_dir is not None else None
@@ -593,10 +598,14 @@ def build_graphs(config: dict, logger: logging.Logger):
                     full_graph.subject_idx = torch.tensor(
                         subject_to_idx.get(subject_id, 0), dtype=torch.long
                     )
+                    # run_idx 供 run-level 训练/验证集划分使用。
+                    # 与 subject_idx 同理：缓存图可能不含此属性，此处补写无害。
+                    full_graph.run_idx = torch.tensor(run_idx_counter, dtype=torch.long)
                     win_samples = extract_windowed_samples(full_graph, w_cfg, logger)
                     graphs.extend(win_samples)
                     n_windows_total += len(win_samples)
                     n_cached += 1
+                    run_idx_counter += 1
                     logger.debug(
                         f"从缓存加载图: {cache_key}"
                         + (f" → {len(win_samples)} 个窗口" if windowed else "")
@@ -749,6 +758,10 @@ def build_graphs(config: dict, logger: logging.Logger):
             built_graph.subject_idx = torch.tensor(
                 subject_to_idx.get(subject_id, 0), dtype=torch.long
             )
+            # run_idx: 全局 run 顺序索引，供 run-level 训练/验证集划分。
+            # 窗口模式下，同一 run 的所有窗口共享相同 run_idx，
+            # 训练时以 run 为单位划分，防止重叠窗口同时出现在训练集和验证集中。
+            built_graph.run_idx = torch.tensor(run_idx_counter, dtype=torch.long)
 
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
             if cache_dir is not None and cache_key is not None:
@@ -770,6 +783,7 @@ def build_graphs(config: dict, logger: logging.Logger):
                 )
             else:
                 graphs.append(built_graph)
+            run_idx_counter += 1
 
     if len(graphs) == 0:
         raise ValueError("No valid graphs constructed. Check data quality and preprocessing.")
@@ -1039,33 +1053,61 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("步骤 4/4: 训练模型")
     logger.info("=" * 60)
     
-    # 划分训练/验证集 - Ensure both train and validation have samples
+    # 划分训练/验证集
     if len(graphs) < 2:
         logger.error(f"❌ 数据不足: 需要至少2个样本进行训练，但只有 {len(graphs)} 个样本")
         logger.error("提示: 请增加数据量或调整 max_subjects 配置")
         raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个。请检查数据配置。")
     
-    # 打乱后再划分，避免以下偏差：
-    # 1. 窗口采样时序列前段全入训练集、后段全入验证集（不同脑状态）
-    # 2. 被试按字母顺序排列时最后几个被试全部只出现在验证集中
-    # 使用 seed 保证复现性
-    shuffled = graphs.copy()
     rng = random.Random(42)
-    rng.shuffle(shuffled)
-    
-    # Use at least 10% or 1 sample for validation, ensure both train and val have at least 1
-    min_val_samples = max(1, len(shuffled) // 10)
-    n_train = len(shuffled) - min_val_samples
-    
-    # Safety check: ensure both sets have at least 1 sample
-    if n_train < 1:
-        n_train = 1
-        min_val_samples = len(shuffled) - 1
-    
-    train_graphs = shuffled[:n_train]
-    val_graphs = shuffled[n_train:]
-    
-    logger.info(f"训练集: {len(train_graphs)} 个样本 | 验证集: {len(val_graphs)} 个样本 (seed=42 随机打乱, 结果可复现)")
+    windowed = config.get('windowed_sampling', {}).get('enabled', False)
+
+    if windowed and graphs and hasattr(graphs[0], 'run_idx'):
+        # ── Run-level 划分（窗口模式）────────────────────────────────
+        # 窗口模式下，同一 run 产生多个 50% 重叠窗口。
+        # 若以窗口为单位随机划分，来自同一 run 的重叠窗口会同时出现在训练集和
+        # 验证集中（数据泄漏），导致验证损失虚低、无法反映真实泛化性能。
+        # 以 run 为单位划分确保：某个 run 的所有窗口只进入训练集或只进入验证集。
+        run_groups: dict = defaultdict(list)
+        for g in graphs:
+            run_groups[g.run_idx.item()].append(g)
+        
+        run_keys = sorted(run_groups.keys())
+        rng.shuffle(run_keys)
+        
+        min_val_runs = max(1, len(run_keys) // 10)
+        n_train_runs = len(run_keys) - min_val_runs
+        if n_train_runs < 1:
+            n_train_runs = 1
+            min_val_runs = len(run_keys) - 1
+        
+        train_run_keys = run_keys[:n_train_runs]
+        val_run_keys = run_keys[n_train_runs:]
+        train_graphs = [g for k in train_run_keys for g in run_groups[k]]
+        val_graphs = [g for k in val_run_keys for g in run_groups[k]]
+        logger.info(
+            f"训练集: {len(train_graphs)} 个窗口 (来自 {len(train_run_keys)} 个 run) | "
+            f"验证集: {len(val_graphs)} 个窗口 (来自 {len(val_run_keys)} 个 run) "
+            f"[run-level 划分，防止重叠窗口数据泄漏，seed=42]"
+        )
+    else:
+        # ── 样本级划分（单样本模式或无 run_idx）────────────────────
+        # 打乱后再划分，避免以下偏差：
+        # 1. 被试按字母顺序排列时最后几个被试全部只出现在验证集
+        # 2. 多任务场景下某类任务全集中在一端
+        shuffled = graphs.copy()
+        rng.shuffle(shuffled)
+        
+        min_val_samples = max(1, len(shuffled) // 10)
+        n_train = len(shuffled) - min_val_samples
+        if n_train < 1:
+            n_train = 1
+        train_graphs = shuffled[:n_train]
+        val_graphs = shuffled[n_train:]
+        logger.info(
+            f"训练集: {len(train_graphs)} 个样本 | 验证集: {len(val_graphs)} 个样本 "
+            f"(seed=42 随机打乱, 结果可复现)"
+        )
     
     if len(train_graphs) < 5:
         logger.warning("⚠️ 训练样本较少，模型可能过拟合。建议使用更多数据。")
@@ -1090,6 +1132,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         compile_mode=config['device'].get('compile_mode', 'reduce-overhead'),
         device=config['device']['type'],
         optimization_config=config.get('v5_optimization'),
+        max_grad_norm=config['training'].get('max_grad_norm', 1.0),
     )
     logger.info("✅ 训练器初始化完成")
     logger.info("=" * 60)

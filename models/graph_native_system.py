@@ -504,6 +504,7 @@ class GraphNativeTrainer:
         compile_mode: str = 'reduce-overhead',
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
         optimization_config: Optional[Dict] = None,
+        max_grad_norm: float = 1.0,
     ):
         """
         Initialize trainer.
@@ -525,11 +526,14 @@ class GraphNativeTrainer:
             optimization_config: Optional dict from config['v5_optimization'].
                 Contains sub-dicts 'adaptive_loss' and 'eeg_enhancement' with
                 fine-grained hyperparameters.  Defaults used when None.
+            max_grad_norm: Max gradient norm for clipping (config['training']['max_grad_norm']).
+                Hardcoding this to 1.0 previously caused the config value to be silently ignored.
         """
         self._optimization_config = optimization_config or {}
         self.model = model.to(device)
         self.device = device
         self.node_types = node_types
+        self.max_grad_norm = max_grad_norm
         
         # Verify CUDA availability
         if device.startswith('cuda') and not torch.cuda.is_available():
@@ -837,7 +841,7 @@ class GraphNativeTrainer:
                 # Backward pass with gradient scaling
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
@@ -867,7 +871,7 @@ class GraphNativeTrainer:
                 
                 # Backward pass
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
                 self.optimizer.step()
             
             # Update loss balancer with detached scalar values.
@@ -1013,6 +1017,12 @@ class GraphNativeTrainer:
         if self.use_adaptive_loss:
             checkpoint['loss_balancer_state'] = self.loss_balancer.state_dict()
         
+        # Save scheduler state so that LR schedule resumes correctly after loading.
+        # Without this, load_checkpoint() would restart the LR from the initial
+        # value + warmup phase, disrupting cosine-annealing restarts.
+        if self.use_scheduler and self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        
         # Atomic save: write to temp file then rename
         temp_path = path.parent / f"{path.name}.tmp"
         
@@ -1032,7 +1042,10 @@ class GraphNativeTrainer:
     
     def load_checkpoint(self, path: Path):
         """Load training checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        # weights_only=False is required for loading HeteroData and custom objects
+        # stored in checkpoints.  Omitting it triggers a FutureWarning in recent
+        # PyTorch versions and will become an error in a future release.
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -1040,6 +1053,18 @@ class GraphNativeTrainer:
         
         if self.use_adaptive_loss and 'loss_balancer_state' in checkpoint:
             self.loss_balancer.load_state_dict(checkpoint['loss_balancer_state'])
+        
+        # Restore scheduler state to continue LR annealing from where it left off.
+        # Old checkpoints (saved before this fix) will not have 'scheduler_state_dict';
+        # in that case the scheduler restarts from epoch 0 (pre-fix behaviour).
+        if self.use_scheduler and self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        elif self.use_scheduler and self.scheduler is not None:
+            logger.warning(
+                "Checkpoint does not contain scheduler_state_dict "
+                "(checkpoint was saved before V5.22). "
+                "LR schedule will restart from epoch 0."
+            )
         
         logger.info(f"Loaded checkpoint from {path}")
         

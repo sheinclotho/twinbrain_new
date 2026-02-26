@@ -1,8 +1,52 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.21  
+**版本**：V5.22  
 **状态**：生产就绪
+
+---
+
+## [V5.22] 2026-02-26 — 全流程审查：四处静默缺陷修复
+
+### 🔍 审查范围
+
+对数据处理 → 图构建 → 编码器 → 训练循环做了完整的调用链追踪审查，发现并修复以下四处在常规训练中不报错但会悄悄影响训练质量的缺陷。
+
+### 🐛 Bug 1：`max_grad_norm` 配置参数被静默忽略
+
+- **根因**：`train_step()` 硬编码 `max_norm=1.0`，`config['training']['max_grad_norm']` 从未被传入或使用
+- **影响**：用户修改梯度裁剪阈值无效；小数据集想要更激进的梯度裁剪（如 0.5）也无法生效
+- **修复**：`GraphNativeTrainer` 新增 `max_grad_norm` 参数；`train_model` 从 config 读取并传入
+
+### 🐛 Bug 2：Checkpoint 不保存 LR 调度器状态
+
+- **根因**：`save_checkpoint()` 未保存 `scheduler.state_dict()`；恢复后余弦退火从头重启
+- **影响**：中断恢复后 LR 从初始值重新线性预热，而非从中断点继续退火——相当于放弃了已有的预热+退火进度
+- **修复**：`save_checkpoint` 补存 `scheduler_state_dict`；`load_checkpoint` 补加还原逻辑；同时修复 `torch.load` 缺少 `weights_only=False` 的弃用警告
+
+### 🐛 Bug 3：编码器无消息时残差计算错误（潜在特征幅度放大）
+
+- **根因**：
+  ```python
+  x_new = x  # no messages
+  x_new = x + self.dropout(x_new)  # → x + dropout(x) ≈ 2x
+  ```
+  4 层编码器 eval 模式下累积约 2^4 = 16× 幅度放大
+- **影响**：通常不触发（正常配置中每个节点类型都有自环边，消息不为空），但若 `add_self_loops=False` 且某节点孤立，会导致特征幅度爆炸
+- **修复**：合并残差与消息：有消息时 `x + dropout(avg(msg))`；无消息时直接透传 `x`
+
+### 🐛 Bug 4：窗口模式下按窗口划分训练/验证集（数据泄漏）
+
+- **根因**：50% 重叠窗口随机 shuffle 后直接 90/10 split，同一 run 的相邻窗口可同时出现在训练集和验证集
+- **影响**：验证损失虚低（≈ 20-40%），无法反映真实泛化性；早停判断失效，模型可能过拟合未被发现
+- **修复**：引入 `run_idx`（每个 `(subject, task)` run 的全局索引），`extract_windowed_samples` 将其复制到所有子窗口，`train_model` 在窗口模式下按 run 分组做 run-level split
+
+### 📁 修改文件
+
+- `models/graph_native_encoder.py`：Bug 3（编码器残差）
+- `models/graph_native_system.py`：Bug 1（max_grad_norm）+ Bug 2（checkpoint scheduler）
+- `main.py`：Bug 1（传参）+ Bug 4（run_idx 赋值 + run-level split）
+- `AGENTS.md`：审查记录
 
 ---
 

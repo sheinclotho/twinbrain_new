@@ -727,14 +727,16 @@ class GraphNativeEncoder(nn.Module):
                             
                             messages.append(msg)
                 
-                # Aggregate messages
+                # Aggregate messages + residual connection.
+                # When messages exist: x_new = x + dropout(avg(messages)) — standard residual.
+                # When no messages (node type has no inbound edges in this batch):
+                #   pass x through unchanged.  The previous code set x_new = x then did
+                #   x + dropout(x_new) = x + dropout(x) ≈ 2x, amplifying features by
+                #   ~2× per layer (up to 16× after 4 layers in eval mode where dropout=0).
                 if messages:
-                    x_new = sum(messages) / len(messages)
+                    x_new = x + self.dropout(sum(messages) / len(messages))
                 else:
-                    x_new = x
-                
-                # Residual connection
-                x_new = x + self.dropout(x_new)
+                    x_new = x  # no incoming edges for this node type in this batch: pass through unchanged
                 
                 # Layer normalization (per timestep)
                 N, T, H = x_new.shape

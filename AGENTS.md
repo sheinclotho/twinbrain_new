@@ -707,3 +707,68 @@ ST-GCN 编码器含 EEG→fMRI 跨模态边。因此：
 - 研究场景推荐 `true`：对认知神经科学应用，功能连接动态性是核心现象
 - 小数据集（< 50 样本）建议谨慎：动态图引入额外参数（每层 `node_proj + mix_logit`），可能过拟合
 - `k_dynamic_neighbors` 建议：fMRI(N=200) 设 10；EEG(N≤64) 设 5
+
+---
+
+### [2026-02-26] 全流程审查发现的四个隐患（V5.21 综合修复）
+
+> 本次审查对从数据处理到训练循环的全部代码做了系统检查，发现以下问题均已修复。
+
+#### 隐患 1：`max_grad_norm` 配置参数被静默忽略
+
+**症状**：用户修改 `configs/default.yaml` 中的 `training.max_grad_norm` 无效果。
+
+**根因**：`GraphNativeTrainer.train_step()` 中两处 `clip_grad_norm_` 均硬编码 `max_norm=1.0`。`config['training']['max_grad_norm']` 虽然存在于 YAML 中，也在 `log_training_summary()` 中被读取，但从未传入 `GraphNativeTrainer`。
+
+**正确思路**：每次在配置文件中存在某参数，都要追溯其完整传递链：YAML → main.py 读取 → 传入目标模块 → 在目标模块中真正使用。任何中间断点都会导致"看上去可以配置，实际上不起作用"。
+
+**修复**：`GraphNativeTrainer.__init__` 新增 `max_grad_norm: float = 1.0` 参数，`train_model` 传入 `config['training'].get('max_grad_norm', 1.0)`。
+
+---
+
+#### 隐患 2：Checkpoint 不保存调度器状态，恢复训练时 LR 从零重启
+
+**症状**：从 checkpoint 恢复训练时，余弦退火从头开始（LR 恢复到初始值 × 0.1），不是从中断点继续。
+
+**根因**：`save_checkpoint()` 保存 `model_state_dict` + `optimizer_state_dict` + `loss_balancer_state`，唯独缺少 `scheduler_state_dict`。`load_checkpoint()` 因此也无法恢复。
+
+**正确思路**：凡是"恢复到和中断前完全一致状态"的需求，都需要保存**所有有状态的组件**：model、optimizer、scheduler、loss_balancer、history。漏掉任何一个都会导致恢复后行为与正常训练不一致。
+
+**修复**：`save_checkpoint` 新增 `scheduler_state_dict`，`load_checkpoint` 新增恢复逻辑（旧版 checkpoint 缺失时给出明确警告）。同时补加 `weights_only=False`（新版 PyTorch 要求）。
+
+---
+
+#### 隐患 3：编码器无消息时残差连接变为 `x + dropout(x)` ≈ 2x（特征幅度放大）
+
+**症状**：若某节点类型在某一批次中没有任何入边（`messages = []`），该层输出约为 2x，4 层编码器后幅度放大约 16×，导致 LayerNorm 输入极大，梯度可能不稳定。
+
+**根因**：
+```python
+if messages:
+    x_new = sum(messages) / len(messages)
+else:
+    x_new = x  # 此处赋值 x
+
+# 残差连接（无条件执行）
+x_new = x + self.dropout(x_new)
+# 当 messages=[] 时等价于：x_new = x + dropout(x) ≈ 2x
+```
+
+无消息时不应做残差加法，应直接透传 `x`。
+
+**正确思路**：残差连接的语义是"原始输入 + 新信息"。当没有新信息时，残差 = 0，结果 = 原始输入。代码应明确区分"有消息"和"无消息"两条路径，不应有无条件的 `x + ...` 操作。
+
+**修复**：合并为 `x_new = x + self.dropout(sum(messages) / len(messages))` 当有消息时；`x_new = x` 当无消息时（passthrough，无 dropout 加法）。
+
+---
+
+#### 隐患 4：窗口模式下训练/验证集按窗口划分，同一 run 的重叠窗口同时进入两集（数据泄漏）
+
+**症状**：启用 `windowed_sampling.enabled: true` 后，验证损失比实际泛化性能虚低。
+
+**根因**：原代码对所有窗口样本随机 shuffle 后取 90/10 split。相邻窗口有 50% 时间重叠（`stride_fraction=0.5`），同一 run 的窗口 w_t 和 w_{t+1} 共享 50% 的 EEG/fMRI 信号，且共用相同 `edge_index`（来自全 run 相关估计）。将它们分别放入训练集和验证集，验证集实际上在"见过的数据上打分"。
+
+**正确思路**：当训练样本来自重叠切分时，应以切分的原始单元（run）为粒度做划分，不能以切分后的个体（窗口）为粒度。类比于时序数据的 walk-forward validation：切点必须是"过去/未来"的边界，不能随机插入到序列中间。
+
+**修复**：引入 `run_idx`（每个 (被试, 任务) run 的全局顺序索引）。`build_graphs` 为每个 run 的完整图赋值 `run_idx`，`extract_windowed_samples` 将其复制到所有子窗口。`train_model` 在窗口模式下按 `run_idx` 分组，以 run 为单位做 90/10 划分，保证同一 run 的所有窗口都进入同一集合。
+
