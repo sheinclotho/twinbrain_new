@@ -163,11 +163,14 @@ class BrainDataLoader:
         查找顺序（优先级从高到低）：
         1. 若配置了 ``fmri_task_mapping``，用映射后的 fMRI 任务名查找；
         2. 用 EEG 任务名直接查找同名 fMRI 文件；
+        2.5 若任务名以 ``ON``/``OFF`` 结尾，自动剥离后缀重试（CBON→CB，CBOFF→CB，
+            ECON→EC，ECOFF→EC，GRADON→GRAD，GRADOFF→GRAD 等），无需任何配置；
         3. 回退到该被试目录下任意 bold.nii* 文件。
 
-        这支持两种场景：
+        这支持三种场景：
         - 1:1（standard）：每个 EEG 任务有同名 fMRI（步骤 2 命中）。
-        - 1:N（共享 fMRI）：多个 EEG 条件共用一个 fMRI run（步骤 1 命中）。
+        - 1:N ON/OFF（自动）：EEG 任务名以 ON/OFF 结尾，fMRI 无后缀（步骤 2.5 命中）。
+        - 1:N 任意（显式）：多个 EEG 条件共用一个 fMRI run，显式配置映射（步骤 1 命中）。
         """
         try:
             # 查找fMRI文件
@@ -197,6 +200,24 @@ class BrainDataLoader:
                     # 步骤 2：按 EEG 任务名直接查找同名 fMRI
                     task_pattern = f"{subject_id}*task-{task}*bold.nii*"
                     fmri_files = list(self.data_root.glob(f"**/{task_pattern}"))
+
+                    if not fmri_files:
+                        # 步骤 2.5：ON/OFF 后缀自动检测
+                        # CBON→CB, CBOFF→CB, ECON→EC, ECOFF→EC, GRADON→GRAD 等
+                        auto_base: Optional[str] = None
+                        for suffix in ('ON', 'OFF'):
+                            if task.upper().endswith(suffix):
+                                auto_base = task[: -len(suffix)]
+                                break
+                        if auto_base:
+                            auto_pattern = f"{subject_id}*task-{auto_base}*bold.nii*"
+                            fmri_files = list(self.data_root.glob(f"**/{auto_pattern}"))
+                            if fmri_files:
+                                logger.debug(
+                                    f"ON/OFF 自动检测命中: EEG task-{task} → fMRI task-{auto_base}"
+                                    f" ({fmri_files[0].name})"
+                                )
+
                     if not fmri_files:
                         # 步骤 3：回退到该被试目录下搜索任意 bold.nii* 文件
                         fmri_files = list(self.data_root.glob(f"**/{fmri_pattern}"))
@@ -235,12 +256,13 @@ class BrainDataLoader:
 
         **任务发现策略**：
 
-        - 若配置了 ``fmri_task_mapping``（1:N 模式），**只**扫描 EEG 文件名——
-          fMRI 任务名由映射表提供，无需从文件名发现。这样可避免将"只有 fMRI
-          没有 EEG"的任务（例如 ``task-CB``）作为独立 run 加载，防止生成
-          无 EEG 的单模态图（对跨模态训练毫无价值）。
+        - 若 EEG 在模态列表中：**只**扫描 EEG 文件名（无论是否配置了 fmri_task_mapping）。
+          fMRI 任务的确定推迟到 ``_load_fmri()`` 时按优先级解析（显式映射 > 直接同名
+          匹配 > ON/OFF 自动检测 > 任意文件回退），从而避免将「fMRI-only 任务」
+          （如 task-CB）作为独立 run 加载——该 run 因无 EEG 配对而产生无跨模态边的
+          单模态图，对联合训练毫无价值。
 
-        - 若未配置映射，同时扫描 EEG 和 fMRI 文件名（旧行为，向后兼容）。
+        - 若 EEG **不在**模态列表中（纯 fMRI 场景）：扫描 fMRI 文件名。
 
         返回去重排序后的任务名列表。若未发现任何任务标记，则返回 ``[None]``，
         表示不过滤任务（加载首个匹配文件）。
@@ -248,11 +270,11 @@ class BrainDataLoader:
         tasks: set = set()
         patterns: List[str] = []
         if 'eeg' in self.modalities:
+            # EEG 存在时：仅依赖 EEG 文件名发现任务。
+            # fMRI 任务由 _load_fmri() 在加载时自动确定（支持同名/ON-OFF/显式映射）。
             patterns.append(f"{subject_id}*task-*eeg.set")
-        # 只有在未配置显式映射时，才从 fMRI 文件名发现任务。
-        # 配置了映射意味着 EEG 任务 → fMRI 任务已由用户显式指定，
-        # 从 fMRI 文件名额外发现任务只会引入无 EEG 配对的单模态 run。
-        if 'fmri' in self.modalities and not self.fmri_task_mapping:
+        elif 'fmri' in self.modalities:
+            # 纯 fMRI 场景：从 fMRI 文件名发现任务。
             patterns.append(f"{subject_id}*task-*bold.nii*")
         for pat in patterns:
             for f in self.data_root.glob(f"**/{pat}"):

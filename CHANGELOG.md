@@ -1,8 +1,57 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-25  
-**版本**：V5.15  
+**最后更新**：2026-02-26  
+**版本**：V5.16  
 **状态**：生产就绪
+
+---
+
+## [V5.16] 2026-02-26 — Atlas 路径修正 + ON/OFF 任务自动对齐
+
+### 🔧 修复：Atlas 文件名错误
+
+`configs/default.yaml` 中 atlas 文件路径修正：
+
+```diff
+- file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
++ file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.nii"
+```
+
+- 分辨率：2mm → 1mm（与用户实际文件一致）
+- 文件格式：.nii.gz（压缩）→ .nii（非压缩，与实际文件后缀一致）
+
+### ✨ 新功能：ON/OFF 实验范式 EEG→fMRI 自动对齐
+
+**背景**：用户数据命名规律——
+- EEG：`task-CBON`, `task-CBOFF`, `task-ECON`, `task-ECOFF`, `task-GRADON`, `task-GRADOFF` ...
+- fMRI：`task-CB`, `task-EC`, `task-GRAD` ...
+
+旧代码需要手动配置 `fmri_task_mapping`，或触发静默回退警告。
+
+**新代码自动检测**（无需任何配置）：
+```
+_load_fmri() 查找优先级：
+  1. 显式 fmri_task_mapping（若配置）
+  2. 直接同名匹配（task-CBON fMRI）
+  2.5 ON/OFF 后缀自动剥离 ★新增
+       CBON → CB, CBOFF → CB
+       ECON → EC, ECOFF → EC
+       GRADON → GRAD, GRADOFF → GRAD
+       EOON → EO, EOOFF → EO
+  3. 任意 bold 文件回退（最后手段）
+```
+
+### 🧹 优化：`_discover_tasks()` 彻底避免幽灵 fMRI-only 任务
+
+旧代码：当无 `fmri_task_mapping` 时同时扫描 EEG + fMRI 文件名 → 发现 CB/EC/EO/GRAD 作为独立任务 → 生成无 EEG 配对的单模态图（训练中无用）。
+
+新代码：**只要 EEG 在模态列表中，就只扫描 EEG 文件名**（不再依赖是否配置了 mapping）。fMRI-only 场景仍正常使用 fMRI 文件名。
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| EEG+fMRI, tasks: null | 发现 CB/EC/EO/GRAD/CBON/CBOFF/... (8+ tasks) | 仅发现 CBON/CBOFF/ECON/ECOFF/... (EEG only) |
+| CBON 加载 fMRI | 静默回退 + WARNING | ON/OFF 自动检测 → CB fMRI (DEBUG) |
+| fMRI-only | 同旧版 | 同旧版 (elif 分支) |
 
 ---
 
