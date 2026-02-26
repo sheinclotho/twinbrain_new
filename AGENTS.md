@@ -351,6 +351,44 @@ conv = stgcn['__'.join(edge_type)]  # always works
 
 ---
 
+### [2026-02-26] 异质图「框架使用完整」≠「特性使用完整」——系统性审查发现三处未使用特性
+
+**背景**：HeteroData 的引入有两个显式目标：(1) 多模态联合建模（EEG + fMRI）；(2) 为未来 DTI 层留下接口。PR 合并后用户问："异质图是否被充分使用？"
+
+**正确的排查方法**：为每个 `HeteroData` 节点属性画一张「SET（设置方）→ READ（读取方）」的追踪表，发现哪些属性只被 SET 从未被 READ。
+
+**审查结果（通过脚本追踪 SET/READ）**：
+
+| 属性 | 设置方 | 读取方 | 状态 |
+|------|--------|--------|------|
+| `eeg.x` | mapper | encoder | ✅ 正常 |
+| `fmri.x` | mapper | encoder | ✅ 正常 |
+| `eeg.pos` | mapper (from MNE montage) | log summary | ⚠️ 仅用于日志，不用于跨模态边创建 |
+| `eeg.labels` | mapper | **无** | ❌ 死存储 |
+| `fmri.labels` | mapper | **无** | ❌ 死存储（windowed_samples 未复制） |
+| `eeg.sampling_rate` | mapper | log summary | ⚠️ 仅日志 |
+| `fmri.sampling_rate` | mapper | log summary | ⚠️ 仅日志 |
+| `eeg.atlas_mapping` | mapper | **无** | ❌ 死存储 |
+| `fmri.pos` | mapper（仅当显式传入时） | **无** | ❌ build_graphs 从不传 node_positions |
+
+**发现的三处结构性缺陷**：
+
+1. **跨模态边无 edge_attr**：`create_simple_cross_modal_edges()` 只返回 `edge_index`，不返回权重。`SpatialTemporalGraphConv.message()` 当 `edge_attr is None` 时跳过加权步骤，导致所有跨模态消息均等对待——而同模态边（来自 `build_graph_structure`）有基于相关性的权重。不一致。
+
+2. **DTI 接口完全缺失**：用户明确说"为未来 DTI 层留下接口"，但代码中无任何 DTI 相关实现：无 `_load_dti()`、无 `add_dti_structural_edges()`、无 `('fmri','structural','fmri')` 边类型、无 `dti_structural_edges` 配置项。
+
+3. **`extract_windowed_samples()` 丢失 `labels` 属性**：复制 `num_nodes`、`pos`、`sampling_rate`，但不复制 `labels`（通道/ROI 名称），导致窗口样本无法用于可解释性分析。
+
+**修复原则**：
+- DTI 不应设计为独立节点类型（DTI 无时序特征，强行加节点类型会破坏编码器架构）
+- DTI 的正确抽象：在已有的 fMRI 节点上**新增一套结构连通性边** `('fmri','structural','fmri')`
+- 这样编码器可同时利用功能连通性（相关性边）和结构连通性（白质纤维边），体现异质图「多边类型」的核心价值
+- 编码器已有"安全跳过"逻辑（`if edge_type in edge_index_dict`），不存在 DTI 文件时自动降级，无需改模型
+
+**影响文件**：`models/graph_native_mapper.py`、`data/loaders.py`、`main.py`、`configs/default.yaml`
+
+---
+
 **TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 
 **核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡。

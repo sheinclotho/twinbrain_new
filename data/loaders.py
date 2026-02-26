@@ -2,7 +2,7 @@
 数据加载器 - Data Loaders
 =======================
 
-负责加载和预处理EEG和fMRI数据
+负责加载和预处理EEG和fMRI数据，以及可选的DTI结构连通性矩阵。
 """
 
 import re
@@ -98,6 +98,14 @@ class BrainDataLoader:
             if fmri_data is not None:
                 data['fmri'] = fmri_data
         
+        # 加载DTI结构连通性（可选）
+        # 不依赖 modalities 列表：只要找到 DTI 连接矩阵文件就自动加载。
+        # 调用方（build_graphs）在配置了 dti_structural_edges: true 时才将其
+        # 转为图中的 ('fmri','structural','fmri') 边，缺失时安静跳过。
+        dti_data = self._load_dti(subject_id, task)
+        if dti_data is not None:
+            data['dti'] = dti_data
+
         return data
     
     def _load_eeg(
@@ -250,7 +258,70 @@ class BrainDataLoader:
         except Exception as e:
             logger.error(f"加载fMRI失败 {subject_id}: {e}")
             return None
-    
+
+    def _load_dti(
+        self,
+        subject_id: str,
+        task: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """加载预计算的DTI结构连通性矩阵（可选）。
+
+        DTI（弥散张量成像）预处理（纤维跟踪、网络矩阵提取）需要专用工具链
+        （FSL、MRtrix3、Dipy 等），本方法仅加载其输出：与 fMRI 图谱 ROI 对齐的
+        连通性矩阵 ``[N_rois, N_rois]``。
+
+        若找到矩阵，其将在 ``build_graphs()`` 中通过
+        ``mapper.add_dti_structural_edges()`` 转化为异质图中的
+        ``('fmri', 'structural', 'fmri')`` 边，为 fMRI 节点同时提供
+        功能连通性（来自 fMRI 时序相关）和结构连通性（来自 DTI 白质纤维）两套边。
+
+        支持的文件格式（按优先级搜索）：
+        - ``sub-XX_*connmat*.npy`` — NumPy 二进制，存储 [N, N] 矩阵
+        - ``sub-XX_*connectivity*.npy``
+        - ``sub-XX_*connmat*.csv`` — 逗号分隔（无表头）
+        - ``sub-XX_*connmat*.tsv`` — 制表符分隔（无表头）
+        - ``sub-XX_*connectivity*.csv``
+
+        Args:
+            subject_id: 被试ID（如 'sub-01'）
+            task: 任务名（当前未用于 DTI 文件搜索，保留供未来按任务区分 DTI 使用）
+
+        Returns:
+            ``{'connectivity': ndarray [N_rois, N_rois]}`` 或 ``None``（未找到时静默返回）
+        """
+        try:
+            patterns = [
+                f"{subject_id}*connmat*.npy",
+                f"{subject_id}*connectivity*.npy",
+                f"{subject_id}*connmat*.csv",
+                f"{subject_id}*connmat*.tsv",
+                f"{subject_id}*connectivity*.csv",
+            ]
+            for pattern in patterns:
+                files = list(self.data_root.glob(f"**/{pattern}"))
+                if files:
+                    if len(files) > 1:
+                        logger.warning(
+                            f"发现 {len(files)} 个匹配 DTI 矩阵文件 (pattern={pattern})，"
+                            f"将使用第一个: {files[0].name}。"
+                            f"其他文件: {[f.name for f in files[1:]]}。"
+                            f"若需指定文件，请将其重命名为唯一匹配的文件名。"
+                        )
+                    f = files[0]
+                    if f.suffix == '.npy':
+                        mat = np.load(str(f))
+                    else:
+                        delimiter = ',' if f.suffix == '.csv' else '\t'
+                        mat = np.loadtxt(str(f), delimiter=delimiter)
+                    mat = mat.astype(np.float32)
+                    logger.info(f"加载DTI连通性矩阵: {f.name} shape={mat.shape}")
+                    return {'connectivity': mat}
+            # 未找到时静默返回（DTI 是可选模态）
+            return None
+        except Exception as e:
+            logger.warning(f"加载DTI矩阵失败 {subject_id}: {e}")
+            return None
+
     def _discover_tasks(self, subject_id: str) -> List[Optional[str]]:
         """自动发现该被试下所有可用的 BIDS 任务名。
 

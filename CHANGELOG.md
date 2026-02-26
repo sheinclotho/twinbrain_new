@@ -1,10 +1,79 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.17  
+**版本**：V5.18  
 **状态**：生产就绪
 
 ---
+
+## [V5.18] 2026-02-26 — 异质图充分利用：DTI接口 + 跨模态边权重修复
+
+### 🔍 背景：系统性异质图使用审查
+
+通过 SET/READ 追踪脚本全面审查 `HeteroData` 属性的设置方与读取方，发现三处结构性缺陷：
+
+| 缺陷 | 现象 | 影响 |
+|------|------|------|
+| 跨模态边无 edge_attr | `create_simple_cross_modal_edges` 只返回 `edge_index` | 跨模态消息无加权，与同模态边不一致 |
+| DTI接口缺失 | 无任何 DTI 相关代码 | 承诺的"DTI层接口"从未实现 |
+| `labels` 在窗口样本中丢失 | `extract_windowed_samples` 不复制 `labels` | 窗口样本无法用于可解释性分析 |
+
+### 🐛 修复：跨模态边添加 edge_attr
+
+`create_simple_cross_modal_edges()` 返回类型从 `Optional[torch.Tensor]` 改为 `Optional[Tuple[torch.Tensor, torch.Tensor]]`，新增均匀权重 `edge_attr`（值=1.0）：
+
+```python
+# Before: edge_attr=None → message() skips weighting
+return edge_index
+
+# After: uniform weights consistent with intra-modal edges
+return edge_index, edge_attr  # edge_attr all 1.0
+```
+
+`build_graphs()` 调用点同步更新，将 `edge_attr` 存入图对象。
+
+### 🐛 修复：windowed_samples 保留 labels
+
+`extract_windowed_samples()` 复制的静态属性列表加入 `'labels'`：
+```python
+for attr in ('num_nodes', 'pos', 'sampling_rate', 'labels'):
+```
+
+### ✨ 新功能：DTI结构连通性接口
+
+**设计原则**：DTI 不作为独立节点类型（DTI 无时序特征），而是在已有 fMRI 节点上
+新增一套结构连通性边 `('fmri','structural','fmri')`，与功能连通性边 `('fmri','connects','fmri')` 并存。
+编码器通过两套边同时利用结构和功能信息——这是异质图「多边类型」的核心价值。
+
+**新增 API**（`GraphNativeBrainMapper`）：
+```python
+mapper.add_dti_structural_edges(data, connectivity_matrix)
+# → data[('fmri','structural','fmri')].edge_index / .edge_attr
+```
+
+**新增数据加载**（`BrainDataLoader._load_dti()`）：
+- 自动搜索被试目录下的预计算 DTI 矩阵：
+  `sub-XX_*connmat*.npy/.csv/.tsv`、`sub-XX_*connectivity*.npy/.csv`
+- 静默跳过（无文件时不报错）
+
+**配置开关**（`configs/default.yaml`）：
+```yaml
+data:
+  dti_structural_edges: false  # 改为 true 启用（需要预计算矩阵文件）
+```
+
+当 `dti_structural_edges: true` 时，编码器预注册该边类型；当某被试无 DTI 文件时，编码器自动降级（`if edge_type in edge_index_dict` 保护），无需修改模型。
+
+### 当前异质图边类型全集
+
+| 边类型 | 来源 | 条件 |
+|--------|------|------|
+| `('eeg','connects','eeg')` | EEG 时序相关矩阵 | 始终 |
+| `('fmri','connects','fmri')` | fMRI 时序相关矩阵 | 始终 |
+| `('eeg','projects_to','fmri')` | 随机连接 / 距离加权（未来） | EEG+fMRI 同时存在 |
+| `('fmri','structural','fmri')` | DTI 白质纤维束矩阵 | `dti_structural_edges: true` + 文件存在 |
+
+**影响文件**：`models/graph_native_mapper.py`、`data/loaders.py`、`main.py`、`configs/default.yaml`
 
 ## [V5.17] 2026-02-26 — 编码器前向传播 KeyError 根治
 

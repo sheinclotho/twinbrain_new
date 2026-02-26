@@ -263,8 +263,15 @@ def extract_windowed_samples(
                 x_slice = x_full[:, t_start_nt:t_end_nt, :]
 
             win[nt].x = x_slice
-            # 复制静态属性（节点数、空间坐标、采样率）
-            for attr in ('num_nodes', 'pos', 'sampling_rate'):
+            # 复制「窗口静态」属性：在同一 run 的所有窗口间不随时间变化。
+            # - num_nodes: 节点数，用于 PyG 内部图构建
+            # - pos: 空间坐标（EEG 电极坐标 / fMRI ROI 质心），用于可视化和距离加权边
+            # - sampling_rate: 采样率，用于日志摘要（不随窗口变化）
+            # - labels: ROI/通道名称，用于可解释性分析（例如 visualization.py）
+            # 有意不复制的属性（非窗口静态或当前未读取）：
+            # - atlas_mapping: EEG→atlas ROI 映射，SET 后从未被 READ，暂不传播
+            # - temporal_length: 全序列长度，窗口中应使用 x.shape[1] 动态获取
+            for attr in ('num_nodes', 'pos', 'sampling_rate', 'labels'):
                 if hasattr(full_graph[nt], attr):
                     setattr(win[nt], attr, getattr(full_graph[nt], attr))
 
@@ -546,12 +553,28 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 
                 # 跨模态边：EEG → fMRI
                 # 设计理念：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。
-                # create_simple_cross_modal_edges 会验证 N_eeg < N_fmri 并在违反时给出警告。
+                # create_simple_cross_modal_edges 返回 (edge_index, edge_attr)，
+                # 其中 edge_attr 为均匀权重（1.0），保持与同模态边一致的加权语义。
                 if 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
-                    cross_edges = mapper.create_simple_cross_modal_edges(built_graph)
-                    if cross_edges is not None:
+                    cross_result = mapper.create_simple_cross_modal_edges(built_graph)
+                    if cross_result is not None:
+                        cross_edges, cross_weights = cross_result
                         built_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
-            
+                        built_graph['eeg', 'projects_to', 'fmri'].edge_attr = cross_weights
+
+            # DTI 结构连通性边（可选）
+            # 当被试有预计算 DTI 连通性矩阵且配置启用时，
+            # 在 fMRI 节点上新增 ('fmri','structural','fmri') 边类型。
+            # 此举使编码器能同时利用 fMRI 功能连通性（相关性边）
+            # 和 DTI 结构连通性（白质纤维边），体现异质图"多边类型"的核心价值。
+            dti_cfg = config['data'].get('dti_structural_edges', False)
+            dti_subject = subject_data.get('dti')
+            if dti_cfg and dti_subject is not None and 'fmri' in built_graph.node_types:
+                mapper.add_dti_structural_edges(
+                    built_graph,
+                    dti_subject['connectivity'],
+                )
+
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
             if cache_dir is not None and cache_key is not None:
                 try:
@@ -605,10 +628,10 @@ def create_model(config: dict, logger: logging.Logger):
     # 确定节点和边类型
     node_types = config['data']['modalities']
     edge_types = []
-    
+
     for modality in node_types:
         edge_types.append((modality, 'connects', modality))
-    
+
     # 跨模态边：设计理念是 EEG → fMRI
     # EEG 电极（通常 32–64 通道）节点数 < fMRI ROI（如 Schaefer200 的 200 个），
     # 因此由 EEG 向 fMRI 投射消息符合"少节点向多节点传播"的图卷积语义。
@@ -618,7 +641,16 @@ def create_model(config: dict, logger: logging.Logger):
     elif len(node_types) > 1:
         # 非 EEG/fMRI 模态组合的通用回退
         edge_types.append((node_types[0], 'projects_to', node_types[1]))
-    
+
+    # DTI 结构连通性边（可选）
+    # 当 dti_structural_edges: true 时，编码器预先注册 ('fmri','structural','fmri')
+    # 边类型。若某个图实际不含该边（DTI 文件缺失），编码器会安静跳过
+    # （GraphNativeEncoder.forward 中 `if edge_type in edge_index_dict` 保护）。
+    # 这是异质图扩展性的核心体现：模型知道该边类型，但不强依赖其存在。
+    if config['data'].get('dti_structural_edges', False) and 'fmri' in node_types:
+        edge_types.append(('fmri', 'structural', 'fmri'))
+        logger.info("DTI结构连通性边已启用: ('fmri','structural','fmri') 已加入边类型列表")
+
     # 输入通道
     in_channels_dict = {modality: 1 for modality in node_types}
     
