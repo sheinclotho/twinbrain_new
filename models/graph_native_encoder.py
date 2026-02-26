@@ -569,13 +569,20 @@ class GraphNativeEncoder(nn.Module):
                 for _ in range(num_layers)
             ])
     
-    def forward(self, data: HeteroData) -> HeteroData:
+    def forward(self, data: HeteroData, subject_embed: Optional[torch.Tensor] = None) -> HeteroData:
         """
         Encode graph with temporal features.
         
         Args:
             data: HeteroData with temporal node features
                   Expected: data[node_type].x = [N, T, C_in]
+            subject_embed: Optional per-subject embedding [H] (AGENTS.md §九 Gap 2).
+                When provided, this [H] vector is added to all node feature projections
+                x_proj[N, T, H] after input projection, before the ST-GCN layers.
+                This gives each subject a unique latent offset that shifts all nodes
+                in the same direction in H-space, capturing systematic individual
+                differences (e.g., differences in baseline activity, cognitive style).
+                Broadcast: [H] → [1, 1, H] → [N, T, H].
                   
         Returns:
             Encoded HeteroData with features [N, T, H]
@@ -589,6 +596,15 @@ class GraphNativeEncoder(nn.Module):
                 
                 # Project each timestep
                 x_proj = self.input_proj[node_type](x)  # [N, T, H]
+
+                # Subject-specific offset (AGENTS.md §九 Gap 2):
+                # Add learnable per-subject embedding to shift all node features.
+                # Broadcast [H] → [1, 1, H] → [N, T, H].  This is applied after
+                # projection (not on raw signal) so that the offset lives in the
+                # same H-dimensional latent space as the model representations.
+                if subject_embed is not None:
+                    x_proj = x_proj + subject_embed.view(1, 1, -1)
+
                 x_dict[node_type] = x_proj
         
         # 2. Stack of ST-GCN layers

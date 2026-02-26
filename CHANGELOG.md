@@ -1,10 +1,54 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.18  
+**版本**：V5.19  
 **状态**：生产就绪
 
 ---
+
+## [V5.19] 2026-02-26 — 第二轮系统审查：cache key修复 + 个性化被试嵌入（Gap 2实现）
+
+### 🔍 审查方法
+对照 AGENTS.md 中每一个功能声明，逐项追踪从 `main()` 入口到 `forward()` 的完整调用链，主动提问"前提条件是否已满足？"
+
+### 🐛 修复：cache key 遗漏 dti_structural_edges
+
+`_graph_cache_key()` 的哈希计算不包含 `dti_structural_edges`：切换该选项后旧缓存仍被命中，DTI 结构边的变更形同虚设。
+
+```python
+# After: hash changes whenever DTI setting changes
+'dti_structural_edges': config['data'].get('dti_structural_edges', False),
+```
+
+### ✨ 新功能：被试特异性嵌入（AGENTS.md §九 Gap 2，全链路首次完整实现）
+
+**目标**：让每个被试学习一个唯一的 `[H]` 潜空间偏移量，无需独立模型即可实现个性化数字孪生。
+
+**全链路变更**：
+
+| 组件 | 变更 |
+|------|------|
+| `build_graphs()` | 预扫描 `subject_to_idx`；`built_graph.subject_idx = tensor(idx)` |
+| `extract_windowed_samples()` | 将 `subject_idx` 从完整 run 图复制到所有窗口样本 |
+| `build_graphs()` 返回值 | `(graphs, mapper, subject_to_idx)` 三元组 |
+| `create_model(num_subjects=N)` | 新参数，传递给 `GraphNativeBrainModel` |
+| `GraphNativeBrainModel.__init__` | `num_subjects: int = 0` → `nn.Embedding(N, H)`, `N(0,0.02)` init |
+| `GraphNativeBrainModel.forward` | 读 `data.subject_idx` → `[H]` embed → 传给 encoder；越界警告 |
+| `GraphNativeEncoder.forward` | `subject_embed: Optional[Tensor]=None` → 投影后 broadcast 加到 `[N,T,H]` |
+
+**个性化推理工作流**（完整调用链）：
+```
+data.subject_idx (built_graph/window) 
+→ model.subject_embed(idx) → [H]
+→ encoder.forward(subject_embed=[H])
+→ x_proj += embed.view(1,1,-1)  # broadcast to [N,T,H]
+→ ST-GCN 层处理个性化特征
+→ 损失正常反向传播
+```
+
+**兼容性**：`num_subjects=0`（默认）完全禁用，与 V5.18 行为一致。
+
+**影响文件**：`main.py`、`models/graph_native_system.py`、`models/graph_native_encoder.py`
 
 ## [V5.18] 2026-02-26 — 异质图充分利用：DTI接口 + 跨模态边权重修复
 

@@ -389,11 +389,51 @@ conv = stgcn['__'.join(edge_type)]  # always works
 
 ---
 
+### [2026-02-26] 三个"声明了但调用链未闭合"的功能（第二轮系统审查）
+
+**背景**：第一轮修复了异质图边的静态问题（DTI 接口、跨模态 edge_attr、labels 丢失）。第二轮对照 AGENTS.md 中每一个功能声明做主动追踪，发现三处新的执行链断点。
+
+**思维误区**：认为"记录在 AGENTS.md 里"等同于"已经实现"。文档记录了意图，但代码执行链才是真相。**每次阅读 AGENTS.md 中的 Gap，都要追问：calling chain 是否从头到尾闭合？**
+
+#### Gap 1：`dti_structural_edges` 不在 cache key 中
+
+**症状**：将 `dti_structural_edges: false` 改为 `true` 后，缓存命中率保持不变，旧图继续被加载——没有 DTI 边。对 DTI 的修改形同虚设。
+
+**根因**：`_graph_cache_key()` 的 `relevant` 字典不含 `dti_structural_edges`。图的边结构发生了变化，但 hash 没变。
+
+**修复**：在 `relevant` 中加入 `'dti_structural_edges': config['data'].get('dti_structural_edges', False)`。
+
+#### Gap 2：`subject_idx` 从未写入图数据（AGENTS.md §九 Gap 2 的必要前提）
+
+**症状**：所有图的 `data.subject_idx` 不存在，`GraphNativeBrainModel.forward()` 中 `hasattr(data, 'subject_idx')` 永远为 False，subject embedding 永远不被激活，即使 `num_subjects > 0`。
+
+**根因**：`build_graphs()` 知道 `subject_id`（字符串），但从未将它写入 `built_graph`。Gap 2 的前提条件（"data 中存储 subject_idx"）从未被满足。
+
+**修复**：
+1. `build_graphs()` 在进入主循环前，扫描所有 `subject_id` 建立 `subject_to_idx` 字典（全局唯一、确定性）；缺失 subject_id 用 `f'unknown_{j}'` 而非共用 `'unknown'`（避免合并无关被试）。
+2. 每次 `built_graph` 构建完成后，写入 `built_graph.subject_idx = torch.tensor(idx, long)`。
+3. `build_graphs()` 返回 `(graphs, mapper, subject_to_idx)` 三元组。
+4. `extract_windowed_samples()` 将图级属性 `subject_idx` 复制到所有窗口样本。
+5. `main()` 解包 `subject_to_idx`，传入 `create_model(num_subjects=len(subject_to_idx))`。
+
+#### Gap 3：Gap 2 主体（subject embedding）全链路实现
+
+**修复**：
+1. `GraphNativeBrainModel.__init__()` 加 `num_subjects: int = 0` 参数，`> 0` 时创建 `nn.Embedding(num_subjects, H)`，`N(0, 0.02)` 初始化（小噪声，不干扰共享预训练信号）。
+2. `forward()` 读取 `data.subject_idx`，查询 `[H]` 嵌入，传给 `self.encoder(data, subject_embed=embed)`；索引越界时发出警告（提示清除缓存）而非静默截断。
+3. `GraphNativeEncoder.forward(subject_embed=None)` 在输入投影后、ST-GCN 层前，将 `[H]` broadcast 为 `[1,1,H]` 加到所有节点特征 `[N, T, H]` 上。
+
+**正确思路**：设计意图文档（AGENTS.md 九）不等于调用链闭合。每次读到"未实现"，都必须问：*这个功能的前提条件（数据结构变更、参数传递）是否也已实现？* 否则即使实现了主体，也因前提断裂而无法激活。
+
+**影响文件**：`main.py`、`models/graph_native_system.py`、`models/graph_native_encoder.py`
+
+---
+
 **TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 
-**核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡。
+**核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡，被试特异性嵌入（个性化数字孪生）。
 
-**当前状态**：V5，生产就绪（MemoryError 已修复）。详见 `SPEC.md`。
+**当前状态**：V5.19，生产就绪。详见 `SPEC.md`。
 
 ---
 

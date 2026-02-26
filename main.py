@@ -141,6 +141,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         'max_seq_len': None if w_enabled else config['training'].get('max_seq_len'),
         'modalities': sorted(config['data'].get('modalities', [])),
         'windowed': w_enabled,
+        # DTI 开关影响图结构（是否含 ('fmri','structural','fmri') 边）；
+        # 修改此选项必须使旧缓存失效，否则切换 DTI 后仍加载无 DTI 边的旧图。
+        'dti_structural_edges': config['data'].get('dti_structural_edges', False),
     }
     params_hash = hashlib.md5(
         json.dumps(relevant, sort_keys=True).encode()
@@ -276,6 +279,15 @@ def extract_windowed_samples(
                     setattr(win[nt], attr, getattr(full_graph[nt], attr))
 
         windows.append(win)
+
+    # 复制图级属性（不属于任何节点类型，但对整个样本共享的元数据）
+    # 当前图级属性：
+    #   subject_idx: 被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
+    # 未来可扩展：task_id（任务类型编码）、session_id（纵向会话索引，支持跨会话预测）
+    for attr in ('subject_idx',):
+        if hasattr(full_graph, attr):
+            for win in windows:
+                setattr(win, attr, getattr(full_graph, attr))
 
     return windows
 
@@ -432,6 +444,17 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
         if max_seq_len is not None:
             logger.info(f"序列截断已启用: max_seq_len={max_seq_len} (防止 CUDA OOM)")
 
+    # 被试 ID → 整数索引映射（用于 subject embedding，AGENTS.md §九 Gap 2）
+    # 在构建图之前先扫描所有被试 ID，保证索引在整个数据集中全局唯一且确定性。
+    # 若 subject_id 缺失，用唯一占位符 f'unknown_{i}' 而非共用 'unknown'，
+    # 避免将多个匿名被试混合到同一个嵌入向量中（违反个性化设计意图）。
+    all_subject_ids = sorted(set(
+        d.get('subject_id') or f'unknown_{j}'
+        for j, d in enumerate(all_data)
+    ))
+    subject_to_idx = {sid: i for i, sid in enumerate(all_subject_ids)}
+    logger.info(f"被试索引映射已建立: {len(subject_to_idx)} 个被试")
+
     graphs: List[HeteroData] = []
     n_cached = 0
     n_windows_total = 0
@@ -575,6 +598,21 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                     dti_subject['connectivity'],
                 )
 
+            # 被试索引（AGENTS.md §九 Gap 2：个性化 subject embedding）
+            # graph-level 属性：每个图（全序列图和窗口样本）均携带，
+            # 供 GraphNativeBrainModel.forward() 查询 subject embedding。
+            # subject_id 必须在 subject_to_idx 中（上方预扫描保证）；
+            # 若 KeyError 发生，说明 subject_id 在预扫描和此处使用之间不一致（逻辑 bug）。
+            if subject_id not in subject_to_idx:
+                logger.warning(
+                    f"subject_id='{subject_id}' not found in subject_to_idx. "
+                    f"This indicates a logic bug — subject_id changed between pre-scan and use. "
+                    f"Falling back to index 0; this subject's embedding will be shared with another."
+                )
+            built_graph.subject_idx = torch.tensor(
+                subject_to_idx.get(subject_id, 0), dtype=torch.long
+            )
+
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
             if cache_dir is not None and cache_key is not None:
                 try:
@@ -616,11 +654,20 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
     else:
         logger.info(f"成功构建 {len(graphs)} 个图")
 
-    return graphs, mapper
+    return graphs, mapper, subject_to_idx
 
 
-def create_model(config: dict, logger: logging.Logger):
-    """创建模型"""
+def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
+    """创建模型
+
+    Args:
+        config: 配置字典
+        logger: 日志记录器
+        num_subjects: 数据集中的总被试数（由 build_graphs 返回的 subject_to_idx 推导）。
+            > 0 时在模型中创建 nn.Embedding(num_subjects, hidden_channels) 实现
+            个性化被试嵌入（AGENTS.md §九 Gap 2）。
+            0 = 禁用（默认，兼容旧行为）。
+    """
     logger.info("=" * 60)
     logger.info("步骤 3/4: 创建模型")
     logger.info("=" * 60)
@@ -670,8 +717,14 @@ def create_model(config: dict, logger: logging.Logger):
         predictor_config=config.get('v5_optimization', {}).get('advanced_prediction'),
         use_dynamic_graph=config['model'].get('use_dynamic_graph', False),
         k_dynamic_neighbors=config['model'].get('k_dynamic_neighbors', 10),
+        num_subjects=num_subjects,
     )
-    
+
+    if num_subjects > 0:
+        logger.info(
+            f"被试特异性嵌入已启用: {num_subjects} 个被试 × "
+            f"{config['model']['hidden_channels']} 维 (AGENTS.md §九 Gap 2)"
+        )
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     
     return model
@@ -1032,12 +1085,13 @@ def main():
     try:
         # 步骤1: 准备数据
         all_data = prepare_data(config, logger)
-        
+
         # 步骤2: 构建图
-        graphs, mapper = build_graphs(all_data, config, logger)
-        
+        # subject_to_idx: {subject_id_str → int_idx}，传给 create_model 以创建正确大小的 Embedding
+        graphs, mapper, subject_to_idx = build_graphs(all_data, config, logger)
+
         # 步骤3: 创建模型
-        model = create_model(config, logger)
+        model = create_model(config, logger, num_subjects=len(subject_to_idx))
         
         # 启动前打印一次人类可读的配置核对表，方便快速验证参数
         log_training_summary(config, graphs, model, logger)
