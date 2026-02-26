@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
-from torch_geometric.nn import MessagePassing, HeteroConv, GCNConv, GATConv
+from torch_geometric.nn import MessagePassing, GCNConv, GATConv
 from torch_geometric.data import HeteroData
 from typing import Dict, Optional, Tuple, List
 import math
@@ -511,13 +511,15 @@ class GraphNativeEncoder(nn.Module):
         })
         
         # Stack of ST-GCN layers (heterogeneous)
+        # Use plain nn.ModuleDict (string keys: '__'.join(edge_type)) instead of
+        # HeteroConv to avoid PyG's internal to_internal_key() transformations,
+        # which can produce key mismatches when accessed with '__'.join(edge_type).
+        # HeteroConv.forward() is never called here; we iterate edges manually.
         self.stgcn_layers = nn.ModuleList()
         for _ in range(num_layers):
-            # Create heterogeneous convolution
             conv_dict = {}
             for edge_type in edge_types:
-                src, rel, dst = edge_type
-                conv_dict[edge_type] = SpatialTemporalGraphConv(
+                conv_dict['__'.join(edge_type)] = SpatialTemporalGraphConv(
                     in_channels=hidden_channels,
                     out_channels=hidden_channels,
                     temporal_kernel_size=temporal_kernel_size,
@@ -526,8 +528,7 @@ class GraphNativeEncoder(nn.Module):
                     dropout=dropout,
                 )
             
-            hetero_conv = HeteroConv(conv_dict, aggr='sum')
-            self.stgcn_layers.append(hetero_conv)
+            self.stgcn_layers.append(nn.ModuleDict(conv_dict))
         
         # Layer normalization per node type
         self.layer_norms = nn.ModuleList([
@@ -641,10 +642,9 @@ class GraphNativeEncoder(nn.Module):
                             # PyG defaults to (N_src, N_src) and cross-modal
                             # aggregation silently produces [N_src, H] instead
                             # of [N_dst, H], corrupting fMRI node features.
-                            # HeteroConv stores modules in nn.ModuleDict with
-                            # string keys: '__'.join((src, rel, dst)).
-                            # Accessing with a tuple raises KeyError.
-                            conv = stgcn.convs['__'.join(edge_type)]
+                            # stgcn is a plain nn.ModuleDict keyed by
+                            # '__'.join(edge_type) — direct string lookup.
+                            conv = stgcn['__'.join(edge_type)]
                             N_src = x_src.shape[0]
                             N_dst = x.shape[0]
                             msg = conv(x_src, ei, ea, size=(N_src, N_dst))
