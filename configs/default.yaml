@@ -20,6 +20,36 @@ data:
   # task: (已弃用，请改用 tasks) 单任务名称；若 tasks 未设置则作为回退。
   task: null
 
+  # EEG 任务 → fMRI 任务 显式映射（1:N 对齐场景）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 适用场景：同一 fMRI 扫描对应多个 EEG 条件（典型例子见下方）。
+  #
+  # ★ ON/OFF 实验范式自动检测（无需配置此项）：
+  #   若 EEG 任务名以 "ON" 或 "OFF" 结尾（如 CBON、CBOFF、ECON、ECOFF），
+  #   系统会先尝试直接匹配同名 fMRI，若未找到则自动剥离后缀重试：
+  #     CBON → CB, CBOFF → CB, ECON → EC, ECOFF → EC
+  #     GRADON → GRAD, GRADOFF → GRAD, EOON → EO, EOOFF → EO
+  #   无需任何配置，直接将此项保持 null 即可。
+  #
+  # 仅在以下情况才需要显式配置此项：
+  #   • ON/OFF 后缀的基础名与 fMRI 任务名不一致（自动剥离的结果不正确）
+  #   • 使用其他命名约定（如 GRADON→GRAD_run-2 这类非自动可推断的映射）
+  #
+  # 配置后的行为变化：
+  #   1. 加载 fMRI 时优先按映射后的任务名查找，而非 EEG 任务名（显式 > 自动检测 > 回退）。
+  #   2. 自动任务发现（tasks: null）仅扫描 EEG 文件，避免 fMRI-only 任务
+  #      被当作独立 run 加载（无 EEG 配对则产生无跨模态边的单模态图）。
+  #
+  # 示例（手动覆盖自动检测结果，强制 CBON/CBOFF → CB）：
+  #   fmri_task_mapping:
+  #     CBON: CB
+  #     CBOFF: CB
+  #     ECON: EC
+  #     ECOFF: EC
+  #
+  # 1:1 标准场景（EEG 任务名 == fMRI 任务名，如 rest_eeg + rest_bold）：保持 null 即可。
+  fmri_task_mapping: null
+
   # 最大被试数 (用于测试, 0 或 null 表示处理所有)
   max_subjects: 0
   
@@ -27,7 +57,7 @@ data:
   # Schaefer200: 200 ROI，性价比最高；400 ROI 精度更高但内存翻倍
   atlas:
     name: "schaefer200"
-    file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
+    file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.nii"
     label_file: "atlases/schaefer200_mask_ready.json"
 
   # 图缓存配置

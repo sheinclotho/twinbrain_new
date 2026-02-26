@@ -67,10 +67,20 @@ def prepare_data(config: dict, logger: logging.Logger):
     logger.info("步骤 1/4: 加载数据")
     logger.info("=" * 60)
     
+    # fMRI 任务映射（用于 1:N EEG→fMRI 场景）
+    fmri_task_mapping = config['data'].get('fmri_task_mapping') or {}
+    if fmri_task_mapping:
+        logger.info(f"fMRI 任务映射: {fmri_task_mapping}")
+        logger.info(
+            "  说明：配置了映射后，任务发现仅扫描 EEG 文件，"
+            "fMRI 文件由映射关系确定（避免 fMRI-only 任务产生无 EEG 的单模态图）。"
+        )
+
     # 初始化数据加载器
     data_loader = BrainDataLoader(
         data_root=config['data']['root_dir'],
         modalities=config['data']['modalities'],
+        fmri_task_mapping=fmri_task_mapping if fmri_task_mapping else None,
     )
     
     # 解析任务列表配置

@@ -1,8 +1,100 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-25  
-**版本**：V5.14  
+**最后更新**：2026-02-26  
+**版本**：V5.16  
 **状态**：生产就绪
+
+---
+
+## [V5.16] 2026-02-26 — Atlas 路径修正 + ON/OFF 任务自动对齐
+
+### 🔧 修复：Atlas 文件名错误
+
+`configs/default.yaml` 中 atlas 文件路径修正：
+
+```diff
+- file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz"
++ file: "atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.nii"
+```
+
+- 分辨率：2mm → 1mm（与用户实际文件一致）
+- 文件格式：.nii.gz（压缩）→ .nii（非压缩，与实际文件后缀一致）
+
+### ✨ 新功能：ON/OFF 实验范式 EEG→fMRI 自动对齐
+
+**背景**：用户数据命名规律——
+- EEG：`task-CBON`, `task-CBOFF`, `task-ECON`, `task-ECOFF`, `task-GRADON`, `task-GRADOFF` ...
+- fMRI：`task-CB`, `task-EC`, `task-GRAD` ...
+
+旧代码需要手动配置 `fmri_task_mapping`，或触发静默回退警告。
+
+**新代码自动检测**（无需任何配置）：
+```
+_load_fmri() 查找优先级：
+  1. 显式 fmri_task_mapping（若配置）
+  2. 直接同名匹配（task-CBON fMRI）
+  2.5 ON/OFF 后缀自动剥离 ★新增
+       CBON → CB, CBOFF → CB
+       ECON → EC, ECOFF → EC
+       GRADON → GRAD, GRADOFF → GRAD
+       EOON → EO, EOOFF → EO
+  3. 任意 bold 文件回退（最后手段）
+```
+
+### 🧹 优化：`_discover_tasks()` 彻底避免幽灵 fMRI-only 任务
+
+旧代码：当无 `fmri_task_mapping` 时同时扫描 EEG + fMRI 文件名 → 发现 CB/EC/EO/GRAD 作为独立任务 → 生成无 EEG 配对的单模态图（训练中无用）。
+
+新代码：**只要 EEG 在模态列表中，就只扫描 EEG 文件名**（不再依赖是否配置了 mapping）。fMRI-only 场景仍正常使用 fMRI 文件名。
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| EEG+fMRI, tasks: null | 发现 CB/EC/EO/GRAD/CBON/CBOFF/... (8+ tasks) | 仅发现 CBON/CBOFF/ECON/ECOFF/... (EEG only) |
+| CBON 加载 fMRI | 静默回退 + WARNING | ON/OFF 自动检测 → CB fMRI (DEBUG) |
+| fMRI-only | 同旧版 | 同旧版 (elif 分支) |
+
+---
+
+## [V5.15] 2026-02-25 — 显式 fMRI-EEG 任务对齐（1:N 场景支持）
+
+### 🔍 问题分析
+
+用户数据中存在「1 fMRI 对应 2 个 EEG 条件」的场景（GRADON / GRADOFF 条件各对应一个 EEG 录音，但只有一个 fMRI run，文件名含 `task-CB`）。
+
+**旧代码的三个缺陷**：
+1. `_discover_tasks()` 同时扫描 EEG 和 fMRI 文件名，发现了 `CB` 任务——但 `task-CB` 没有对应 EEG，加载后产生无跨模态边的单模态 fMRI 图（对联合训练毫无价值，纯浪费预处理时间）。
+2. GRADON/GRADOFF 加载 fMRI 时依赖静默回退（"未找到 task-GRADON fMRI，回退到任意 bold 文件"），对应关系完全不透明，靠「碰巧文件名」成立。
+3. 无任何配置项让用户显式声明哪个 EEG 任务对应哪个 fMRI——1:N 对齐是「设计缺失」而非「设计完成」。
+
+### ✨ 新增功能：`fmri_task_mapping` 显式对齐
+
+**`configs/default.yaml`**（新增配置项）：
+```yaml
+fmri_task_mapping: null  # 默认 null = 旧行为（向后兼容）
+
+# 示例（GRADON 和 GRADOFF 均对应 task-CB 的 fMRI）：
+# fmri_task_mapping:
+#   GRADON: CB
+#   GRADOFF: CB
+```
+
+**`data/loaders.py`**：
+- `BrainDataLoader.__init__` 新增 `fmri_task_mapping` 参数
+- `_load_fmri()` 查找顺序：① 映射后的 fMRI 任务名 → ② EEG 同名 fMRI → ③ 任意 bold（回退）
+- `_discover_tasks()` 配置映射后只扫描 EEG 文件（避免 fMRI-only 幽灵任务）
+
+**`main.py`**：
+- `prepare_data()` 读取 `config['data']['fmri_task_mapping']` 并传入 `BrainDataLoader`
+
+### 📊 行为变化对比
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| 自动发现任务（tasks: null） | 发现 GRADON, GRADOFF, CB（3个 run） | 仅发现 GRADON, GRADOFF（2个 run，配置映射后） |
+| task-CB run | 加载为单模态 fMRI 图 | **不加载**（无 EEG 配对） |
+| GRADON 的 fMRI | 静默回退+警告 | 显式映射命中，无警告 |
+| GRADOFF 的 fMRI | 静默回退+警告 | 显式映射命中，无警告 |
+| 未配置 mapping | — | 行为与旧版完全相同 |
 
 ---
 
