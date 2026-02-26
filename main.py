@@ -352,8 +352,18 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
 
         Why this matters: without parcellation fMRI is collapsed to a single node
         ([1, T]), making graph convolution meaningless.  With the Schaefer200 atlas
-        we get 200 anatomically meaningful nodes — the actual design intent.
+        we get ~190-200 anatomically meaningful nodes — the actual design intent.
+        The exact count depends on how many atlas parcels overlap with the
+        subject's fMRI brain mask after resampling; see logging below.
         """
+        # Infer the expected number of parcels from the atlas file name.
+        # Pattern: "schaeferNNN" → NNN parcels; "aal116" → 116; etc.
+        # Falls back to None (unknown) for non-standard names.
+        import re as _re
+        _m = _re.search(r'_?(\d{2,4})_?[Pp]arcels', atlas_path.name)
+        if _m is None:
+            _m = _re.search(r'[Ss]chaefer(\d+)', atlas_path.name)
+        expected_n_rois: Optional[int] = int(_m.group(1)) if _m else None
         try:
             try:
                 from nilearn.maskers import NiftiLabelsMasker  # nilearn >= 0.10
@@ -365,6 +375,27 @@ def build_graphs(all_data, config: dict, logger: logging.Logger):
                 detrend=True,
             )
             roi_ts = masker.fit_transform(fmri_img)  # [T, N_rois]
+            n_rois = roi_ts.shape[1]
+            # NiftiLabelsMasker excludes atlas parcels that have no valid voxels
+            # in the fMRI brain mask after resampling the atlas to the EPI
+            # resolution.  For Schaefer200 it is normal to get 190-199 ROIs:
+            # the excluded parcels are typically temporal-pole and orbitofrontal
+            # regions prone to EPI signal dropout, or very small parcels that
+            # lose all voxels when resampled from 1 mm to ~3 mm.
+            # This is expected behaviour — the actual ROI count varies by subject
+            # and acquisition and does NOT indicate a problem.
+            if expected_n_rois is not None and n_rois < expected_n_rois:
+                logger.info(
+                    f"Atlas parcellation ({atlas_path.name}): "
+                    f"{n_rois}/{expected_n_rois} ROIs extracted. "
+                    f"({expected_n_rois - n_rois} parcels excluded — no overlap with "
+                    f"subject brain mask after resampling; expected for EPI data.)"
+                )
+            else:
+                logger.info(
+                    f"Atlas parcellation ({atlas_path.name}): {n_rois} ROIs extracted."
+                    + (" (all parcels have valid voxel coverage)" if expected_n_rois and n_rois == expected_n_rois else "")
+                )
             if roi_ts.shape[0] < _MIN_VOLUMES:
                 logger.warning(
                     f"Atlas parcellation produced only {roi_ts.shape[0]} timepoints; skipping."

@@ -1,12 +1,65 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-26  
-**版本**：V5.20  
+**版本**：V5.21  
 **状态**：生产就绪
 
 ---
 
-## [V5.20] 2026-02-26 — 第三轮系统审查：缓存命中路径 subject_idx 补写 + 启动日志个性化状态 + SPEC.md 更新
+## [V5.21] 2026-02-26 — 训练速度优化：ST-GCN 时间循环向量化 + 注意力归一化修复
+
+### 🔍 问题背景
+
+用户反馈训练速度极慢，并询问为什么 Schaefer200 图谱返回 190 个 ROI（而非 200）。
+
+### 📊 问题 1：fMRI ROI 数量 190 ≠ 200（正常行为，添加说明）
+
+**解答**：190 ROI 完全正常。`NiftiLabelsMasker(resampling_target='data'，默认)` 将 1 mm 图谱重采样到 EPI 分辨率（~3 mm）；颞极、眶额皮质等区域因磁化率伪影或 FOV 限制，在重采样后无有效体素，被 nilearn 自动排除。
+
+- 之前"硬编码 200 能跑"实际上是因为图谱文件未找到，系统回退到单节点模式（N_fmri=1），atlas 分区**从未生效**
+- 190 ROI 意味着 atlas 已真正生效，GNN 有完整空间结构
+
+**修复**：`_parcellate_fmri_with_atlas()` 新增明确的日志说明，解释排除的 ROI 数量及其原因。
+
+### 🐛 修复：SpatialTemporalGraphConv 注意力归一化错误（GNN 消息传递实际失效）
+
+**根因**：`message()` 中：
+```python
+alpha = torch.softmax(alpha, dim=0)  # 注释说"per target node"，实际是全局 softmax
+```
+`dim=0` 对 `[E, 1]` 张量做全局归一化，E≈4000 时每条边权重 ≈ 1/4000 = 0.00025。所有邻居消息乘以极小权重后几乎消失，GNN 退化为仅有自连接的逐节点 MLP，完全没有在做有意义的消息传递。
+
+**修复**：替换为 PyG 的 scatter-softmax：
+```python
+from torch_geometric.utils import softmax as pyg_softmax
+alpha = pyg_softmax(alpha, index, num_nodes=size_i)
+```
+在向量化时间传播中，`index` 包含虚拟节点索引 `t*N_dst + m`，softmax 在每个 `(t, m)` 组内归一化 — 等价于每节点每时间步归一化，语义完全正确。
+
+### ✨ 优化：SpatialTemporalGraphConv 时间循环向量化（主要性能改进）
+
+**根因**：原有 Python `for t in range(T)` 循环（T=300），每次迭代调用一次 `propagate()`：
+- T=300 × 4 层 × 3 种边类型 = **3,600 次 CUDA 内核启动**（每次仅处理 E≈4000 条边）
+- 每次小任务远小于 GPU 并行能力，大量时间花在 Python 调度和内核启动延迟上
+- GPU 利用率极低
+
+**方案**："时序虚拟节点"技巧（Temporal Virtual-Node Trick）：
+1. 将 edge_index 扩展 T 倍：源节点 `(n, t) → t × N_src + n`，目标节点 `(m, t) → t × N_dst + m`
+2. 单次 `propagate()` 处理全部 T×E 条消息 → 一次大内核，GPU 完全饱和
+3. 输出 `[N_dst×T, H]` → reshape 为 `[N_dst, T, H]`（注意 view(T, N_dst, H).permute(1,0,2) 的正确顺序）
+
+**性能提升（估算）**：
+- 内核启动次数：3,600 → 12（4 层 × 3 边类型，每次一个大内核）
+- 对 ST-GCN 组件：理论 100-300× 加速
+- 端到端（含预测头等其他组件）：预估 5-20× 加速
+
+**内存**：总内存使用相同（T×E×H 浮点数），梯度检查点对单次大 propagate 同样有效。
+
+**影响文件**：`models/graph_native_encoder.py`、`main.py`、`AGENTS.md`、`CHANGELOG.md`
+
+---
+
+
 
 ### 🔍 审查方法
 遍历所有代码路径，重点问："每个 `continue`/`break` 之前，有没有遗漏的必要副作用？" + "用户怎么知道这个功能是否真的在运行？"

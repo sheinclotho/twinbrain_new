@@ -468,7 +468,86 @@ continue  ← 直接跳过 built_graph.subject_idx = torch.tensor(...)
 
 ---
 
-**TwinBrain**：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
+### [2026-02-26] Schaefer200 返回 190 ROI — 这是正常行为，不是 bug
+
+**用户疑问**："为什么调用 Schaefer200 时 fMRI 节点数是 190？之前硬编码 200 也能跑，是漏了还是？"
+
+**答案**：190 ROI 是完全正常且可预期的结果，不是 bug。
+
+**根因**：`NiftiLabelsMasker(resampling_target='data'，默认值)` 将 1mm Schaefer200 图谱重采样到 EPI 分辨率（~3mm）。某些图谱分区在重采样后在 fMRI 脑掩模内没有有效体素，被 nilearn 自动排除：
+- 颞极（temporal pole）：EPI 磁化率伪影（signal dropout）
+- 眶额皮质（OFC）：磁化率伪影
+- 极小分区：1mm 下有效，3mm 采样后消失
+
+**关键理解**：
+1. ROI 数量因被试和采集方案（FOV、分辨率、脑掩模）而异，子集合可能是 185-200
+2. 硬编码 200 能"跑"只是因为当时 atlas 文件未找到，系统回退到单节点模式（N_fmri=1）——实际上 atlas 分区从未生效
+3. 190 ROI 意味着 atlas 已真正生效，图卷积有实际空间结构可以利用
+
+**正确思路**：每次看到"ROI 数 < 理论最大值"，先问：**这些缺失的 ROI 是哪些区域？** 如果是边缘区域（颞极、OFC）且数量 < 5%，完全正常。不应强制填充到 200（填充值为 0 的 ROI 时序会破坏相关性估计）。
+
+**代码修复**：在 `_parcellate_fmri_with_atlas()` 中添加明确的日志说明，解释 ROI 数量差异的原因。
+
+---
+
+### [2026-02-26] SpatialTemporalGraphConv 注意力归一化用 global softmax — GNN 消息传递实际失效
+
+**症状**：训练能收敛，但速度极慢，效果不佳。图神经网络"存在但无效"。
+
+**根因**：`message()` 中的注意力归一化：
+```python
+alpha = torch.softmax(alpha, dim=0)  # 注释说"Normalize per target node"
+```
+但实现上是**全局** softmax（跨所有 E 条边），而非**每目标节点独立** softmax。后果：
+- E≈4000 条边时，每条边的权重 ≈ 1/4000 = 0.00025
+- 所有邻居消息乘以这个极小权重后，几乎消失
+- `update()` 中的自连接 `lin_self(x_self)` 完全主导
+- 等价于根本没有消息传递（GNN 退化为每节点独立的 MLP）
+
+**思维误区**：看到 `softmax` 和注释"per target node"就以为归一化是正确的。没有追问：**`dim=0` 在 `[E, 1]` 张量上是什么语义？** 对 `[E, 1]` 使用 `softmax(dim=0)` 就是跨 E 维度归一化，与"每节点"完全无关。
+
+**正确思路**：GAT 风格的注意力应使用 scatter-softmax（按目标节点分组）。PyG 的 `pyg_softmax(alpha, index, num_nodes=size_i)` 就是为此设计的。每个目标节点的所有入边权重之和 = 1（而非所有 E 条边之和 = 1）。
+
+**修复**：将 `torch.softmax(alpha, dim=0)` 替换为 `pyg_softmax(alpha, index, num_nodes=size_i)`（来自 `torch_geometric.utils`）。在向量化时间传播中，`index` 包含虚拟节点索引 `t*N_dst + m`，pyg_softmax 自动对每个 `(t, m)` 组归一化 — 等价于每节点每时间步归一化，语义完全正确。
+
+**影响文件**：`models/graph_native_encoder.py`
+
+---
+
+### [2026-02-26] SpatialTemporalGraphConv 时间循环 — Python for-loop 导致 GPU 利用率极低
+
+**症状**："训练速度极慢"，GPU 利用率低，nvtop/nvidia-smi 显示 GPU 大量空闲。
+
+**根因**：`forward()` 中有：
+```python
+for t in range(T):   # T=300 次 Python 迭代
+    out_t = self.propagate(edge_index, x=x_t[:, t, :], ...)
+    out_list.append(out_t)
+out = torch.stack(out_list, dim=1)
+```
+
+每次 `propagate()` 是一次独立的 CUDA 内核启动，负载 E≈4000 条边。对于现代 GPU（数千个并行单元），4000 条边的任务在微秒内完成，大部分时间花在 Python 调度开销和内核启动延迟上。
+
+T=300 × 4 层 × 3 种边类型 = **3600 次 CUDA 内核启动**，Python 循环是串行瓶颈。
+
+**量化**：
+- 每次 propagate 有效计算时间：~0.1ms（E=4000 太小，GPU 无法填满）
+- 每次 Python 调度开销：~0.1ms
+- 总串行时间：3600 × 0.2ms = ~0.7s/样本（仅编码器前向）
+- 向量化后：单次大 propagate（T*E=1.2M 条边）：~5ms（GPU 接近饱和）
+- **理论加速：100-140×**（对该组件；端到端加速取决于其他瓶颈）
+
+**思维误区**：以为"Python 循环调用 CUDA 就是并行"。实际上，每次 `propagate()` 调用必须等待上一次完成（PyTorch CUDA 流默认是串行的），Python 循环本身是串行开销。**小批量重复调用 ≠ 并行；只有在同一 CUDA 内核内的运算才是并行的。**
+
+**正确思路**："时序虚拟节点"技巧（Temporal Virtual-Node Trick）：
+- 为每个时间步 t 创建一组虚拟节点：源节点 `(n, t)` 的全局索引 = `t * N_src + n`
+- 将 edge_index 扩展 T 次（每次加偏移 t*N），得到 [2, T*E] 的扩展图
+- 单次 `propagate()` 处理所有 T*E 条消息 → 一次大内核，GPU 满载
+- 输出 `[N_dst*T, H]` → reshape 为 `[N_dst, T, H]`
+
+**代码修复**：替换 `forward()` 中的 Python 时间循环为向量化扩展。梯度检查点（gradient checkpointing）对单次大 propagate 同样有效，内存使用不变。
+
+**影响文件**：`models/graph_native_encoder.py`：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
 
 **核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡，被试特异性嵌入（个性化数字孪生）。
 
@@ -485,7 +564,7 @@ continue  ← 直接跳过 built_graph.subject_idx = torch.tensor(...)
 | 阶段 | EEG | fMRI |
 |------|-----|------|
 | 原始数据 | `[N_ch, N_times]` (e.g. 63×75000) | `[X, Y, Z, T]` (e.g. 64×64×40×190) |
-| 图节点特征 | `[N_eeg, T_eeg, 1]` (e.g. 63×300×1 截断后) | `[N_fmri, T_fmri, 1]` (e.g. 200×190×1，Schaefer200 atlas) |
+| 图节点特征 | `[N_eeg, T_eeg, 1]` (e.g. 63×300×1 截断后) | `[N_fmri, T_fmri, 1]` (e.g. 190×190×1，Schaefer200 atlas 实际节点数因被试 EPI 覆盖而异，通常 185-200) |
 | 编码器输入投影 | `[N_eeg, T_eeg, H]` | `[N_fmri, T_fmri, H]` |
 | ST-GCN 跨模态消息 | 源：`[N_eeg, T_eeg, H]` → propagate(size=(N_eeg, N_fmri)) → `[N_fmri, T_eeg, H]` → interpolate → `[N_fmri, T_fmri, H]` | 目标 |
 | 编码器输出 | `[N_eeg, T_eeg, H]` | `[N_fmri, T_fmri, H]` |
