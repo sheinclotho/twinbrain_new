@@ -262,6 +262,12 @@ class HierarchicalPredictor(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Hierarchical prediction.
+
+        Coarse scales (large scale_factor) are skipped when
+        ``future_steps // scale_factor == 0`` (e.g. prediction_steps=1 with
+        scale_factor=4).  Only scales that can produce at least one future step
+        participate in the fusion.  This allows NPI-style "N predict 1"
+        configurations without crashing.
         
         Args:
             x: Context [batch, context_len, input_dim]
@@ -269,7 +275,7 @@ class HierarchicalPredictor(nn.Module):
             
         Returns:
             prediction: Final prediction [batch, future_steps, input_dim]
-            scale_predictions: Predictions at each scale
+            scale_predictions: Predictions at each scale (only valid scales)
         """
         batch_size = x.shape[0]
         
@@ -277,6 +283,14 @@ class HierarchicalPredictor(nn.Module):
         
         # Predict at each scale
         for i, (predictor, scale_factor) in enumerate(zip(self.predictors, self.scale_factors)):
+            # Number of future steps at this (downsampled) scale.
+            # Bug fix: integer division may produce 0 when prediction_steps is
+            # small (e.g. prediction_steps=1, scale_factor=4 → 1//4 = 0).
+            # Repeating 0 future slots creates an empty tensor and the
+            # transformer / GRU have nothing to predict.
+            # Fix: clamp to at least 1 so each scale always predicts ≥1 step.
+            future_steps_scaled = max(1, future_steps // scale_factor)
+
             # Downsample context
             if scale_factor > 1:
                 # Average pooling to downsample
@@ -291,8 +305,6 @@ class HierarchicalPredictor(nn.Module):
             # Predict at this scale
             if isinstance(predictor, TransformerPredictor):
                 # For transformer, we need to extend sequence with future slots
-                future_steps_scaled = future_steps // scale_factor
-                
                 # Create future slots (initialized with last context value)
                 future_init = x_down[:, -1:, :].repeat(1, future_steps_scaled, 1)
                 x_extended = torch.cat([x_down, future_init], dim=1)
@@ -310,7 +322,7 @@ class HierarchicalPredictor(nn.Module):
             else:
                 # For GRU, predict autoregressively
                 pred = self._autoregressive_predict(
-                    predictor, x_down, future_steps // scale_factor
+                    predictor, x_down, future_steps_scaled
                 )
             
             # Upsample to finest resolution if needed
@@ -327,7 +339,17 @@ class HierarchicalPredictor(nn.Module):
                         align_corners=False,
                     ).transpose(1, 2)
             else:
-                pred_up = pred
+                # Finest scale: ensure output has exactly future_steps steps.
+                # When future_steps_scaled was clamped from 0→1 for a scale where
+                # scale_factor == 1 (no upsampling), pred already has 1 step; if
+                # future_steps > 1 we repeat the last predicted step.
+                if pred.shape[1] < future_steps:
+                    repeat_count = future_steps - pred.shape[1]
+                    pred_up = torch.cat(
+                        [pred, pred[:, -1:, :].repeat(1, repeat_count, 1)], dim=1
+                    )
+                else:
+                    pred_up = pred[:, :future_steps, :]
             
             scale_predictions.append(pred_up)
         

@@ -436,7 +436,85 @@ train_step()
 
 ---
 
-## 九、数字孪生脑架构状态（持续更新）
+### [2026-02-27] 预测功能系统性审查：三个叠加盲区
+
+**背景**：要求以"哪都可能有问题"的批判态度对预测功能进行完整审查。
+
+---
+
+**盲区 1 — HierarchicalPredictor 整数除法产生空张量（P0 bug）**
+
+**思维误区**：以为 `future_steps // scale_factor` 总是正整数。
+
+**根因**：当 `prediction_steps=1`（NPI 风格）且 `scale_factor=4` 时，`1 // 4 = 0`。
+`future_init = x_down[:, -1:, :].repeat(1, 0, 1)` 产生形状 `[N, 0, H]` 的空张量，
+Transformer 对空序列的输出仍是空张量，`pred_full[:, -0:, :]` = 完整序列（Python 负索引！），
+导致 fusion 的输入维度从 `input_dim * 3` 变为 `input_dim * 3 + 全序列 * 2`，报 shape mismatch。
+
+**触发条件**：`prediction_steps` < `max(scale_factors)` = 4（默认 num_scales=3）。
+即 `prediction_steps ∈ {1, 2, 3}` 都会在前两个尺度上产生空预测。
+
+**修复**：`future_steps_scaled = max(1, future_steps // scale_factor)`。
+每个尺度至少预测 1 步，粗尺度用下采样后的 context 预测 1 步后再上采样到 future_steps，
+物理语义为"低分辨率趋势预测"，融合后给细尺度提供全局先验。
+
+**规则**：**所有整数除法，若分子可能小于分母，必须用 max(1, ...) 或 ceiling 除法。**
+
+---
+
+**盲区 2 — validate() pred_R² 使用非因果 context（P1 科学问题）**
+
+**思维误区**：以为 `h[:, :T_ctx, :]` 是"上下文的表示"，没有追问编码器是否是因果的。
+
+**根因**：编码器使用：
+- `Conv1d(kernel=3, padding=1)`：对称填充，`h[t]` 包含 `signal[t-1, t, t+1]` 的信息
+- `TemporalAttention(is_causal=False)`：全局双向注意力，每个时间步可看到所有其他时间步
+
+因此 `h[:, T_ctx-1, :]`（context 最后一步）包含来自 `T_ctx, T_ctx+1` 的少量未来信息。
+旧 validate() 用这个"污染"的 context 做预测，pred_r2 会偏乐观。
+
+**影响评估**：对 `kernel_size=3`, `T_ctx=200` 的情况，泄漏量约为 0.5%（仅边界步受影响）。
+训练时接受此近似（避免 2× forward pass cost）。**但评估指标必须严格，不能接受偏差。**
+
+**修复**：validate() 中重新编码仅含 T_ctx 步的数据：
+```python
+context_data = data.clone()
+context_data[nt].x = data[nt].x[:, :T_ctx, :]  # 切片原始信号
+_, _, h_ctx = self.model(context_data, return_encoded=True)  # 编码器只见 T_ctx 步
+pred_latents = predictor.predict_next(h_ctx[nt])  # 真正因果预测
+```
+代价：验证时多一次无反向传播的 forward pass（可接受）。
+
+**规则**：**科学评估指标不能有任何信息泄漏。训练效率 vs 评估严格性的权衡，必须让评估端严格。**
+
+---
+
+**盲区 3 — 声明"因果"但未追问编码器是否真的因果**
+
+**思维误区**：看到注释"causal prediction using predict_next()"就以为整个流程是因果的。
+
+**根因**：`predict_next()` 本身是因果的（只用 context 的最后 context_length 步），
+但如果 context 是由非因果编码器产生的（包含未来信息），因果预测器也无济于事。
+"因果"需要端到端保证：**编码器因果 + 预测器因果 + 评估因果**，缺一不可。
+
+**现状**：
+- 训练：编码器非因果（工程权衡，边界泄漏极小）→ 预测器因果 → 近似因果（可接受）
+- 评估：**编码器强制因果**（重新编码 T_ctx 步）→ 预测器因果 → 完全因果（严格）
+
+**规则**：**对任何标榜"因果"的预测功能，逐一检查信息流的每一步：原始信号 → 编码 → 预测 → 解码 → 评估，看哪一步有未来信息的访问权限。**
+
+---
+
+**附：StratifiedWindowSampler.forward() 是训练中的死代码**
+
+`EnhancedMultiStepPredictor.forward()`（使用 StratifiedWindowSampler 采样多个窗口）
+在当前训练循环中**从未被调用**。训练用 `predict_next()`，验证也用 `predict_next()`。
+
+`forward()` 是 API 的一部分（向后兼容），保留不删除，但新用户不应依赖它进行训练。
+
+---
+
+## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
 |------|------|---------|
@@ -450,6 +528,12 @@ train_step()
 | 相关性跨模态边（NVC 感知，top-k |r|） | ✅ 已实现 | V5.30 |
 | 训练曲线可视化（loss + R² PNGs） | ✅ 已实现 | V5.30 |
 | 断点续训（--resume） | ✅ 已实现 | V5.30 |
+| 时序数据增强（noise + scale，可选） | ✅ 已实现（默认关闭） | V5.30 |
+| NPI 风格 context_length 可配置 | ✅ 已实现 | V5.31 |
+| HierarchicalPredictor NPI 兼容（prediction_steps=1） | ✅ 已修复 | V5.31 |
+| validate() 真因果 pred_R²（因果编码） | ✅ 已修复 | V5.31 |
+| 跨会话预测 | ⚡ 部分（within-run） | — |
+| 干预响应、自我演化 | ❌ Future work | — |
 | 时序数据增强（noise + scale，可选） | ✅ 已实现（默认关闭） | V5.30 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |

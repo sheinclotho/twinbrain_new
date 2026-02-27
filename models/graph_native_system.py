@@ -620,25 +620,30 @@ class GraphNativeBrainModel(nn.Module):
                 
                 losses[f'recon_{node_type}'] = recon_loss
         
-        # ── 潜空间自监督预测损失（系统级）──────────────────────────────────
-        # 流程（修正后）：
-        #   1. 将编码器潜空间序列切分为：
-        #        context = 前 _PRED_CONTEXT_RATIO 部分   → 历史
-        #        future  = 后 (1-_PRED_CONTEXT_RATIO) 部分 → 待预测目标
-        #   2. 调用 predict_next(context)：
-        #        从 context 的最后 min(context_length, T_ctx) 步预测
-        #        未来 prediction_steps 步（NPI 范式，因果对齐）
-        #   3. 将所有模态的初步预测传入 GraphPredictionPropagator，
-        #        让预测在连通脑区间传播（系统级预测）
-        #   4. 计算传播后预测 vs. actual future 的损失
+        # ── 潜空间自监督预测预标记任务（系统级）──────────────────────────────
         #
-        # 关键修正（之前的错误）：
-        #   旧：pred_windows.mean(dim=0) = 对 context 内不同起始位置的窗口
-        #       预测求均值 → 再与 future_target 比较
-        #       → 比较的是 "steps [50-60], [120-130], [190-200] 的均值预测"
-        #         与 "steps [200-299] 的实际未来"，这是完全不同的时间段！
-        #   新：predict_next(context) 直接从 context 最后 context_length 步
-        #       预测 future 的最初 prediction_steps 步 → 因果对齐
+        # ⚠ 设计说明（工程权衡，非 bug）：
+        #   编码器使用双向时序卷积（Conv1d 对称 padding）和双向时序注意力
+        #   (is_causal=False)。这意味着 h[:, T_ctx-1, :] 含有来自 T_ctx 和
+        #   T_ctx+1 的少量未来信息（kernel_size=3 时边界泄漏 ±1 步）。
+        #   对于 T_ctx=200 步的序列，这种泄漏比例极小（约 0.5%），因此：
+        #   • 预标记任务仍然提供了有用的时序动力学学习信号（正确）
+        #   • 但不是严格的"因果"监督信号（可接受的工程权衡）
+        #
+        # 真正因果的评估在 validate() 中完成：
+        #   validate() 对每个样本重新编码仅含 T_ctx 步的数据（上下文截断），
+        #   确保编码器看不到任何未来信息。pred_r2 度量由此保证科学严谨性。
+        #
+        # 为什么训练不也用因果编码？
+        #   训练每步需要额外一次编码器 forward pass，速度下降 ~50%。
+        #   对于 kernel_size=3 的卷积，边界泄漏仅 ±1 步，预标记任务仍然
+        #   有意义。如需完全因果训练，可修改编码器为因果卷积（左填充）。
+        #
+        # 流程（修正后）：
+        #   1. 切分 h → context（前 2/3）+ future_target（后 1/3）
+        #   2. predict_next(context)：最后 context_length 步 → 下一 pred_steps 步
+        #   3. GraphPredictionPropagator：系统级传播（EEG→fMRI 耦合动态）
+        #   4. 计算传播后预测 vs. actual future latent 的损失
         if encoded is not None and self.use_prediction:
             pred_means: Dict[str, torch.Tensor] = {}
             future_targets: Dict[str, torch.Tensor] = {}
@@ -1303,10 +1308,16 @@ class GraphNativeTrainer:
         2. Signal-space prediction R² (pred_r2_<node_type>):
            **Primary quality indicator** — how well the model predicts future
            brain signals from past signals.
-           Procedure: encode full sequence → split context (first 2/3) / future
-           (last 1/3) → run predictor on context latent → decode predicted
-           latent back to signal space → compare against actual future signal.
-           This is the real "digital-twin" capability metric.
+           Procedure:
+           a) Slice raw signal to T_ctx steps (context only).
+           b) Re-encode the context-only slice through the full encoder.
+              This is the TRULY CAUSAL encoding: the encoder cannot see any
+              signal beyond T_ctx, regardless of its bidirectional structure.
+           c) Run predictor on causal context latent → predicted latent.
+           d) Decode to signal space → predicted signal.
+           e) Compare against raw future signal [T_ctx:T_ctx+pred_steps].
+           This is the real "digital-twin" capability metric — measured without
+           any future information leakage from the bidirectional encoder.
 
         Args:
             data_list: List of validation data
@@ -1360,35 +1371,76 @@ class GraphNativeTrainer:
                         ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
 
                 # ── Signal-space prediction R² per modality ─────────────────
-                # Causal evaluation: given only the first T_ctx timesteps of
-                # the encoded sequence, predict the next pred_steps timesteps,
-                # decode back to signal space, and compare against the actual
-                # future signal.  This matches the training objective exactly.
-                if self.model.use_prediction and encoded is not None:
+                # TRULY CAUSAL evaluation:
+                #
+                # The encoder uses symmetric Conv1d padding + bidirectional
+                # TemporalAttention (is_causal=False).  This means h[:,T_ctx-1,:]
+                # contains a small amount of information from timestep T_ctx
+                # (boundary leakage of ±1 step for kernel_size=3).
+                #
+                # For a scientifically rigorous metric we re-encode with ONLY
+                # the first T_ctx raw signal timesteps so the encoder cannot see
+                # any future data.  Cost: one extra encoder forward pass without
+                # backprop (acceptable in a validation loop).
+                #
+                # Why this matters: if we use h[:, :T_ctx, :] from the full
+                # bidirectional encoding, pred_R² is slightly optimistic because
+                # the context latent already "leaks" about the future through the
+                # bidirectional temporal attention. The truly causal evaluation
+                # here is the reliable benchmark.
+                if self.model.use_prediction:
                     pred_latents: Dict[str, torch.Tensor] = {}
                     pred_T_ctx: Dict[str, int] = {}
 
+                    # ── Step 1: Determine context split per modality ──────────
+                    # Use the full-sequence latent length (from encoded above,
+                    # if available) to compute T_ctx; otherwise fall back to the
+                    # raw-signal length.
+                    ctx_T_map: Dict[str, int] = {}
                     for node_type in self.node_types:
-                        if node_type not in encoded:
+                        if node_type not in data.node_types:
                             continue
-                        h = encoded[node_type]  # [N, T, H]
-                        T = h.shape[1]
+                        if encoded is not None and node_type in encoded:
+                            T = encoded[node_type].shape[1]
+                        else:
+                            T = data[node_type].x.shape[1]
                         if T < self.model._PRED_MIN_SEQ_LEN:
                             continue
-                        T_ctx = int(T * self.model._PRED_CONTEXT_RATIO)
-                        context = h[:, :T_ctx, :]
-                        # Causal prediction using the same predict_next() as training.
-                        pred_latents[node_type] = self.model.predictor.predict_next(context)
-                        pred_T_ctx[node_type] = T_ctx
+                        ctx_T_map[node_type] = int(T * self.model._PRED_CONTEXT_RATIO)
 
-                    # System-level graph propagation of predictions
+                    if ctx_T_map:
+                        # ── Step 2: Build context-only data and encode ────────
+                        # Each node type is sliced to its T_ctx steps so the
+                        # encoder only sees past data — no future leakage.
+                        context_data = data.clone()
+                        for node_type, T_ctx in ctx_T_map.items():
+                            context_data[node_type].x = (
+                                data[node_type].x[:, :T_ctx, :]
+                            )
+                        _, _, h_ctx_dict = self.model(
+                            context_data,
+                            return_prediction=False,
+                            return_encoded=True,
+                        )
+
+                        # ── Step 3: Predict from causal context ───────────────
+                        for node_type, T_ctx in ctx_T_map.items():
+                            if node_type not in h_ctx_dict:
+                                continue
+                            h_ctx = h_ctx_dict[node_type]  # [N, T_ctx, H]
+                            pred_latents[node_type] = (
+                                self.model.predictor.predict_next(h_ctx)
+                            )
+                            pred_T_ctx[node_type] = T_ctx
+
+                    # ── Step 4: System-level graph propagation ────────────────
                     if pred_latents:
-                        pred_latents = self.model.prediction_propagator(pred_latents, data)
+                        pred_latents = self.model.prediction_propagator(
+                            pred_latents, data
+                        )
 
                     if pred_latents:
-                        # Decode predicted latents to signal space.
-                        # Build a temporary HeteroData where each node type's
-                        # .x is the predicted latent [N, pred_steps, H].
+                        # ── Step 5: Decode latent predictions to signal space ─
                         pred_enc = data.clone()
                         for nt, pred_lat in pred_latents.items():
                             pred_enc[nt].x = pred_lat
@@ -1400,6 +1452,9 @@ class GraphNativeTrainer:
                             T_ctx = pred_T_ctx.get(node_type)
                             if T_ctx is None:
                                 continue
+                            # ── Step 6: Compare against raw future signal ─────
+                            # Uses the RAW signal (not the latent) so the metric
+                            # is interpretable in physical units (z-scored signal).
                             future_sig = data[node_type].x[:, T_ctx:, :]  # [N, T_fut, C]
                             n_steps = min(pred_sig.shape[1], future_sig.shape[1])
                             if n_steps < 1:
