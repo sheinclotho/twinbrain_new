@@ -144,25 +144,24 @@ class AdaptiveLossBalancer(nn.Module):
         weights = {name: torch.exp(self.log_weights[name]).detach().clamp(self.min_weight, self.max_weight)
                    for name in self.task_names}
         
-        # Set initial losses on first call (for normalization)
+        # Capture initial losses on first call (used only by update_weights for
+        # convergence-rate tracking — NOT for normalization here).
+        # Energy-seeded initial weights already correct for amplitude scale; adding
+        # another normalization by L0 would compound the two corrections and create
+        # extreme gradient imbalances (e.g. w_eeg/L0_eeg = 50/0.001 = 50,000 vs
+        # w_fmri/L0_fmri = 1/0.5 = 2 → EEG dominates by 25,000×).
         if not self.initial_losses_set:
             self.initial_losses = torch.tensor([
                 losses.get(name, torch.tensor(0.0)).detach().item()
                 for name in self.task_names
             ], device=self.initial_losses.device)
-            # Use same device as initial_losses for consistency
             self.initial_losses_set = torch.tensor(True, device=self.initial_losses.device)
-        
-        # Compute weighted losses
+
+        # Compute weighted losses — energy-seeded weights alone handle amplitude scale.
         weighted_losses = {}
-        for i, name in enumerate(self.task_names):
+        for name in self.task_names:
             if name in losses:
-                # Normalize by initial loss to prevent scale differences
-                loss_norm = losses[name]
-                if self.initial_losses[i] > 1e-6:
-                    loss_norm = loss_norm / (self.initial_losses[i] + 1e-8)
-                
-                weighted_losses[name] = weights[name] * loss_norm
+                weighted_losses[name] = weights[name] * losses[name]
             else:
                 weighted_losses[name] = torch.tensor(0.0, device=list(losses.values())[0].device)
         
@@ -175,7 +174,7 @@ class AdaptiveLossBalancer(nn.Module):
     
     def update_weights(self, losses: Dict[str, torch.Tensor]):
         """
-        Update loss weights based on relative loss magnitudes.
+        Update loss weights based on relative convergence rates.
 
         Design note: the original GradNorm algorithm calls torch.autograd.grad()
         per task to compute per-task gradient norms.  That requires the computation
@@ -183,10 +182,19 @@ class AdaptiveLossBalancer(nn.Module):
         has already consumed and freed the graph.  Calling autograd.grad() at that
         point raises "Trying to backward through the graph a second time".
 
-        Instead we use loss magnitudes as a lightweight proxy: tasks whose loss is
-        larger than the group average are "harder" and receive a lower weight so
-        that all tasks converge at a comparable rate.  This is not GradNorm but is
-        stable and avoids the post-backward graph issue.
+        Instead we use normalized loss ratios L(t)/L(0) as a proxy for per-task
+        convergence speed (inspired by GradNorm's ˜L_i(t) metric).  Tasks that
+        are converging SLOWER relative to their initial loss (higher ratio) receive
+        a HIGHER weight so the optimizer allocates more capacity to them.
+
+        Normalization by initial losses is essential here: without it, the raw
+        loss magnitude of fMRI (large amplitude → large absolute loss) would always
+        exceed EEG loss, causing the balancer to permanently misread fMRI as the
+        "harder" task based on scale rather than convergence difficulty.
+
+        Direction:
+          rel_loss > 1  (task converging slower than average) → raise weight  ← correct
+          rel_loss < 1  (task converging faster than average) → lower weight  ← correct
         """
         # Only update after warmup and at specified frequency
         if self.epoch_count < self.warmup_epochs:
@@ -197,35 +205,50 @@ class AdaptiveLossBalancer(nn.Module):
             return
         
         self.step_count += 1
-        
-        # Gather scalar loss values (graph already freed — use .item())
+
+        # Gather raw loss scalars (computation graph already freed)
         loss_values = {
             name: losses[name].item()
             for name in self.task_names
             if name in losses
         }
-        
+
         if not loss_values:
             return
-        
-        avg_loss = sum(loss_values.values()) / len(loss_values)
-        
+
+        # Normalize each task's loss by its initial value to get scale-independent
+        # convergence ratios.  Without normalization, the raw fMRI loss (high amplitude
+        # → large absolute value) is always larger than EEG loss, causing the balancer
+        # to permanently misread fMRI as harder based on scale rather than convergence.
+        # After normalization: ratio < 1 → converged below initial level (fast); ratio > 1
+        # → still above initial level (slow).
+        if self.initial_losses_set:
+            loss_values_norm = {
+                name: loss_val / (self.initial_losses[self.task_names.index(name)].item() + 1e-8)
+                for name, loss_val in loss_values.items()
+            }
+        else:
+            # initial_losses not captured yet (shouldn't happen after warmup, but be safe)
+            loss_values_norm = loss_values
+
+        avg_loss_norm = sum(loss_values_norm.values()) / len(loss_values_norm)
+
         with torch.no_grad():
-            for name, loss_val in loss_values.items():
-                if loss_val < 1e-8:
+            for name, loss_norm_val in loss_values_norm.items():
+                if loss_norm_val < 1e-8:
                     continue
-                
-                # Relative loss: how much harder is this task than average?
-                rel_loss = loss_val / (avg_loss + 1e-8)
-                
-                # Drive all task losses towards the group average.
-                # If task loss > avg (rel_loss > 1): task is harder → lower its weight
-                # If task loss < avg (rel_loss < 1): task is easier → raise its weight
-                weight_update = -self.learning_rate * (rel_loss - 1.0)
+
+                # Relative convergence rate vs. group average.
+                rel_loss = loss_norm_val / (avg_loss_norm + 1e-8)
+
+                # GradNorm-inspired direction: RAISE weight for slower-converging tasks.
+                # rel_loss > 1 → task converging slower → needs more gradient signal → +update
+                # rel_loss < 1 → task converging faster → can reduce signal → −update
+                weight_update = +self.learning_rate * (rel_loss - 1.0)
                 weight_update = max(-0.5, min(0.5, weight_update))  # clip
-                
+
                 self.log_weights[name].data += weight_update
-                
+
                 max_log = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
                 min_log = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
                 self.log_weights[name].data.clamp_(min_log, max_log)
@@ -234,7 +257,7 @@ class AdaptiveLossBalancer(nn.Module):
             weights = {name: torch.exp(self.log_weights[name]).item()
                        for name in self.task_names}
             logger.debug(f"Updated loss weights: {weights}")
-            logger.debug(f"Loss values used: {loss_values}")
+            logger.debug(f"Normalized loss ratios: {loss_values_norm}")
     
     def set_epoch(self, epoch: int):
         """Set current epoch for warmup tracking."""
