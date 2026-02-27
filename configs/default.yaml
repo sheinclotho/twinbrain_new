@@ -348,6 +348,10 @@ v5_optimization:
     num_windows: 3
     # 窗口采样策略：uniform（均匀）/ random（随机）/ adaptive（重要性加权）
     sampling_strategy: "uniform"
+    # 系统级预测传播层数（GraphPredictionPropagator）
+    # 含义：预测在图上传播的跳数；2 = 覆盖 2-hop 邻居（A→B→C）
+    # 建议：2（小图 N<100）；3（大图 N>200，如 Schaefer400）
+    num_prop_layers: 2
 
 # ──────────────────────────────────────────────────────────────────────────
 # 五、图构建配置

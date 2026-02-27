@@ -1,10 +1,135 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-27  
-**版本**：V5.24  
+**版本**：V5.26  
 **状态**：生产就绪
 
 ---
+
+## [V5.26] 2026-02-27 — 训练流程科学性审查：AdaptiveLossBalancer 双 Bug 修复
+
+### 问题背景
+
+对训练流程进行全面科学性审查，发现 `AdaptiveLossBalancer` 存在两个相互叠加的错误，导致多模态训练实质上退化为单模态（EEG-only）训练。
+
+### Bug 1 — 双重修正导致 25,000× 梯度失衡
+
+**根因**：
+
+能量初始化（`modality_energy_ratios`）与初始损失归一化（`loss / L0`）各自独立地解决振幅差异问题，叠加后产生严重过补偿：
+
+| 修正机制 | EEG 梯度比例 | fMRI 梯度比例 |
+|---------|-------------|-------------|
+| 能量初始化（正确） | 50 | 1 |
+| 初始损失归一化（冗余） | 50/0.001 = 50,000 | 1/0.5 = 2 |
+| **叠加后（错误）** | **50,000** | **2** |
+
+在这种配置下 fMRI 对总梯度的贡献几乎为零（<0.004%），模型实质上只在训练 EEG 重建。
+
+**修复**：移除 `forward()` 中的 `loss / initial_loss` 归一化。能量初始化已足够。
+
+### Bug 2 — GradNorm 方向反转：困难任务权重被降低
+
+**根因**：`update_weights()` 注释声明目标是"驱动所有任务向组均值收敛"，但实现的符号是：
+
+```python
+# 错误（修复前）：
+weight_update = -self.learning_rate * (rel_loss - 1.0)
+# rel_loss > 1（任务困难）→ 负更新 → 权重降低 → 模型放弃困难任务
+```
+
+正确 GradNorm 逻辑：收敛慢的任务应获得**更高**权重（更多梯度信号）才能追上进度。
+
+**修复**：
+1. `update_weights()` 在计算相对困难度前先用 `initial_losses` 做量纲归一化（消除振幅差的干扰）
+2. 符号改正：`weight_update = +lr * (rel_loss - 1.0)`
+
+### 修复后的设计逻辑
+
+| 机制 | 负责解决 | 时机 |
+|------|---------|------|
+| 能量初始化 | EEG/fMRI 振幅差异（~50×） | 训练初始 warm-up 期间 |
+| GradNorm 自适应 | 各任务收敛速度差异 | warm-up 结束后逐步调整 |
+
+二者正交，不叠加。
+
+### 数值验证
+
+- EEG/fMRI 权重初始比例：50:1（正确补偿振幅差异）
+- EEG loss 贡献 / fMRI loss 贡献：约 10:1（合理，4 任务中 EEG 贡献更大但不绝对主导）
+- fMRI 收敛慢时权重变化：+方向（正确）
+- EEG 收敛快时权重变化：−方向（正确）
+
+---
+
+## [V5.25] 2026-02-27 — 系统级预测：GraphPredictionPropagator
+
+### 问题背景
+
+用户实验发现：对单脑区施加刺激并运行预测，只有该脑区的后续活动轨迹改变，其他脑区不受影响。这违反了大脑作为耦合动力学系统的基本原则——任何脑区的活动变化必须通过结构/功能连接影响相邻脑区。
+
+### 根因
+
+`GraphNativeBrainModel.forward()` 中的预测逻辑：
+
+```python
+# 旧实现（错误）
+for node_type in self.node_types:
+    h = encoded_data[node_type].x  # [N, T, H]
+    pred_windows, _, _ = self.predictor(h, ...)  # N 个节点被当作独立 batch
+    predictions[node_type] = pred_windows.mean(dim=0)
+```
+
+`EnhancedMultiStepPredictor` 将 `[N, T, H]` 中的 N 作为 batch 维度，对每个节点独立运行 Transformer/GRU。图拓扑在预测阶段**完全缺失**。编码器的 ST-GCN 跨区域信息传递只在编码时发生，预测时没有任何机制让一个脑区的预测变化传播至相邻脑区。
+
+### 修复：GraphPredictionPropagator
+
+新增 `GraphPredictionPropagator` 模块（`graph_native_system.py`），在每节点时间预测之后运行图消息传递：
+
+```
+Step 3a: EnhancedMultiStepPredictor
+         h[N, T, H] → pred_mean[N, pred_steps, H]（per-node，独立）
+
+Step 3b: GraphPredictionPropagator
+         {node_type: pred_mean} + graph edges
+         → num_prop_layers 轮 ST-GCN 消息传递
+         → 刺激节点 A 的预测变化传播至连接的 B, C, D...
+```
+
+**架构细节**：
+- `temporal_kernel_size=1`：每个预测步骤独立传播，保持时间结构
+- `num_prop_layers=2`（可配置）：覆盖 ≥2 跳邻居（A→B→C）
+- 复用 `SpatialTemporalGraphConv` + spectral norm + per-node softmax attention
+- 残差连接 + LayerNorm：与编码器保持一致的归一化惯例
+- 跨模态边（EEG→fMRI）同样参与传播：预测的 EEG 活动变化影响 fMRI 预测
+
+**训练一致性**：`compute_loss()` 的预测损失计算路径同步更新：
+1. 先对所有模态计算初步 `pred_mean`
+2. 用 `prediction_propagator` 传播
+3. 计算传播后预测 vs. `future_target` 的损失
+
+这确保训练信号与推理行为一致——模型学到的是"系统级预测"而非"孤立节点预测"。
+
+### 科学意义
+
+| 特性 | 修复前 | 修复后 |
+|------|--------|--------|
+| 单脑区刺激 | 只影响该区预测 | 传播至所有连接脑区 |
+| 预测语义 | N 个独立时间序列 | 耦合动力学系统预测 |
+| 跨模态影响 | 仅编码阶段 | 编码 + 预测两阶段 |
+| 训练目标 | per-node MSE | system-level MSE（传播后） |
+
+### 配置新增
+
+`configs/default.yaml` 的 `v5_optimization.advanced_prediction` 支持新键：
+
+```yaml
+v5_optimization:
+  advanced_prediction:
+    num_prop_layers: 2   # 预测传播层数（默认 2，覆盖 ≥2 跳邻居）
+```
+
+
 
 ## [V5.24] 2026-02-27 — 多被试多任务联合训练正确性审查
 
