@@ -26,6 +26,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _row_zscore(mat: torch.Tensor) -> torch.Tensor:
+    """Row-wise z-score normalisation.  Returns (mat - row_mean) / (row_std + eps)."""
+    mu  = mat.mean(dim=1, keepdim=True)
+    std = mat.std(dim=1, keepdim=True) + 1e-8
+    return (mat - mu) / std
+
+
 class GraphNativeBrainMapper:
     """
     Unified brain data mapper that maintains graph structure.
@@ -671,11 +678,6 @@ class GraphNativeBrainMapper:
 
                 # ── Pearson correlation matrix [N_eeg, N_fmri] ─────────────
                 # Row-wise z-score so that corr[i,j] = <z_eeg_i, z_fmri_j> / T
-                def _row_zscore(mat: torch.Tensor) -> torch.Tensor:
-                    mu  = mat.mean(dim=1, keepdim=True)
-                    std = mat.std(dim=1, keepdim=True) + 1e-8
-                    return (mat - mu) / std
-
                 eeg_z  = _row_zscore(eeg_ts)   # [N_eeg, T]
                 fmri_z = _row_zscore(fmri_ts)  # [N_fmri, T]
 

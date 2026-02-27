@@ -455,16 +455,15 @@ def plot_training_curves(
             ax.plot(range(1, len(val_loss) + 1), val_loss, label='Val Loss',
                     color='tomato', linewidth=1.5, marker='o', markersize=3)
             # Annotate best validation point
-            if val_loss:
-                best_val_idx = int(min(range(len(val_loss)), key=lambda i: val_loss[i]))
-                ax.annotate(
-                    f'best\n{val_loss[best_val_idx]:.4f}',
-                    xy=(best_val_idx + 1, val_loss[best_val_idx]),
-                    xytext=(best_val_idx + 1 + max(1, len(val_loss) // 20), val_loss[best_val_idx]),
-                    fontsize=7,
-                    arrowprops=dict(arrowstyle='->', color='gray', lw=1),
-                    color='gray',
-                )
+            best_val_idx = int(min(range(len(val_loss)), key=lambda i: val_loss[i]))
+            ax.annotate(
+                f'best\n{val_loss[best_val_idx]:.4f}',
+                xy=(best_val_idx + 1, val_loss[best_val_idx]),
+                xytext=(best_val_idx + 1 + max(1, len(val_loss) // 20), val_loss[best_val_idx]),
+                fontsize=7,
+                arrowprops=dict(arrowstyle='->', color='gray', lw=1),
+                color='gray',
+            )
         ax.set_xlabel('Epoch / Validation Index')
         ax.set_ylabel('Loss')
         ax.set_title('TwinBrain V5 — Training Loss Curve')
@@ -503,6 +502,9 @@ def plot_training_curves(
         r2_path = output_dir / 'training_r2_curve.png'
         fig.savefig(r2_path, dpi=120, bbox_inches='tight')
         _plt.close(fig)
+
+
+def create_sample_visualizations(output_dir: str = 'visualization_examples'):
     """
     Create sample visualizations with dummy data.
     

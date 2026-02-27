@@ -1,8 +1,118 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-27  
-**版本**：V5.29  
+**版本**：V5.30  
 **状态**：生产就绪
+
+---
+
+## [V5.30] 2026-02-27 — 相关性跨模态边 + 训练曲线可视化 + 断点续训 + 数据增强 + 缓存架构重设计
+
+### 背景
+
+对完整训练管线进行一轮全局审查，识别出四项功能性改进机会，并针对用户反馈的"缓存加载时看不到下游可用数据"问题重新设计了缓存架构。
+
+---
+
+### 优化 A：基于时序相关性的跨模态边（神经血管耦合感知）
+
+**问题**：`create_simple_cross_modal_edges()` 使用随机连接+均匀权重（1.0），完全忽略 EEG 通道与 fMRI ROI 之间的神经血管耦合（Neurovascular Coupling, NVC）。
+
+**方案**：
+- 从 `merged_data['eeg'].x`（[N_eeg, T, 1]）和 `merged_data['fmri'].x`（[N_fmri, T, 1]）提取时序
+- 使用 `adaptive_avg_pool1d` 对高采样率模态降采样至低采样率时间轴（EEG→fMRI 对齐）
+- GPU 矩阵乘法计算 [N_eeg, N_fmri] Pearson 绝对相关矩阵
+- 每个 EEG 通道保留相关性最高的 top-k fMRI ROI，边权 = |r|
+- 新增配置：`graph.k_cross_modal: 5`（建议值，可调整）
+- 若时序对齐失败（如节点特征不存在），安全回退到随机连接
+
+**科学依据**：NVC 理论（Logothetis 2001；Laufs 2008）：局部场电位/高频 EEG 功率与覆盖皮层区域的 BOLD 信号呈线性相关。相关性边权让跨模态消息传递在真实 NVC 通路上更强，噪声通路上更弱，直接体现该神经科学原理。
+
+**代码变更**：`models/graph_native_mapper.py`、`configs/default.yaml`
+
+---
+
+### 优化 B：训练曲线自动可视化
+
+**问题**：训练结束后仅有日志数字，用户（尤其是非计算机专业研究者）无法直观判断训练是否收敛、R² 趋势是否健康。
+
+**方案**：
+- `utils/visualization.py` 新增 `plot_training_curves(history, output_dir, ...)` 函数
+- 生成 `training_loss_curve.png`（train+val loss，标注最低 val_loss 点）
+- 生成 `training_r2_curve.png`（各模态 val R² 曲线，标注 R²=0.3 和 R²=0 参考线）
+- `train_model()` 训练完成后自动调用；matplotlib 不可用时静默跳过
+
+**代码变更**：`utils/visualization.py`、`main.py`
+
+---
+
+### 优化 C：断点续训（`--resume`）
+
+**问题**：无 CLI 参数支持从已保存检查点恢复训练；长时间训练中断后必须从 epoch 1 重头开始。
+
+**方案**：
+- `main()` argparse 新增 `--resume CHECKPOINT` 参数
+- 若提供检查点路径，在 `train_model()` 初始化训练器后立即加载检查点（model + optimizer + scheduler + loss_balancer）
+- 从 `saved_epoch + 1` 继续训练循环；加载失败时优雅降级并从 epoch 1 重新开始
+- 完全后向兼容：不提供 `--resume` 时行为与旧版本完全一致
+
+**代码变更**：`main.py`
+
+---
+
+### 优化 D：可选时序数据增强
+
+**问题**：训练时唯一的增强为 EEG 通道增强（`use_eeg_enhancement`）；对信号噪声和个体幅度差异缺乏通用鲁棒性。
+
+**方案**：
+- 新增配置 `training.augmentation`：`enabled: false`（默认关闭，后向兼容）
+  - `noise_std: 0.01`：每步向节点特征添加 σ=1% 的高斯噪声
+  - `scale_range: [0.9, 1.1]`：随机幅度缩放 ±10%
+- 仅在 `model.training=True` 时应用（验证时不增强，保证评估一致性）
+- 对所有模态节点特征生效（EEG + fMRI 均增强）
+
+**科学依据**：神经影像信号自带 10-20% 测量噪声（仪器噪声、生理伪迹）；信号级扰动在有效信号范围内，不破坏时序相关结构，提升模型对采集噪声的鲁棒性（Perez et al. 2017；Volpp et al. 2018）。
+
+**代码变更**：`models/graph_native_system.py`、`configs/default.yaml`
+
+---
+
+### 缓存架构重设计（解决下游加载问题）
+
+**问题**：
+1. 跨模态边之前被序列化进缓存文件；修改 `k_cross_modal` 需清空全部缓存才能生效。
+2. 下游代码（推理、可视化、分析）无简便方式从 `.pt` 缓存文件提取 EEG/fMRI 时序 numpy 数组。
+
+**方案**：
+- **缓存保存**：仅持久化节点特征（EEG/fMRI 时序 x）和同模态边（功能连通性 edge_index/edge_attr）；跨模态边不写入缓存
+- **缓存加载**：每次加载时从缓存节点特征动态重建跨模态边（代价 O(N_eeg×N_fmri×T)，仅矩阵乘法）；`k_cross_modal` 修改立即生效，无需重建缓存
+- `k_cross_modal` 从缓存键哈希中移除 → 旧缓存文件后向兼容，无需清空重建
+- 缓存加载日志新增节点类型和边类型显示
+- 新增 `utils/helpers.py::load_subject_graph_from_cache(cache_path)` 工具函数：
+  - 输入：缓存 `.pt` 路径
+  - 输出：`{'eeg_timeseries': ndarray[N_eeg, T], 'fmri_timeseries': ndarray[N_fmri, T], 'eeg_edge_index': ..., 'fmri_edge_index': ..., ...}`
+  - 下游代码无需了解 PyG HeteroData 即可直接使用
+
+**代码变更**：`main.py`（`_graph_cache_key`、缓存加载/保存路径）、`utils/helpers.py`
+
+---
+
+### 代码质量改进
+
+- `_row_zscore()` 提升为 `graph_native_mapper.py` 模块级私有函数（可独立测试）
+- 修复 `visualization.py` 中 `create_sample_visualizations` 函数定义丢失问题
+- 移除 `plot_training_curves` 中的冗余 `if val_loss:` 嵌套检查
+
+---
+
+### 修改文件
+
+- `models/graph_native_mapper.py`：相关性跨模态边，`_row_zscore` 提升为模块级
+- `models/graph_native_system.py`：数据增强，`augmentation_config` 参数
+- `utils/visualization.py`：`plot_training_curves`，修复 `create_sample_visualizations`
+- `utils/helpers.py`：`load_subject_graph_from_cache`
+- `main.py`：缓存架构，断点续训，训练曲线调用，代码审查修复
+- `configs/default.yaml`：`k_cross_modal`，`training.augmentation`
 
 ---
 

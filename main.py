@@ -1246,7 +1246,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         if resume_path.exists():
             try:
                 saved_epoch = trainer.load_checkpoint(resume_path)
-                _start_epoch = saved_epoch + 1
+                # load_checkpoint returns the saved epoch number (int).
+                # Guard against None in case an old checkpoint had no 'epoch' key.
+                _start_epoch = (int(saved_epoch) + 1) if saved_epoch is not None else 1
                 logger.info(
                     f"🔄 断点续训: 从 epoch {_start_epoch} 继续"
                     f" (已加载检查点 {resume_path})"
