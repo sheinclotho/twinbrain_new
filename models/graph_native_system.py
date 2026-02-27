@@ -719,6 +719,7 @@ class GraphNativeTrainer:
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
         optimization_config: Optional[Dict] = None,
         max_grad_norm: float = 1.0,
+        gradient_accumulation_steps: int = 1,
     ):
         """
         Initialize trainer.
@@ -742,12 +743,19 @@ class GraphNativeTrainer:
                 fine-grained hyperparameters.  Defaults used when None.
             max_grad_norm: Max gradient norm for clipping (config['training']['max_grad_norm']).
                 Hardcoding this to 1.0 previously caused the config value to be silently ignored.
+            gradient_accumulation_steps: Accumulate gradients over this many steps before
+                calling optimizer.step().  Default 1 = standard single-step update (backward
+                compatible).  Set to 4 for an effective batch size of 4 with batch_size=1
+                data, stabilising gradient estimates on small datasets without extra memory.
+                The loss is scaled by 1/gradient_accumulation_steps before backward() to
+                keep gradient magnitudes consistent regardless of the accumulation count.
         """
         self._optimization_config = optimization_config or {}
         self.model = model.to(device)
         self.device = device
         self.node_types = node_types
         self.max_grad_norm = max_grad_norm
+        self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
         
         # Verify CUDA availability
         if device.startswith('cuda') and not torch.cuda.is_available():
@@ -967,18 +975,33 @@ class GraphNativeTrainer:
         """
         return eeg_x.squeeze(0).permute(1, 0).unsqueeze(-1)
 
-    def train_step(self, data: HeteroData) -> Dict[str, float]:
+    def train_step(
+        self,
+        data: HeteroData,
+        do_zero_grad: bool = True,
+        do_optimizer_step: bool = True,
+        loss_scale: float = 1.0,
+    ) -> Dict[str, float]:
         """
         Single training step with optional mixed precision.
         
         Args:
             data: Input HeteroData
+            do_zero_grad: Whether to zero gradients before this step.
+                Set False when accumulating gradients across multiple steps.
+            do_optimizer_step: Whether to call optimizer.step() after backward.
+                Set False for all but the last step in gradient accumulation.
+            loss_scale: Multiply total_loss by this factor before backward().
+                Use 1/gradient_accumulation_steps to normalise gradient magnitude
+                when accumulating, keeping effective gradient scale constant
+                regardless of accumulation count.
             
         Returns:
             Dictionary of loss values
         """
         self.model.train()
-        self.optimizer.zero_grad()
+        if do_zero_grad:
+            self.optimizer.zero_grad()
         
         # Move data to device
         data = data.to(self.device)
@@ -1069,12 +1092,15 @@ class GraphNativeTrainer:
                         total_loss = total_loss + eeg_reg
                         losses['eeg_reg'] = eeg_reg
                 
-                # Backward pass with gradient scaling
-                self.scaler.scale(total_loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # Backward pass with gradient scaling.
+                # Apply loss_scale (= 1/gradient_accumulation_steps) to normalise
+                # gradient magnitude when accumulating across multiple steps.
+                self.scaler.scale(total_loss * loss_scale).backward()
+                if do_optimizer_step:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
             else:
                 # Standard training without AMP
                 if self.model.use_prediction:
@@ -1100,10 +1126,13 @@ class GraphNativeTrainer:
                     total_loss = total_loss + eeg_reg
                     losses['eeg_reg'] = eeg_reg
                 
-                # Backward pass
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
-                self.optimizer.step()
+                # Backward pass.
+                # Apply loss_scale (= 1/gradient_accumulation_steps) to normalise
+                # gradient magnitude when accumulating across multiple steps.
+                (total_loss * loss_scale).backward()
+                if do_optimizer_step:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                    self.optimizer.step()
             
             # Update loss balancer with detached scalar values.
             # backward() has already freed the computation graph by this point;
@@ -1156,6 +1185,7 @@ class GraphNativeTrainer:
         random.Random(epoch or 0).shuffle(epoch_data)
         total_loss = 0.0
         num_batches = len(epoch_data)
+        ga = self.gradient_accumulation_steps  # shorthand
         
         # Advance epoch counter in the adaptive loss balancer so that the warmup
         # period expires correctly and weight adaptation becomes active.
@@ -1170,7 +1200,17 @@ class GraphNativeTrainer:
                 logger.info(f"📊 Epoch {epoch}/{total_epochs or '?'} 训练中...")
         
         for i, data in enumerate(epoch_data):
-            loss_dict = self.train_step(data)
+            # ── 梯度累积控制 ────────────────────────────────────────────────────
+            # 每 ga 步执行一次 optimizer.step()，等效 batch size = ga × 1。
+            # loss 除以 ga 以保持梯度期望不随 ga 变化（梯度期望 = Σ∇L_i / ga）。
+            # do_zero_grad=True 仅在每组累积的第一步清零，避免丢失已累积梯度。
+            is_accum_boundary = (i + 1) % ga == 0 or i == num_batches - 1
+            loss_dict = self.train_step(
+                data,
+                do_zero_grad=(i % ga == 0),
+                do_optimizer_step=is_accum_boundary,
+                loss_scale=1.0 / ga,
+            )
             total_loss += loss_dict['total']
             
             # Log progress for longer training runs (every 10 batches or at 25%, 50%, 75%)
@@ -1208,7 +1248,7 @@ class GraphNativeTrainer:
             self.scheduler.step(val_loss)
     
     @torch.no_grad()
-    def validate(self, data_list: List[HeteroData]) -> float:
+    def validate(self, data_list: List[HeteroData]) -> Tuple[float, Dict[str, float]]:
         """
         Validation pass.
         
@@ -1217,14 +1257,26 @@ class GraphNativeTrainer:
         Previously this only computed reconstruction loss, making val_loss
         artificially lower than train_loss regardless of overfitting.
         
+        Additionally computes per-modality R² (coefficient of determination)
+        on reconstructed signals, providing a direct, interpretable measure
+        of model quality independent of loss function choice or signal scale.
+        R² = 0: model predicts the mean (no better than baseline).
+        R² = 1: perfect reconstruction.
+        R² < 0: model is worse than mean prediction (catastrophic failure).
+        
         Args:
             data_list: List of validation data
             
         Returns:
-            Average validation loss
+            Tuple of:
+                avg_loss: Average validation loss (scalar)
+                r2_dict: Per-modality R² {'r2_eeg': float, 'r2_fmri': float}
         """
         self.model.eval()
         total_loss = 0.0
+        # Accumulators for R²: running SS_res and SS_tot per modality
+        ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        ss_tot: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         
         for data in data_list:
             data = data.to(self.device)
@@ -1242,11 +1294,45 @@ class GraphNativeTrainer:
             
             losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
             total_loss += sum(losses.values()).item()
+
+            # ── R² per modality ─────────────────────────────────────────────
+            # R² = 1 - SS_res / SS_tot, accumulated over the full validation set
+            # (not averaged per sample) for a more stable estimate.
+            for node_type in self.node_types:
+                if (
+                    node_type in data.node_types
+                    and node_type in reconstructed
+                ):
+                    target = data[node_type].x          # [N, T, C]
+                    recon  = reconstructed[node_type]   # [N, T', C]
+                    T_min  = min(target.shape[1], recon.shape[1])
+                    target = target[:, :T_min, :]
+                    recon  = recon[:, :T_min, :]
+                    if recon.shape[0] != target.shape[0]:
+                        continue  # shape mismatch — already handled by compute_loss
+                    target_mean = target.mean()
+                    ss_res[node_type] += ((target - recon) ** 2).sum().item()
+                    ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
         
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
+
+        # Compute R² per modality
+        r2_dict: Dict[str, float] = {}
+        for node_type in self.node_types:
+            tot = ss_tot[node_type]
+            if tot > 1e-12:
+                r2 = 1.0 - ss_res[node_type] / tot
+            else:
+                r2 = 0.0  # undefined (zero-variance target) → treat as 0
+            r2_dict[f'r2_{node_type}'] = r2
+            # Track history per modality
+            key = f'val_r2_{node_type}'
+            if key not in self.history:
+                self.history[key] = []
+            self.history[key].append(r2)
         
-        return avg_loss
+        return avg_loss, r2_dict
     
     def save_checkpoint(self, path: Path, epoch: int):
         """Save training checkpoint with atomic write for safety."""

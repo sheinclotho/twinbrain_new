@@ -92,6 +92,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         # fMRI 条件时间段截取：修改此选项改变 fMRI 节点特征的时间维度和连通性估计，
         # 必须使旧缓存失效，否则使用错误时间段的图参与训练。
         'fmri_condition_bounds': config['data'].get('fmri_condition_bounds'),
+        # EEG 连通性方法：'correlation' vs 'coherence' 产生不同 edge_index/edge_attr，
+        # 切换方法必须使旧缓存失效，否则 coherence 模式会使用 correlation 权重的旧图。
+        'eeg_connectivity_method': config['graph'].get('eeg_connectivity_method', 'correlation'),
     }
     params_hash = hashlib.md5(
         json.dumps(relevant, sort_keys=True).encode()
@@ -393,6 +396,7 @@ def build_graphs(config: dict, logger: logging.Logger):
         threshold_fmri=config['graph'].get('threshold_fmri', 0.3),
         threshold_eeg=config['graph'].get('threshold_eeg', 0.2),
         device=config['device']['type'],
+        eeg_connectivity_method=config['graph'].get('eeg_connectivity_method', 'correlation'),
     )
 
     # Resolve atlas file path once (relative to project root)
@@ -1180,6 +1184,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         device=config['device']['type'],
         optimization_config=config.get('v5_optimization'),
         max_grad_norm=config['training'].get('max_grad_norm', 1.0),
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
     )
     logger.info("✅ 训练器初始化完成")
     logger.info("=" * 60)
@@ -1188,9 +1193,12 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     
     # 训练循环
     best_val_loss = float('inf')
+    best_epoch = 0
     patience_counter = 0
     no_improvement_warning_shown = False
     epoch_times = []
+    output_dir = Path(config['output']['output_dir'])
+    best_checkpoint_path = output_dir / "best_model.pt"
     
     for epoch in range(1, config['training']['num_epochs'] + 1):
         epoch_start_time = time.time()
@@ -1227,7 +1235,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         
         # 验证
         if epoch % config['training']['val_frequency'] == 0:
-            val_loss = trainer.validate(val_graphs)
+            val_loss, r2_dict = trainer.validate(val_graphs)
             
             # Step scheduler based on validation loss (for ReduceLROnPlateau)
             trainer.step_scheduler_on_validation(val_loss)
@@ -1237,9 +1245,12 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
                 logger.error(f"❌ Validation loss is NaN/Inf at epoch {epoch}. Stopping training.")
                 raise ValueError("Validation diverged: loss is NaN or Inf")
             
+            # Format R² values for logging (show all modalities)
+            r2_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(r2_dict.items()))
             logger.info(
                 f"✓ Epoch {epoch}/{config['training']['num_epochs']}: "
                 f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
+                f"{r2_str}, "
                 f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
             
@@ -1252,12 +1263,11 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
             if val_loss < best_val_loss:
                 improvement = (best_val_loss - val_loss) / best_val_loss * 100 if best_val_loss != float('inf') else 100
                 best_val_loss = val_loss
+                best_epoch = epoch
                 patience_counter = 0
                 
                 # 保存检查点
-                output_dir = Path(config['output']['output_dir'])
-                checkpoint_path = output_dir / "best_model.pt"
-                trainer.save_checkpoint(checkpoint_path, epoch)
+                trainer.save_checkpoint(best_checkpoint_path, epoch)
                 if improvement != 100:
                     logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f} (提升 {improvement:.1f}%)")
                 else:
@@ -1277,12 +1287,168 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         
         # 定期保存检查点
         if epoch % config['training']['save_frequency'] == 0:
-            output_dir = Path(config['output']['output_dir'])
             checkpoint_path = output_dir / f"checkpoint_epoch_{epoch}.pt"
             trainer.save_checkpoint(checkpoint_path, epoch)
     
     logger.info("训练完成!")
     logger.info(f"最佳验证损失: {best_val_loss:.4f}")
+
+    # ── 恢复最佳模型（Optimization 4）────────────────────────────────────
+    # 训练结束（含早停）后，trainer.model 处于最后一个 epoch 的状态。
+    # 自动加载 best_model.pt，确保后续推理/评估使用验证集最优权重，
+    # 而非训练轨迹末端可能已过拟合的权重。
+    # 这是所有现代训练框架（Keras ModelCheckpoint、PyTorch-Lightning）的标准行为。
+    if best_checkpoint_path.exists() and best_val_loss < float('inf'):
+        try:
+            trainer.load_checkpoint(best_checkpoint_path)
+            logger.info(
+                f"✅ 已自动恢复最佳模型 "
+                f"(epoch={best_epoch}, val_loss={best_val_loss:.4f})"
+            )
+        except Exception as _e:
+            logger.warning(
+                f"⚠️ 最佳模型自动恢复失败: {_e}。"
+                f" 当前模型为最后一个 epoch 的状态。"
+                f" 可手动调用 trainer.load_checkpoint('{best_checkpoint_path}')。",
+                exc_info=True,
+            )
+
+    # ── SWA 阶段（Optimization 2，可选）────────────────────────────────────
+    # 在主训练（含最佳模型恢复）之后，以固定低 LR 继续训练若干 epoch，
+    # 对途中权重快照取平均，找到比 SGD 终点更平坦的极小值。
+    # 参考：Izmailov et al. (2018) "Averaging Weights Leads to Wider Optima"
+    if config['training'].get('use_swa', False):
+        try:
+            from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+            _swa_available = True
+        except ImportError:
+            logger.warning(
+                "⚠️ torch.optim.swa_utils 不可用（需要 PyTorch >= 1.6）。"
+                " 跳过 SWA 阶段。"
+            )
+            _swa_available = False
+
+        if _swa_available:
+            swa_epochs = int(config['training'].get('swa_epochs', 10))
+            swa_lr_ratio = float(config['training'].get('swa_lr_ratio', 0.05))
+            swa_lr = config['training']['learning_rate'] * swa_lr_ratio
+
+            logger.info("=" * 60)
+            logger.info(f"📊 开始 SWA 阶段: {swa_epochs} epochs, LR={swa_lr:.2e}")
+            logger.info("=" * 60)
+
+            # 1. Build averaged model wrapper (wraps trainer.model in-place for inference)
+            _orig_model = trainer.model  # keep reference for attribute access + compute_loss
+            swa_model = AveragedModel(_orig_model)
+
+            # 2. Replace scheduler with constant SWALR for SWA phase
+            swa_scheduler = SWALR(
+                trainer.optimizer,
+                swa_lr=swa_lr,
+                anneal_epochs=max(1, swa_epochs // 3),  # smooth transition
+                anneal_strategy='cos',
+            )
+
+            for swa_ep in range(1, swa_epochs + 1):
+                swa_train_loss = trainer.train_epoch(
+                    train_graphs,
+                    epoch=config['training']['num_epochs'] + swa_ep,
+                    total_epochs=config['training']['num_epochs'] + swa_epochs,
+                )
+                swa_model.update_parameters(trainer.model)
+                swa_scheduler.step()
+                logger.info(
+                    f"  SWA Epoch {swa_ep}/{swa_epochs}: "
+                    f"train_loss={swa_train_loss:.4f}"
+                )
+
+            # 3. Update BatchNorm running statistics.
+            #    The SWA-averaged weights never processed any real batch; BN layers
+            #    (present in GraphNativeDecoder) still have stale running_mean/var
+            #    from the original training run.  We use PyTorch's built-in
+            #    update_bn() which resets running stats and re-estimates them via a
+            #    cumulative moving average over the entire training set.
+            #    update_bn() sets the model to train() mode internally and uses
+            #    the iterable's items as positional arguments to swa_model.forward().
+            #    GraphNativeBrainModel.forward(data) accepts a single HeteroData
+            #    positional argument with all other params defaulting, so the
+            #    plain list iteration works correctly.
+            logger.info("  更新 SWA 模型 BatchNorm 统计量...")
+            try:
+                update_bn(train_graphs, swa_model, device=trainer.device)
+                logger.info("  ✅ BatchNorm 统计量已更新")
+            except Exception as _bn_err:
+                logger.warning(
+                    f"  BatchNorm 更新遇到问题: {_bn_err}。"
+                    f" SWA 模型 BN 统计量可能不准确。",
+                    exc_info=True,
+                )
+
+            # 4. Validate SWA model directly (without swapping trainer.model
+            #    to avoid AveragedModel attribute-proxy issues).
+            swa_model.eval()
+            swa_total_loss = 0.0
+            swa_ss_res: Dict[str, float] = {}
+            swa_ss_tot: Dict[str, float] = {}
+            with torch.no_grad():
+                for val_data in val_graphs:
+                    val_data = val_data.to(trainer.device)
+                    # AveragedModel.forward() proxies to the wrapped module's forward.
+                    # Use the original model for attribute checks like use_prediction.
+                    if _orig_model.use_prediction:
+                        recon_swa, _, enc_swa = swa_model(
+                            val_data, return_prediction=False, return_encoded=True
+                        )
+                    else:
+                        recon_swa, _ = swa_model(val_data, return_prediction=False)
+                        enc_swa = None
+                    # compute_loss is defined on the underlying module
+                    swa_losses = _orig_model.compute_loss(val_data, recon_swa, encoded=enc_swa)
+                    swa_total_loss += sum(swa_losses.values()).item()
+                    # R² per modality
+                    for nt in trainer.node_types:
+                        if nt in val_data.node_types and nt in recon_swa:
+                            tgt = val_data[nt].x
+                            rec = recon_swa[nt]
+                            T_min = min(tgt.shape[1], rec.shape[1])
+                            tgt = tgt[:, :T_min, :]
+                            rec = rec[:, :T_min, :]
+                            if rec.shape[0] != tgt.shape[0]:
+                                continue
+                            tgt_mean = tgt.mean()
+                            swa_ss_res[nt] = swa_ss_res.get(nt, 0.0) + ((tgt - rec) ** 2).sum().item()
+                            swa_ss_tot[nt] = swa_ss_tot.get(nt, 0.0) + ((tgt - tgt_mean) ** 2).sum().item()
+            swa_val_loss = swa_total_loss / max(len(val_graphs), 1)
+            swa_r2_dict = {
+                f'r2_{nt}': (1.0 - swa_ss_res.get(nt, 0.0) / max(swa_ss_tot.get(nt, 1e-12), 1e-12))
+                for nt in trainer.node_types
+            }
+
+            swa_r2_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(swa_r2_dict.items()))
+            logger.info(
+                f"✅ SWA 完成: val_loss={swa_val_loss:.4f} "
+                f"(主训练最佳: {best_val_loss:.4f})  {swa_r2_str}"
+            )
+            if swa_val_loss < best_val_loss:
+                logger.info(
+                    f"  🎯 SWA 验证损失优于主训练最佳 "
+                    f"({swa_val_loss:.4f} < {best_val_loss:.4f})，"
+                    f" 保存为 swa_model.pt 并推荐用于推理。"
+                )
+            else:
+                logger.info(
+                    f"  ℹ️  SWA 验证损失 ({swa_val_loss:.4f}) 未优于主训练最佳 "
+                    f"({best_val_loss:.4f})。两种模型均已保存，可按需选择。"
+                )
+
+            # 5. Save SWA model — always save regardless of comparison
+            #    (SWA's generalization benefit often shows on held-out test sets)
+            swa_checkpoint_path = output_dir / "swa_model.pt"
+            try:
+                torch.save(swa_model.state_dict(), swa_checkpoint_path)
+                logger.info(f"  💾 SWA 模型已保存: {swa_checkpoint_path}")
+            except Exception as _save_err:
+                logger.warning(f"  SWA 模型保存失败: {_save_err}")
 
 
 def main():

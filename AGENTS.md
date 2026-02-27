@@ -261,7 +261,35 @@ fmri_condition_bounds:
 
 ---
 
-## 四、文档格式规范（必须遵守）
+### [2026-02-27] 训练优化：四个关联盲区（V5.28）
+
+**问题 1 — validate() 返回值变更后调用方同步规则**
+
+`validate()` 从 `float` 改为 `Tuple[float, Dict]` 后，所有调用方必须同步解包，否则在 `np.isnan(val_loss)` 等处触发 `TypeError: ufunc 'isnan' not supported for the input types`。
+
+**规则**：改变函数返回类型前，先用 grep 找出所有调用方，确保全部同步修改。
+
+**问题 2 — AMP scaler 在梯度累积边界的调用顺序**
+
+`scaler.step()` 和 `scaler.update()` 必须成对调用，且只在真正执行 `optimizer.step()` 的那一步（边界步）调用。`scaler.unscale_(optimizer)` 也应仅在边界步调用，否则梯度被提前反缩放导致数值不稳定。
+
+**规则**：梯度累积中，AMP scaler 的 `unscale_/step/update` 三个调用均受 `do_optimizer_step` 条件保护。
+
+**问题 3 — SWA 对 AveragedModel 的属性访问**
+
+`AveragedModel` 是一个 `nn.Module` 包装器，`forward()` 正确透传，但自定义属性（如 `use_prediction`、`compute_loss`）不自动代理，直接访问会 `AttributeError`。
+
+**规则**：凡需要访问被 AveragedModel 包装的原始模型属性或方法，应先 `_orig_model = trainer.model`（AveragedModel 创建前），然后通过 `_orig_model` 访问，不通过 `swa_model` 访问。
+
+**问题 4 — EEG 频谱相干性改变 edge_index，必须纳入缓存 key**
+
+将 `eeg_connectivity_method` 从 `'correlation'` 切换到 `'coherence'` 会产生完全不同的连边和权重。若缓存 key 不包含此参数，旧缓存（用 correlation 权重）会被 coherence 模式无声使用，导致图结构静默错误。
+
+**规则**：任何影响 edge_index 或 edge_attr 的参数（包括连通性计算方法、阈值、k 近邻数）必须全部纳入 `_graph_cache_key()` 的哈希计算。
+
+---
+
+
 
 **项目永远只保留以下四个 MD 文件：**
 
@@ -357,6 +385,11 @@ train_step()
 |------|------|---------|
 | 个性化（被试特异性嵌入） | ✅ 已实现 | V5.19–V5.20 |
 | 动态拓扑（DynamicGraphConstructor） | ✅ 已实现 | V5.14 |
+| 系统级预测传播（GraphPredictionPropagator） | ✅ 已实现 | V5.25 |
+| 梯度累积（gradient_accumulation_steps） | ✅ 已实现 | V5.28 |
+| 随机权重平均（SWA） | ✅ 已实现（可选） | V5.28 |
+| 验证集 R² 指标 | ✅ 已实现 | V5.28 |
+| EEG 频谱相干性连接（configurable） | ✅ 已实现 | V5.28 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

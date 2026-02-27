@@ -48,6 +48,7 @@ class GraphNativeBrainMapper:
         threshold_fmri: float = 0.3,
         threshold_eeg: float = 0.2,
         device: Optional[str] = None,
+        eeg_connectivity_method: str = 'correlation',
     ):
         """
         Initialize graph-native mapper.
@@ -62,6 +63,12 @@ class GraphNativeBrainMapper:
             threshold_fmri: Connectivity threshold for fMRI (default: 0.3)
             threshold_eeg: Connectivity threshold for EEG (default: 0.2)
             device: Device to create tensors on ('cpu', 'cuda', or None for auto-detect)
+            eeg_connectivity_method: Method for EEG connectivity estimation.
+                'correlation' (default): Pearson correlation — fast, backward-compatible.
+                'coherence': Wideband magnitude squared coherence — captures
+                    frequency-domain oscillatory coupling (alpha/beta/gamma bands)
+                    more faithfully than time-domain correlation.
+                    Produces values in [0, 1]. Changes cache key automatically.
         """
         self.atlas_name = atlas_name
         self.preserve_temporal = preserve_temporal
@@ -71,6 +78,7 @@ class GraphNativeBrainMapper:
         self.k_nearest_eeg = k_nearest_eeg
         self.threshold_fmri = threshold_fmri
         self.threshold_eeg = threshold_eeg
+        self.eeg_connectivity_method = eeg_connectivity_method
         
         # Device management
         if device is None:
@@ -371,23 +379,95 @@ class GraphNativeBrainMapper:
         
         return data
     
-    def _compute_eeg_connectivity(self, timeseries: np.ndarray) -> np.ndarray:
+    def _compute_eeg_connectivity_spectral(self, timeseries: np.ndarray) -> np.ndarray:
+        """Compute wideband magnitude squared coherence (MSC) between EEG channels.
+
+        Coherence captures frequency-domain linear coupling between channels,
+        which is more meaningful for oscillatory neural signals than time-domain
+        Pearson correlation.  A single-number summary across all frequencies
+        (wideband MSC) is used so that the result has the same [N, N] shape and
+        value range [0, 1] as correlation-based connectivity.
+
+        Algorithm
+        ---------
+        For channels i and j at discrete frequency bin f:
+            G_xi(f) = FFT(x_i)[f]
+        Wideband MSC:
+            wMSC_ij = |mean_f(G_xi × conj(G_xj))|² /
+                      (mean_f(|G_xi|²) × mean_f(|G_xj|²))
+
+        Vectorised as matrix operations:
+            F: [N, n_freq] complex (rfft output)
+            cross_mean = F @ conj(F)^T / n_freq  → [N, N] complex
+            psd_mean   = mean(|F|², axis=1)       → [N]
+            wMSC = |cross_mean|² / outer(psd_mean, psd_mean)
+
+        The final connectivity value is sqrt(wMSC) (magnitude coherence, range [0,1]),
+        chosen for better dynamic range vs. raw MSC which clusters near 1 for
+        well-correlated channels.
+
+        References
+        ----------
+        - Nunez et al. (1997). EEG coherence. Neural Computation.
+        - Bullmore & Sporns (2009). Complex brain networks. Nat Rev Neurosci.
         """
-        Compute EEG connectivity matrix using GPU-accelerated correlation.
-        
+        N_ch, T = timeseries.shape
+        # rfft for real-valued signals: output shape [N_ch, T//2 + 1]
+        # float64 is required for numerical precision in the cross-spectrum
+        # computation; only convert if not already float64 to avoid redundant copy.
+        ts_f64 = timeseries if timeseries.dtype == np.float64 else timeseries.astype(np.float64)
+        F = np.fft.rfft(ts_f64, axis=1)
+        n_freq = F.shape[1]
+
+        # Mean cross-power matrix [N_ch, N_ch] complex:
+        # cross_mean[i,j] = mean_f( F[i,f] * conj(F[j,f]) )
+        cross_mean = np.dot(F, F.conj().T) / n_freq  # [N_ch, N_ch]
+
+        # Mean PSD per channel [N_ch]
+        psd_mean = (np.abs(F) ** 2).mean(axis=1)  # [N_ch]
+
+        # Wideband magnitude squared coherence [N_ch, N_ch]
+        psd_outer = np.outer(psd_mean, psd_mean) + 1e-12
+        msc = (np.abs(cross_mean) ** 2) / psd_outer
+
+        # Convert MSC (magnitude squared coherence, range [0,1²]) to
+        # magnitude coherence (sqrt of MSC, range [0,1]).  This is analogous
+        # to taking the absolute Pearson correlation: both represent the
+        # linear coupling strength between 0 (independent) and 1 (identical),
+        # and the sqrt provides better dynamic range since MSC ∈ [0,1] clusters
+        # near 1 for strongly coupled channels while sqrt(MSC) spreads the
+        # values more uniformly.  The result is directly comparable to the
+        # absolute Pearson correlation used in correlation-based connectivity.
+        connectivity = np.sqrt(np.clip(msc, 0.0, 1.0)).astype(np.float32)
+        np.fill_diagonal(connectivity, 1.0)
+        return connectivity
+
+    def _compute_eeg_connectivity(self, timeseries: np.ndarray) -> np.ndarray:
+        """Compute EEG connectivity matrix.
+
+        Dispatches to either Pearson correlation (fast, default, backward-compatible)
+        or wideband spectral coherence (neuroscientifically superior for oscillatory
+        EEG signals) based on ``self.eeg_connectivity_method``.
+
         Args:
             timeseries: [N_channels, T_time]
-            
+
         Returns:
-            connectivity: [N_channels, N_channels]
+            connectivity: [N_channels, N_channels] values in [0, 1]
         """
-        # Use GPU-accelerated correlation (same as fMRI)
-        connectivity = self._compute_correlation_gpu(timeseries)
-        
+        if self.eeg_connectivity_method == 'coherence':
+            connectivity = self._compute_eeg_connectivity_spectral(timeseries)
+            logger.debug(
+                f"EEG connectivity: wideband spectral coherence "
+                f"(N={timeseries.shape[0]}, T={timeseries.shape[1]})"
+            )
+        else:
+            # Default: GPU-accelerated Pearson correlation (same as fMRI)
+            connectivity = self._compute_correlation_gpu(timeseries)
+
         # Ensure valid values
         connectivity = np.nan_to_num(connectivity, nan=0.0)
         np.fill_diagonal(connectivity, 1.0)
-        
         return connectivity
     
     def _get_graph_device(self, data: HeteroData) -> torch.device:
