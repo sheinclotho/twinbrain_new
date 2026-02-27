@@ -377,8 +377,11 @@ class GraphNativeBrainModel(nn.Module):
             use_gradient_checkpointing: Free intermediate activations per timestep
                 to avoid MemoryError on long sequences (trades memory for compute)
             predictor_config: Optional dict from config['v5_optimization']['advanced_prediction'].
-                Keys: use_hierarchical, use_transformer, use_uncertainty, num_scales,
-                num_windows, sampling_strategy.  Defaults used when None.
+                Keys: context_length, use_hierarchical, use_transformer, use_uncertainty,
+                num_scales, num_windows, sampling_strategy.  Defaults used when None.
+                context_length (default 200): number of past timesteps the predictor
+                uses as input.  Set context_length=70 + prediction_steps=1 for the
+                NPI "70-predict-1" paradigm.
             use_dynamic_graph: Enable self-iterating graph structure learning
                 (DynamicGraphConstructor per ST-GCN layer, intra-modal edges only).
             k_dynamic_neighbors: k-nearest neighbours for the dynamic adjacency.
@@ -436,6 +439,7 @@ class GraphNativeBrainModel(nn.Module):
             self.predictor = EnhancedMultiStepPredictor(
                 input_dim=hidden_channels,
                 hidden_dim=hidden_channels * 2,
+                context_length=pred_cfg.get('context_length', 200),
                 prediction_steps=prediction_steps,
                 use_hierarchical=pred_cfg.get('use_hierarchical', True),
                 use_transformer=pred_cfg.get('use_transformer', True),
@@ -526,25 +530,18 @@ class GraphNativeBrainModel(nn.Module):
         # 3. Predict: Future steps (optional)
         predictions = None
         if return_prediction and self.use_prediction:
-            # Step 3a — Per-node temporal prediction.
-            # EnhancedMultiStepPredictor treats N nodes as the batch dimension
-            # (h: [N, T, H]).  Each node's future trajectory is predicted
-            # independently from its own latent history.
+            # Per-node causal prediction: use last context_length timesteps
+            # to predict the next prediction_steps timesteps (NPI paradigm).
+            # predict_next() is the single correct entry point — it uses only
+            # the last min(context_length, T) steps (no future leakage) and
+            # produces a single coherent [N, pred_steps, H] prediction.
             predictions = {}
             for node_type in self.node_types:
                 if node_type in encoded_data.node_types:
                     h = encoded_data[node_type].x  # [N, T, H]
-                    # Returns (pred_windows, targets, uncertainties):
-                    #   pred_windows: [num_windows, N, prediction_steps, H]
-                    pred_windows, _, _ = self.predictor(h, return_uncertainty=False)
-                    # Average across sampled windows → [N, prediction_steps, H]
-                    predictions[node_type] = pred_windows.mean(dim=0)
+                    predictions[node_type] = self.predictor.predict_next(h)
 
-            # Step 3b — System-level graph propagation.
-            # The per-node predictions above are independent.  The propagator
-            # runs graph message-passing on {node_type: [N, pred_steps, H]} so
-            # that stimulating one brain region influences its connected
-            # neighbours — the brain as a coupled dynamical system.
+            # System-level graph propagation.
             if predictions:
                 predictions = self.prediction_propagator(predictions, data)
 
@@ -624,22 +621,25 @@ class GraphNativeBrainModel(nn.Module):
                 losses[f'recon_{node_type}'] = recon_loss
         
         # ── 潜空间自监督预测损失（系统级）──────────────────────────────────
-        # 流程：
-        #   1. 对每个模态，将编码器潜空间序列切分为
-        #      context（前 2/3）→ per-node 预测 future（后 1/3）
-        #   2. 对所有模态的初步预测应用 GraphPredictionPropagator，
-        #      让预测在连通脑区间传播（系统级预测）
-        #   3. 计算传播后的预测 vs. future_target 的损失
+        # 流程（修正后）：
+        #   1. 将编码器潜空间序列切分为：
+        #        context = 前 _PRED_CONTEXT_RATIO 部分   → 历史
+        #        future  = 后 (1-_PRED_CONTEXT_RATIO) 部分 → 待预测目标
+        #   2. 调用 predict_next(context)：
+        #        从 context 的最后 min(context_length, T_ctx) 步预测
+        #        未来 prediction_steps 步（NPI 范式，因果对齐）
+        #   3. 将所有模态的初步预测传入 GraphPredictionPropagator，
+        #        让预测在连通脑区间传播（系统级预测）
+        #   4. 计算传播后预测 vs. actual future 的损失
         #
-        # 关键区别（与节点独立预测）：
-        #   旧：每节点独立预测，刺激脑区 A 仅影响 A 的预测轨迹
-        #   新：传播后，A 的预测变化通过图拓扑扩散至相邻脑区 B、C…
-        #       等同于"大脑作为耦合动力学系统"的建模原则
-        #
-        # 注：编码器的 ST-GCN 跨模态边已使 fMRI 潜向量包含 EEG 信息，
-        #     故系统级预测损失隐式覆盖了跨模态预测目标。
+        # 关键修正（之前的错误）：
+        #   旧：pred_windows.mean(dim=0) = 对 context 内不同起始位置的窗口
+        #       预测求均值 → 再与 future_target 比较
+        #       → 比较的是 "steps [50-60], [120-130], [190-200] 的均值预测"
+        #         与 "steps [200-299] 的实际未来"，这是完全不同的时间段！
+        #   新：predict_next(context) 直接从 context 最后 context_length 步
+        #       预测 future 的最初 prediction_steps 步 → 因果对齐
         if encoded is not None and self.use_prediction:
-            # Step 1: Per-node temporal predictions for all modalities
             pred_means: Dict[str, torch.Tensor] = {}
             future_targets: Dict[str, torch.Tensor] = {}
 
@@ -649,25 +649,22 @@ class GraphNativeBrainModel(nn.Module):
                 h = encoded[node_type]  # [N, T, H]
                 T = h.shape[1]
                 if T < self._PRED_MIN_SEQ_LEN:
-                    # 序列过短，跳过（需 ≥ _PRED_MIN_SEQ_LEN 才能切分 context/future）
                     continue
                 T_ctx = int(T * self._PRED_CONTEXT_RATIO)
                 context = h[:, :T_ctx, :]       # [N, T_ctx, H]
                 future_target = h[:, T_ctx:, :] # [N, T_fut, H]
 
-                # EnhancedMultiStepPredictor: nodes treated as batch dim
-                # Returns (pred_windows[W, N, pred_steps, H], targets, unc)
-                pred_windows, _, _ = self.predictor(context, return_uncertainty=False)
-                pred_means[node_type] = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+                # Causal prediction: last context_length steps → next prediction_steps.
+                # This is the NPI paradigm: "N past steps → K future steps."
+                pred = self.predictor.predict_next(context)  # [N, pred_steps, H]
+                pred_means[node_type] = pred
                 future_targets[node_type] = future_target
 
-            # Step 2: System-level graph propagation of predictions.
-            # Allows the predicted activity change at one brain region to
-            # propagate to its neighbours, producing a whole-brain forecast.
+            # System-level graph propagation of predictions.
             if pred_means:
                 pred_means = self.prediction_propagator(pred_means, data)
 
-            # Step 3: Prediction loss per modality
+            # Prediction loss: propagated prediction vs. actual future.
             for node_type, pred_mean in pred_means.items():
                 future_target = future_targets[node_type]
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
@@ -1363,10 +1360,10 @@ class GraphNativeTrainer:
                         ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
 
                 # ── Signal-space prediction R² per modality ─────────────────
-                # The predictor operates in latent space; we decode its output
-                # back to signal space so we can measure the genuinely useful
-                # "given the past, how well can you predict the future signal?"
-                # capability — the primary metric for a digital-twin brain model.
+                # Causal evaluation: given only the first T_ctx timesteps of
+                # the encoded sequence, predict the next pred_steps timesteps,
+                # decode back to signal space, and compare against the actual
+                # future signal.  This matches the training objective exactly.
                 if self.model.use_prediction and encoded is not None:
                     pred_latents: Dict[str, torch.Tensor] = {}
                     pred_T_ctx: Dict[str, int] = {}
@@ -1380,11 +1377,8 @@ class GraphNativeTrainer:
                             continue
                         T_ctx = int(T * self.model._PRED_CONTEXT_RATIO)
                         context = h[:, :T_ctx, :]
-                        # Use same predictor as compute_loss()
-                        pred_windows, _, _ = self.model.predictor(
-                            context, return_uncertainty=False
-                        )
-                        pred_latents[node_type] = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+                        # Causal prediction using the same predict_next() as training.
+                        pred_latents[node_type] = self.model.predictor.predict_next(context)
                         pred_T_ctx[node_type] = T_ctx
 
                     # System-level graph propagation of predictions

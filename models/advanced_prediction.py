@@ -790,6 +790,60 @@ class EnhancedMultiStepPredictor(nn.Module):
         
         return predictions, targets, uncertainties
     
+    def predict_next(self, h: torch.Tensor) -> torch.Tensor:
+        """Causal one-shot prediction: context → future.
+
+        Uses the last ``min(context_length, T)`` timesteps as context and
+        predicts the next ``prediction_steps`` timesteps.  Unlike ``forward()``
+        (which samples multiple windows for self-supervised training), this
+        method produces a single causally-aligned prediction — the correct
+        entry point for training loss, inference, and evaluation.
+
+        Scientific analogy (NPI-style): the model receives the last
+        ``context_length`` brain-state vectors and produces the next
+        ``prediction_steps`` brain-state vectors.  With
+        ``context_length=70, prediction_steps=1`` this is exactly the
+        "70 predict 1" paradigm; with
+        ``context_length=200, prediction_steps=10`` it predicts 10 future
+        steps from 200 past steps.
+
+        Args:
+            h: Latent sequence [batch, T, H].  Only the last
+               ``min(context_length, T)`` steps are used.
+
+        Returns:
+            pred: Predicted latent [batch, prediction_steps, H]
+        """
+        ctx_len = min(self.context_length, h.shape[1])
+        if ctx_len < self.prediction_steps:
+            logger.warning(
+                f"predict_next: available context ({ctx_len} steps) is shorter than "
+                f"prediction_steps ({self.prediction_steps}).  Prediction may be unreliable. "
+                f"Consider reducing prediction_steps or providing a longer sequence."
+            )
+        context = h[:, -ctx_len:, :]   # [batch, ctx_len, H] — causally bounded
+
+        if self.use_uncertainty:
+            pred, _ = self.predictor(
+                context,
+                future_steps=self.prediction_steps,
+                return_uncertainty=False,
+            )
+        elif self.use_hierarchical:
+            pred, _ = self.predictor(context, self.prediction_steps)
+        else:
+            # GRU: autoregressive rollout from last context step
+            _, hidden = self.predictor(context)
+            current = context[:, -1:, :]
+            preds = []
+            for _ in range(self.prediction_steps):
+                output, hidden = self.predictor(current, hidden)
+                preds.append(output)
+                current = output
+            pred = torch.cat(preds, dim=1)  # [batch, prediction_steps, H]
+
+        return pred
+
     def compute_loss(
         self,
         predictions: torch.Tensor,

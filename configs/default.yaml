@@ -384,6 +384,24 @@ v5_optimization:
   
   # 潜空间预测头配置（EnhancedMultiStepPredictor）
   advanced_prediction:
+    # 预测上下文长度（context_length）
+    # ─────────────────────────────────────────────────────────────
+    # 用于预测的历史时间步数 = 预测头的输入窗口大小。
+    # 训练和推理使用完全相同的长度（因果对齐，无数据泄漏）。
+    #
+    # 科学依据（NPI 范式，NUST 等）：
+    #   NPI 方法使用 3 或 70 个时间步的历史预测下一个时间步。
+    #   本模型同样支持此范式；通过调节以下两个参数：
+    #     context_length=70, prediction_steps=1  → "70步预测1步"（NPI风格）
+    #     context_length=200, prediction_steps=10 → "200步预测10步"（长程预测）
+    #
+    # 默认值 200：
+    #   对应 max_seq_len=300 时上下文部分的全部历史（2/3 × 300 = 200 步）。
+    #   改为更小的值（如 70）可以用更少历史做预测，训练更稳定但长程信息减少。
+    #
+    # fMRI (TR=2s, 200步 × 2s = 400秒历史):  建议 context_length=50-200
+    # EEG (250Hz, 200步 / 250Hz = 0.8秒历史): 建议 context_length=50-500
+    context_length: 200
     # true：多尺度层级预测（粗→细，Transformer + 上采样）
     # 理论基础：大脑对时间信息的处理本身是层级的（Hasson et al. 2015）。
     use_hierarchical: true
@@ -396,7 +414,7 @@ v5_optimization:
     # 时间尺度数（Hierarchical 模式下的粗-中-细层数）
     # 建议：3（2^2, 2^1, 2^0 下采样因子，覆盖不同频率成分）。
     num_scales: 3
-    # 采样窗口数（每次 forward 从序列中采样的窗口数量）
+    # 采样窗口数（每次 forward 从序列中采样的窗口数量，仅用于预训练/自监督）
     # 建议：3（Stratified 采样覆盖序列首/中/尾）。
     num_windows: 3
     # 窗口采样策略：uniform（均匀）/ random（随机）/ adaptive（重要性加权）
