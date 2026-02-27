@@ -243,6 +243,36 @@ training:
   # 建议：1.0（Adam 系列标准）。
   max_grad_norm: 1.0
   
+  # 梯度累积步数（等效增大批次大小，不增加内存）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 默认 1 = 标准单步更新（后向兼容）。
+  # 设为 N 时，每 N 步才执行一次 optimizer.step()，等效 batch_size = N × 1 = N。
+  # loss 自动除以 N，梯度期望不变，幅度与单步一致。
+  #
+  # 科学依据：更大的等效 batch_size 减少梯度估计方差（Goodfellow et al. 2016 Ch.8）。
+  # 对 N<100 样本的神经影像数据集，推荐 gradient_accumulation_steps=4（等效 batch=4）。
+  # 建议：4（小数据集）；2（中等数据集）；1（大数据集）。
+  gradient_accumulation_steps: 1  # 建议小数据集设为 4
+
+  # 随机权重平均（Stochastic Weight Averaging, SWA）
+  # ─────────────────────────────────────────────────────────────────────────
+  # SWA 在主训练循环结束后，以固定低学习率继续训练若干 epoch，并对途中权重快照取平均。
+  # 通过平均找到比单一 SGD 终点更宽/更平坦的极小值，提升 OOD 泛化 3-8%（Izmailov 2018）。
+  #
+  # 对神经影像场景特别有价值：测试被试的脑信号分布可能与训练集存在偏差，
+  # 更宽的极小值对此类分布偏移更鲁棒。
+  #
+  # 参考：Izmailov et al. (2018) "Averaging Weights Leads to Wider Optima and
+  #       Better Generalization" UAI 2018.
+  #
+  # false（默认）：不使用 SWA（后向兼容）。
+  # true：主训练结束后额外运行 swa_epochs 轮 SWA 训练，结果保存为 swa_model.pt。
+  use_swa: false
+  # SWA 训练额外轮数（建议：总 epoch 数的 10-20%，例如 100 epoch 训练后 10-20 轮 SWA）
+  swa_epochs: 10
+  # SWA 学习率 = 初始 LR × swa_lr_ratio（建议：0.01–0.05；太小无法采集多样快照）
+  swa_lr_ratio: 0.05
+  
   # 验证频率（每 N 个 epoch 做一次验证）
   val_frequency: 5
   
@@ -384,6 +414,21 @@ graph:
   # 仅当 EEG 电极已通过 MNE 配准到 MNI 坐标系时有效；
   # 否则使用随机连接（connection_ratio）。
   cross_modal_distance_threshold: 30.0
+
+  # EEG 通道间连通性计算方法
+  # ─────────────────────────────────────────────────────────────────────────
+  # "correlation"（默认）：Pearson 相关系数（时域，快速，后向兼容）。
+  # "coherence"：宽带幅度相干性（频域，捕捉 alpha/beta/gamma 神经振荡同步）。
+  #
+  # 科学依据：相干性（coherence）衡量频域线性耦合，对振荡性神经活动更敏感：
+  #   • Alpha (8-12 Hz)：视觉皮层放松态，枕-顶同步
+  #   • Beta (13-30 Hz)：运动准备，感觉运动环路同步
+  #   • Gamma (30-80 Hz)：认知绑定，局部回路
+  # 若数据主要体现神经振荡特征，"coherence" 通常比 "correlation" 产生更有意义的图拓扑。
+  #
+  # 注意：修改此选项会改变 EEG 图的 edge_index 和 edge_attr；
+  #       缓存键自动包含此参数，切换后旧缓存文件自动失效并重建。
+  eeg_connectivity_method: "correlation"  # "correlation" 或 "coherence"
 
 # ──────────────────────────────────────────────────────────────────────────
 # 六、输出配置
