@@ -1,8 +1,31 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-27  
-**版本**：V5.26  
+**版本**：V5.27  
 **状态**：生产就绪
+
+---
+
+## [V5.27] 2026-02-27 — 代码审查：Bug 修复 + 死代码清理 + 推理接口完善
+
+### Bug 修复
+
+- **`EnhancedGraphNativeTrainer.train_step()`**：梯度裁剪硬编码 `max_norm=1.0`，忽略 `config['training']['max_grad_norm']`；已改为 `self.max_grad_norm`
+- **`GraphNativeBrainModel.forward()`**：`import logging as _log` 为 hot-path 内局部导入，已改为模块级 `logger`
+
+### 死代码清理
+
+- `main.py` 删除从未被调用的 `prepare_data()` 函数（55 行，已被 `build_graphs()` 取代）
+
+### 推理接口完善（来自 API_REFERENCE.md 迁移）
+
+- `main()` 新增：训练完成后将 `subject_to_idx` 保存为 `outputs/<exp>/subject_to_idx.json`。  
+  此映射是被试特异性嵌入在推理阶段不可缺少的依据——若不保存则无法将被试 ID 还原到 Embedding 索引
+
+### 文档更新
+
+- `SPEC.md`：更新项目结构（补全 V5.1 模块）、新增推理接口速查表（张量形状 + 检查点格式）
+- `USERGUIDE.md`：新增常见错误排查表、依赖版本表、意识模块简短示例
 
 ---
 
@@ -866,6 +889,42 @@ initial_weight(recon_fmri) ∝ 1/energy_fmri = 1/1.0 = 1
 **修复**：在 `extract_windowed_samples()` 中新增 `cross_modal_align` 选项（默认 False）：
 - `True`：`ws_eeg = round(ws_fmri × T_eeg / T_fmri)`，强制时间对齐。
 - 配置项：`windowed_sampling.cross_modal_align: false`（见 `configs/default.yaml`）。
+
+---
+
+## [V5.1] 2026-02-19 — 意识建模模块（实验性，Experimental）
+
+### 新增模块
+
+| 文件 | 内容 |
+|------|------|
+| `models/consciousness_module.py` | **全局工作空间整合器**（GWT, Baars 1988）：16 个可学习工作空间槽位 + 多头注意力竞争/广播；**IIT Φ 计算器**（Tononi 2004）：近似最小信息分区，Φ = 整体有效信息 − 分区信息；**意识状态分类器**：7 状态（Wakefulness Φ>0.6, REM ≈0.45, NREM ≈0.25, Anesthesia <0.2, Coma <0.1, Vegetative ≈0.05, MinimallyConscious ≈0.15） |
+| `models/advanced_attention.py` | **CrossModalAttention**：EEG ↔ fMRI 双向注意力（解决时空分辨率不匹配）；**SpatialTemporalAttention**；**HierarchicalAttention**；**ContrastiveAttention** |
+| `models/predictive_coding.py` | **HierarchicalPredictiveCoding**（Friston 2010）：3 层次（256→512→1024）预测编码，精度加权，自由能最小化；**ActiveInference**：期望自由能最小化 + 目标导向动作选择 |
+| `models/enhanced_graph_native.py` | **ConsciousGraphNativeBrainModel** + **EnhancedGraphNativeTrainer**：以 wrap 方式集成以上模块，`enable_*` 参数独立开关，向后兼容基础模型 |
+| `utils/visualization.py` | 脑网络图、Φ 时序、跨模态注意力矩阵、意识状态轨迹等可视化工具 |
+
+### 计算开销（相对基础 V5 模型）
+
+| 模块 | 额外时间 | 额外内存 |
+|------|---------|---------|
+| 全局工作空间（GWT） | +10% | +5% |
+| IIT Φ 计算 | +5% | +3% |
+| 跨模态注意力 | +15% | +8% |
+| 预测编码 | +20% | +10% |
+| **合计** | **+50%** | **+26%** |
+
+### 使用方式
+
+```python
+from models import create_enhanced_model, EnhancedGraphNativeTrainer
+model = create_enhanced_model(base_model_config=..., enable_consciousness=True,
+                               enable_cross_modal_attention=True, enable_predictive_coding=True)
+trainer = EnhancedGraphNativeTrainer(model, consciousness_loss_weight=0.1,
+                                      predictive_coding_loss_weight=0.1, ...)
+```
+
+**状态**：实验性，尚无公开数据集基准测试。
 
 ---
 

@@ -1340,6 +1340,18 @@ def main():
         # subject_to_idx: {subject_id_str → int_idx}，传给 create_model 以创建正确大小的 Embedding
         graphs, mapper, subject_to_idx = build_graphs(config, logger)
 
+        # 持久化 subject_to_idx 映射，确保推理时能将被试 ID 还原到 Embedding 索引。
+        # 不保存此文件则无法在训练后推理时恢复正确的 subject_idx，
+        # 导致被试特异性嵌入无法使用（详见 SPEC.md §2.4）。
+        if subject_to_idx:
+            sidx_path = Path(config['output']['output_dir']) / "subject_to_idx.json"
+            try:
+                with open(sidx_path, "w", encoding="utf-8") as _f:
+                    json.dump(subject_to_idx, _f, ensure_ascii=False, indent=2)
+                logger.info(f"被试索引映射已保存: {sidx_path}")
+            except OSError as _e:
+                logger.warning(f"保存 subject_to_idx 失败 ({sidx_path}): {_e}")
+
         # 步骤3: 创建模型
         model = create_model(config, logger, num_subjects=len(subject_to_idx))
         

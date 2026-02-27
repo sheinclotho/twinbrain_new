@@ -195,11 +195,69 @@ twinbrain_new/
 │   ├── graph_native_system.py   # 完整模型 + 训练器（含 subject_embed）
 │   ├── adaptive_loss_balancer.py
 │   ├── eeg_channel_handler.py
-│   └── advanced_prediction.py
+│   ├── advanced_prediction.py
+│   ├── consciousness_module.py  # 意识模块：GWT + IIT（V5.1，实验性）
+│   ├── advanced_attention.py    # 跨模态注意力、时空注意力（V5.1，实验性）
+│   ├── predictive_coding.py     # 层次化预测编码 + 主动推理（V5.1，实验性）
+│   └── enhanced_graph_native.py # 增强模型 + 训练器，集成以上意识模块（V5.1）
 ├── utils/
-│   └── helpers.py
+│   ├── helpers.py
+│   └── visualization.py         # 可视化工具（脑网络图、时序信号、注意力矩阵）
 └── atlases/                     # 脑图谱文件（Schaefer200）
 ```
+
+---
+
+## 三点五、推理接口速查
+
+### 模型输出张量形状
+
+| 张量 | 形状 | 值域 | 说明 |
+|------|------|------|------|
+| `reconstructed['eeg']` | `[N_eeg, T_eeg, 1]` | ≈±3 | EEG 重建信号 |
+| `reconstructed['fmri']` | `[N_fmri, T_fmri, 1]` | ≈±3 | fMRI 重建信号 |
+| `encoded['eeg']` | `[N_eeg, T_eeg, H]` | 无界 | EEG 潜向量 |
+| `encoded['fmri']` | `[N_fmri, T_fmri, H]` | 无界 | fMRI 潜向量（含 EEG 跨模态信息） |
+| `predictions['eeg']` | `[N_eeg, steps, H]` | 无界 | EEG 潜空间未来预测 |
+| `predictions['fmri']` | `[N_fmri, steps, H]` | 无界 | fMRI 潜空间未来预测 |
+| 同模态 `edge_attr` | `[E, 1]` | [0, 1] | Pearson \|r\| 功能连接强度 |
+| 跨模态 `edge_attr` | `[E, 1]` | = 1.0 | 均匀权重（随机连接） |
+| `subject_embed.weight` | `[N_sub, H]` | ≈±0.02 | 被试潜空间偏移（初始化值） |
+
+> 可视化时通常需要 `[N, T]` 而非 `[N, T, 1]`，用 `.squeeze(-1)` 即可。
+
+### 检查点文件结构（`best_model.pt`）
+
+```python
+checkpoint = torch.load("outputs/.../best_model.pt", map_location="cpu")
+# 键：
+{
+    "epoch":                int,          # 保存时的 epoch
+    "model_state_dict":     OrderedDict,  # model.load_state_dict() 用
+    "optimizer_state_dict": dict,         # 恢复训练用
+    "scheduler_state_dict": dict,         # LR 调度器状态（V5.22+，旧 ckpt 无此键）
+    "history": {
+        "train_loss": List[float],
+        "val_loss":   List[float],
+    },
+    # use_adaptive_loss=True 时额外存在：
+    "loss_balancer_state":  OrderedDict,
+}
+
+# 推理时从 state_dict 推断 num_subjects（无需外部记录）：
+state = checkpoint["model_state_dict"]
+num_subjects = state["subject_embed.weight"].shape[0] if "subject_embed.weight" in state else 0
+```
+
+### 被试索引映射（`subject_to_idx.json`）
+
+训练完成后自动保存到 `outputs/<experiment_name>/subject_to_idx.json`，内容如：
+
+```json
+{"sub-01": 0, "sub-02": 1, "sub-03": 2}
+```
+
+**推理时必须加载此文件**来确定各被试对应的 `subject_idx`，否则无法正确使用个性化嵌入。
 
 ---
 
