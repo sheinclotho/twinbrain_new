@@ -62,62 +62,6 @@ def load_config(config_path: str = None) -> dict:
     return config
 
 
-def prepare_data(config: dict, logger: logging.Logger):
-    """准备训练数据"""
-    logger.info("=" * 60)
-    logger.info("步骤 1/4: 加载数据")
-    logger.info("=" * 60)
-    
-    # fMRI 任务映射（用于 1:N EEG→fMRI 场景）
-    fmri_task_mapping = config['data'].get('fmri_task_mapping') or {}
-    if fmri_task_mapping:
-        logger.info(f"fMRI 任务映射: {fmri_task_mapping}")
-        logger.info(
-            "  说明：配置了映射后，任务发现仅扫描 EEG 文件，"
-            "fMRI 文件由映射关系确定（避免 fMRI-only 任务产生无 EEG 的单模态图）。"
-        )
-
-    # 初始化数据加载器
-    data_loader = BrainDataLoader(
-        data_root=config['data']['root_dir'],
-        modalities=config['data']['modalities'],
-        fmri_task_mapping=fmri_task_mapping if fmri_task_mapping else None,
-    )
-    
-    # 解析任务列表配置
-    # 优先使用 tasks（列表），兼容旧版 task（单字符串）
-    tasks = config['data'].get('tasks')
-    if tasks is None:
-        legacy_task = config['data'].get('task')
-        if legacy_task is not None:
-            tasks = [legacy_task]
-            logger.info(
-                f"使用旧版 'task: {legacy_task}' 配置。"
-                f" 建议迁移到 'tasks: [{legacy_task}]'。"
-            )
-        # tasks 仍为 None → 自动发现所有任务
-    elif isinstance(tasks, str):
-        tasks = [tasks]
-
-    if tasks is None:
-        logger.info("tasks: null → 自动发现每个被试的所有任务")
-    else:
-        logger.info(f"将加载以下任务: {tasks}")
-    
-    # 加载所有被试（可跨多任务）
-    all_data = data_loader.load_all_subjects(
-        tasks=tasks,
-        max_subjects=config['data'].get('max_subjects'),
-    )
-    
-    if not all_data:
-        raise ValueError("未加载到任何数据，请检查数据路径配置")
-    
-    logger.info(f"成功加载 {len(all_data)} 个被试-任务组合")
-    
-    return all_data
-
-
 # ── 时间窗口默认值（神经影像经验值，可通过配置覆盖）──────────────
 # fMRI: 50 TRs × TR≈2s = 100s — 覆盖一个完整慢波脑状态周期（Hutchison 2013）
 # EEG: 500 pts ÷ 250Hz = 2s — 覆盖 alpha (8-12 Hz) + beta (13-30 Hz) 主要节律
@@ -1395,6 +1339,18 @@ def main():
         # 步骤1-2: 加载数据 & 构建图（缓存感知，命中时跳过原始数据加载）
         # subject_to_idx: {subject_id_str → int_idx}，传给 create_model 以创建正确大小的 Embedding
         graphs, mapper, subject_to_idx = build_graphs(config, logger)
+
+        # 持久化 subject_to_idx 映射，确保推理时能将被试 ID 还原到 Embedding 索引。
+        # 不保存此文件则无法在训练后推理时恢复正确的 subject_idx，
+        # 导致被试特异性嵌入无法使用（详见 SPEC.md §2.4）。
+        if subject_to_idx:
+            sidx_path = Path(config['output']['output_dir']) / "subject_to_idx.json"
+            try:
+                with open(sidx_path, "w", encoding="utf-8") as _f:
+                    json.dump(subject_to_idx, _f, ensure_ascii=False, indent=2)
+                logger.info(f"被试索引映射已保存: {sidx_path}")
+            except OSError as _e:
+                logger.warning(f"保存 subject_to_idx 失败 ({sidx_path}): {_e}")
 
         # 步骤3: 创建模型
         model = create_model(config, logger, num_subjects=len(subject_to_idx))

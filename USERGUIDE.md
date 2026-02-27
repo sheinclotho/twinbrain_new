@@ -79,17 +79,66 @@ A：
 
 ---
 
-## 进阶：调整参数
+## 常见错误排查
 
-如果你对机器学习有一定了解，可以在 `configs/default.yaml` 中调整：
-
-| 参数 | 位置 | 说明 |
-|------|------|------|
-| `num_epochs: 100` | training | 训练轮数，越多越慢但效果可能更好 |
-| `learning_rate: 0.0001` | training | 学习率，一般不需要修改 |
-| `hidden_channels: 128` | model | 模型大小，内存不足时改为 64 |
-| `max_subjects: 0` | data | 0 表示用全部数据；改为 10 可快速测试 |
+| 错误信息 | 原因 | 解决办法 |
+|---------|------|---------|
+| 第一轮训练很慢（30-120s） | `torch.compile()` 首次编译 | 正常现象，第二轮开始加快 |
+| 内存不足 / 程序崩溃 | 模型太大 | `hidden_channels: 128` → `64` |
+| GPU 显存不足 | 编码层太深 | `num_encoder_layers: 4` → `2` |
+| `N_fmri=1`（fMRI 只有 1 节点） | atlas 文件找不到或 nilearn 未安装 | 检查 `atlases/` 目录；`pip install nilearn` |
+| `subject_embed.weight` 尺寸不匹配 | 推理时 `num_subjects` 与训练时不一致 | 从 `subject_to_idx.json` 重建，或从 checkpoint `state_dict` 推断 `num_subjects` |
+| 图缓存无 `subject_idx` 属性 | 缓存由旧版本（V5.18 前）生成 | 清除 `outputs/graph_cache/` 后重新运行 |
+| `KeyError: 'eeg'` on reconstructed | `modalities` 配置与实际数据不符 | 检查 `config.data.modalities` |
 
 ---
 
-**版本**：V5.0 | **更新**：2026-02-20
+## 依赖版本
+
+| 包 | 最低版本 | 说明 |
+|----|---------|------|
+| `torch` | 1.13+（推荐 2.0+） | `torch.compile()` 需 2.0+ |
+| `torch_geometric` | 2.3+ | HeteroData、MessagePassing |
+| `nilearn` | 0.9+（可选） | atlas 分区；缺失时 N_fmri=1 |
+| `mne` | 1.0+ | EEG 加载与预处理 |
+| `nibabel` | 4.0+ | NIfTI fMRI 文件读取 |
+| `numpy` | 1.21+ | — |
+| `pyyaml` | 6.0+ | 配置文件解析 |
+
+---
+
+## 进阶：使用意识建模模块（实验性功能，V5.1）
+
+系统内置了基于全局工作空间理论（GWT）和整合信息理论（IIT）的实验性意识建模模块，适合研究场景：
+
+```python
+from models import create_enhanced_model, EnhancedGraphNativeTrainer
+
+# 创建带意识模块的增强模型
+model = create_enhanced_model(
+    base_model_config={
+        'node_types': ['eeg', 'fmri'],
+        'edge_types': [('eeg','connects','eeg'), ('fmri','connects','fmri'),
+                       ('eeg','projects_to','fmri')],
+        'in_channels_dict': {'eeg': 1, 'fmri': 1},
+        'hidden_channels': 128,
+    },
+    enable_consciousness=True,           # 全局工作空间 + Φ 计算（+10% 开销）
+    enable_cross_modal_attention=True,   # EEG ↔ fMRI 双向注意力（+15%）
+    enable_predictive_coding=True,       # 自由能最小化（+20%）
+)
+
+trainer = EnhancedGraphNativeTrainer(
+    model=model,
+    node_types=['eeg', 'fmri'],
+    consciousness_loss_weight=0.1,
+    predictive_coding_loss_weight=0.1,
+)
+```
+
+**GPU 内存建议：** 8 GB → `num_workspace_slots: 8`；16 GB+ → 默认值即可。  
+完整 API 见 `models/consciousness_module.py`、`models/enhanced_graph_native.py` 的 docstring。
+
+---
+
+**版本**：V5.0 | **更新**：2026-02-27
