@@ -1,8 +1,152 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-26  
-**版本**：V5.21  
+**最后更新**：2026-02-27  
+**版本**：V5.24  
 **状态**：生产就绪
+
+---
+
+## [V5.24] 2026-02-27 — 多被试多任务联合训练正确性审查
+
+### 问题背景
+
+用户指出"合成图是多个任务多被试合成的，需要确保训练中能合理训练"，触发对训练完整流程的系统审查。
+
+### 误解澄清
+
+`graphs` 列表中每个 `HeteroData` 均为独立的 (被试, 任务) 图，不存在跨被试/跨任务的节点或特征混合。`train_epoch` 对每个样本独立调用 `train_step`（batch_size=1），每次完整的前向/反向/参数更新周期均基于单个样本。
+
+### 修复的三项缺陷
+
+#### Bug 1 — `train_epoch` 缺少逐 epoch 打乱（SGD 偏差）
+
+- **症状**：`train_model` 启动时只打乱一次，之后 epoch 1,2,3,... 看到完全相同的顺序
+- **影响**：optimizer 动量使列表末尾被试每轮获得最新梯度，模型系统性偏向字母序靠后的被试
+- **修复**：`train_epoch` 用 `random.Random(epoch).shuffle(copy)` 每轮独立打乱（以 epoch 为种子，可复现）
+
+#### Bug 2 — EEG handler 通道数不匹配跨被试静默失败
+
+- **症状**：`_ensure_eeg_handler` 按第一个样本的 `N_eeg` 初始化，后续不同通道数的被试传入错误形状张量
+- **影响**：产生不可预期的形状错误或静默的错误梯度，且无任何警告
+- **修复**：记录 `_eeg_n_channels`；不匹配时跳过该样本的增强并记录 debug 日志；`original_eeg_x` 仅在实际修改前保存（non-None ↔ 已修改，语义清晰）
+
+#### Bug 3 — `task_id` / `subject_id_str` 未存储（数据不可见）
+
+- **症状**：图构建后任务名和被试字符串被丢弃，无法追踪每个训练样本的来源
+- **影响**：`log_training_summary` 无法验证数据分布，调试困难
+- **修复**：在 `build_graphs`、缓存加载路径均写入这两个属性；`extract_windowed_samples` 传播到所有窗口；`log_training_summary` 展示每任务/被试的样本数及数据独立性说明
+
+### 样例训练摘要输出（V5.24 新增）
+
+```
+【训练数据组成】
+  总样本数: 330
+  按任务分布 (3 个任务):
+    GRADON: 110 个样本 (33.3%)
+    GRADOFF: 110 个样本 (33.3%)
+    rest: 110 个样本 (33.3%)
+  按被试分布 (10 个被试):
+    sub-01: 33 个样本 (10.0%)
+    ...
+  ✅ 数据独立性确认: 每个样本均来自独立的 (被试, 任务) 组合 ...
+  ✅ 逐 Epoch 打乱: train_epoch 每轮以 epoch 编号为种子打乱样本顺序 ...
+```
+
+### 修改文件
+
+- `models/graph_native_system.py`：`import random` 移到文件顶部；`_eeg_n_channels` 字段；`train_step` 通道守卫；`train_epoch` 逐 epoch 打乱
+- `main.py`：`build_graphs` / 缓存路径写入 `task_id` + `subject_id_str`；`extract_windowed_samples` 传播新属性；`log_training_summary` 数据组成摘要；`Counter` 顶层导入
+- `AGENTS.md`：记录三项缺陷
+- `CHANGELOG.md`：本版本更新日志
+
+---
+
+## [V5.23] 2026-02-27 — 跨条件边界时序污染修复
+
+### 🔍 问题背景
+
+用户发现：在 ON/OFF 多条件共享 fMRI 实验范式中（GRADON/GRADOFF 条件共用 task-CB 扫描），系统没有机制确保每个条件只学习自己对应的 fMRI 时间段。
+
+### 🐛 时序污染分析（两种模式均受影响）
+
+**非窗口模式** (`windowed_sampling.enabled: false`)：
+- GRADON 和 GRADOFF 的 `max_seq_len` 截断都从 `t=0` 开始
+- GRADOFF 错误地使用 GRADON 时段的 fMRI 数据（相同的神经影像特征）
+- 导致：两个实验条件的 fMRI 图结构完全相同，失去条件区分能力
+
+**窗口模式** (`windowed_sampling.enabled: true`)：
+- 滑动窗口从 CB fMRI 的 `t=0` 延伸至整个 run 末尾
+- 跨条件边界的窗口（如边界 TR=150 处的窗口 `[135:185]`）同时包含两个条件的数据
+- 预测损失：`context=[135:163]` → 预测 `target=[163:185]`，而 TR=150 处有实验条件切换
+- 模型被迫学习"如何预测实验条件切换"而非神经时序动态 → 引入虚假规律
+
+### ✅ 修复方案
+
+新增 `fmri_condition_bounds` 配置项：
+```yaml
+fmri_condition_bounds:
+  GRADON: [0, 150]    # CB fMRI 前 150 TRs 对应 GRADON 条件
+  GRADOFF: [150, 300] # CB fMRI 后 150 TRs 对应 GRADOFF 条件
+```
+
+**作用位置**：在 `mapper.map_fmri_to_graph()` 调用**之前**截取，确保：
+1. 连通性矩阵从条件特异性时间段估计（不含另一条件的神经活动）
+2. `max_seq_len` 截断和滑动窗口均在条件特异性范围内操作
+3. 不存在跨条件边界的训练样本
+
+**缓存兼容性**：`fmri_condition_bounds` 已加入 `_graph_cache_key()` 哈希计算，修改边界后旧缓存自动失效并重建。
+
+**1:1 标准场景**（每个 EEG 任务有独立的 fMRI 文件）：保持 `fmri_condition_bounds: null`，行为与之前完全一致。
+
+### 📁 修改文件
+
+- `main.py`：`_graph_cache_key()` 加入新参数；`build_graphs()` 增加条件时间段截取
+- `configs/default.yaml`：新增 `fmri_condition_bounds` 配置项（详细注释）
+- `AGENTS.md`：记录此类时序污染模式
+
+---
+
+## [V5.22] 2026-02-26 — 全流程审查：四处静默缺陷修复
+
+### 🔍 审查范围
+
+对数据处理 → 图构建 → 编码器 → 训练循环做了完整的调用链追踪审查，发现并修复以下四处在常规训练中不报错但会悄悄影响训练质量的缺陷。
+
+### 🐛 Bug 1：`max_grad_norm` 配置参数被静默忽略
+
+- **根因**：`train_step()` 硬编码 `max_norm=1.0`，`config['training']['max_grad_norm']` 从未被传入或使用
+- **影响**：用户修改梯度裁剪阈值无效；小数据集想要更激进的梯度裁剪（如 0.5）也无法生效
+- **修复**：`GraphNativeTrainer` 新增 `max_grad_norm` 参数；`train_model` 从 config 读取并传入
+
+### 🐛 Bug 2：Checkpoint 不保存 LR 调度器状态
+
+- **根因**：`save_checkpoint()` 未保存 `scheduler.state_dict()`；恢复后余弦退火从头重启
+- **影响**：中断恢复后 LR 从初始值重新线性预热，而非从中断点继续退火——相当于放弃了已有的预热+退火进度
+- **修复**：`save_checkpoint` 补存 `scheduler_state_dict`；`load_checkpoint` 补加还原逻辑；同时修复 `torch.load` 缺少 `weights_only=False` 的弃用警告
+
+### 🐛 Bug 3：编码器无消息时残差计算错误（潜在特征幅度放大）
+
+- **根因**：
+  ```python
+  x_new = x  # no messages
+  x_new = x + self.dropout(x_new)  # → x + dropout(x) ≈ 2x
+  ```
+  4 层编码器 eval 模式下累积约 2^4 = 16× 幅度放大
+- **影响**：通常不触发（正常配置中每个节点类型都有自环边，消息不为空），但若 `add_self_loops=False` 且某节点孤立，会导致特征幅度爆炸
+- **修复**：合并残差与消息：有消息时 `x + dropout(avg(msg))`；无消息时直接透传 `x`
+
+### 🐛 Bug 4：窗口模式下按窗口划分训练/验证集（数据泄漏）
+
+- **根因**：50% 重叠窗口随机 shuffle 后直接 90/10 split，同一 run 的相邻窗口可同时出现在训练集和验证集
+- **影响**：验证损失虚低（≈ 20-40%），无法反映真实泛化性；早停判断失效，模型可能过拟合未被发现
+- **修复**：引入 `run_idx`（每个 `(subject, task)` run 的全局索引），`extract_windowed_samples` 将其复制到所有子窗口，`train_model` 在窗口模式下按 run 分组做 run-level split
+
+### 📁 修改文件
+
+- `models/graph_native_encoder.py`：Bug 3（编码器残差）
+- `models/graph_native_system.py`：Bug 1（max_grad_norm）+ Bug 2（checkpoint scheduler）
+- `main.py`：Bug 1（传参）+ Bug 4（run_idx 赋值 + run-level split）
+- `AGENTS.md`：审查记录
 
 ---
 

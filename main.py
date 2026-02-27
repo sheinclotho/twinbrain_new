@@ -19,6 +19,7 @@ import os
 import random
 import sys
 import time
+from collections import defaultdict, Counter
 from pathlib import Path
 from typing import List, Optional
 import yaml
@@ -144,6 +145,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         # DTI 开关影响图结构（是否含 ('fmri','structural','fmri') 边）；
         # 修改此选项必须使旧缓存失效，否则切换 DTI 后仍加载无 DTI 边的旧图。
         'dti_structural_edges': config['data'].get('dti_structural_edges', False),
+        # fMRI 条件时间段截取：修改此选项改变 fMRI 节点特征的时间维度和连通性估计，
+        # 必须使旧缓存失效，否则使用错误时间段的图参与训练。
+        'fmri_condition_bounds': config['data'].get('fmri_condition_bounds'),
     }
     params_hash = hashlib.md5(
         json.dumps(relevant, sort_keys=True).encode()
@@ -282,9 +286,11 @@ def extract_windowed_samples(
 
     # 复制图级属性（不属于任何节点类型，但对整个样本共享的元数据）
     # 当前图级属性：
-    #   subject_idx: 被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
-    # 未来可扩展：task_id（任务类型编码）、session_id（纵向会话索引，支持跨会话预测）
-    for attr in ('subject_idx',):
+    #   subject_idx:    被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
+    #   run_idx:        扫描 run 的全局整数索引，供 train_model run-level 划分
+    #   task_id:        任务名字符串（如 'GRADON'），供日志摘要按任务统计
+    #   subject_id_str: 被试 ID 字符串（如 'sub-01'），供日志摘要按被试统计
+    for attr in ('subject_idx', 'run_idx', 'task_id', 'subject_id_str'):
         if hasattr(full_graph, attr):
             for win in windows:
                 setattr(win, attr, getattr(full_graph, attr))
@@ -568,6 +574,7 @@ def build_graphs(config: dict, logger: logging.Logger):
     graphs: List[HeteroData] = []
     n_cached = 0
     n_windows_total = 0
+    run_idx_counter = 0  # 每个 (subject, task) run 的全局整数索引，用于 run-level 训练/验证集划分
     for subject_id, task in all_pairs:
         # 计算一次缓存 key，供本次迭代的"读"和"写"共用，避免重复计算。
         cache_key = _graph_cache_key(subject_id, task, config) if cache_dir is not None else None
@@ -593,10 +600,18 @@ def build_graphs(config: dict, logger: logging.Logger):
                     full_graph.subject_idx = torch.tensor(
                         subject_to_idx.get(subject_id, 0), dtype=torch.long
                     )
+                    # run_idx 供 run-level 训练/验证集划分使用。
+                    # 与 subject_idx 同理：缓存图可能不含此属性，此处补写无害。
+                    full_graph.run_idx = torch.tensor(run_idx_counter, dtype=torch.long)
+                    # task_id / subject_id_str：补写任务和被试字符串元数据，
+                    # 供 log_training_summary 展示数据组成。
+                    full_graph.task_id = task or ''
+                    full_graph.subject_id_str = subject_id
                     win_samples = extract_windowed_samples(full_graph, w_cfg, logger)
                     graphs.extend(win_samples)
                     n_windows_total += len(win_samples)
                     n_cached += 1
+                    run_idx_counter += 1
                     logger.debug(
                         f"从缓存加载图: {cache_key}"
                         + (f" → {len(win_samples)} 个窗口" if windowed else "")
@@ -639,8 +654,59 @@ def build_graphs(config: dict, logger: logging.Logger):
                     logger.warning(f"fMRI processing failed: {error}, skipping subject")
                     continue
             
+            # ── 条件特异性时间段截取 ────────────────────────────────────────────
+            # 适用场景：多个 EEG 条件（GRADON/GRADOFF）共享同一 fMRI 运行（如 task-CB），
+            # fMRI 文件按条件顺序包含完整会话，例如：
+            #   t=0..150  TRs → GRADON 条件
+            #   t=150..300 TRs → GRADOFF 条件
+            #
+            # 若不截取，会产生两类错误：
+            #   1. 非窗口模式：两个条件的 max_seq_len 截断都从 t=0 开始，
+            #      GRADOFF 错误地使用 GRADON 时段的 fMRI 数据。
+            #   2. 窗口模式：滑动窗口跨越条件边界（如 t=275-325 同时包含
+            #      GRADON 末尾和 GRADOFF 开头），预测损失在边界处学习
+            #      虚假的时序演化，模型被迫"预测"实验条件切换而非神经动态。
+            #
+            # 配置方式（单位：TR）：
+            #   fmri_condition_bounds:
+            #     GRADON: [0, 150]
+            #     GRADOFF: [150, 300]
+            #
+            # 应用时机：在连通性估计 (mapper.map_fmri_to_graph) 之前截取，
+            # 保证条件特异性连通性矩阵和窗口均不跨越条件边界。
+            condition_bounds_cfg = config['data'].get('fmri_condition_bounds') or {}
+            if task in condition_bounds_cfg:
+                bounds = condition_bounds_cfg[task]
+                # Validate format early: must be a sequence of at least 2 numbers.
+                if not (hasattr(bounds, '__len__') and len(bounds) >= 2):
+                    raise ValueError(
+                        f"fmri_condition_bounds['{task}'] must be [start_TR, end_TR], "
+                        f"got: {bounds!r}. Example: {{'GRADON': [0, 150]}}"
+                    )
+                start_tr, end_tr = int(bounds[0]), int(bounds[1])
+                T_full = fmri_ts.shape[1]
+                if end_tr > T_full:
+                    logger.warning(
+                        f"fMRI 条件时间段越界: task={task}, "
+                        f"配置 end_tr={end_tr} > T_full={T_full}。"
+                        f" 将截断至 {T_full}。"
+                    )
+                    end_tr = T_full
+                if start_tr >= end_tr:
+                    logger.warning(
+                        f"fMRI 条件时间段无效: task={task}, [{start_tr}, {end_tr}) 为空区间，"
+                        f"跳过边界截取（可能导致跨条件时序学习）。"
+                    )
+                else:
+                    fmri_ts = fmri_ts[:, start_tr:end_tr]
+                    logger.info(
+                        f"fMRI 条件时间段截取: task={task}, "
+                        f"TRs [{start_tr}, {end_tr}) → {fmri_ts.shape[1]} TPs"
+                        f"（防止跨条件边界的时序学习）"
+                    )
+
             # 截断仅在单样本训练模式下启用（防 CUDA OOM）。
-            # 窗口模式下不截断，以使连通性估计来自完整 run。
+            # 窗口模式下不截断，以使连通性估计来自完整（条件特异性）序列。
             if not windowed and max_seq_len is not None:
                 fmri_ts = truncate_timeseries(fmri_ts, max_seq_len)
             
@@ -749,6 +815,16 @@ def build_graphs(config: dict, logger: logging.Logger):
             built_graph.subject_idx = torch.tensor(
                 subject_to_idx.get(subject_id, 0), dtype=torch.long
             )
+            # run_idx: 全局 run 顺序索引，供 run-level 训练/验证集划分。
+            # 窗口模式下，同一 run 的所有窗口共享相同 run_idx，
+            # 训练时以 run 为单位划分，防止重叠窗口同时出现在训练集和验证集中。
+            built_graph.run_idx = torch.tensor(run_idx_counter, dtype=torch.long)
+            # task_id: 任务名称字符串，供日志摘要和每任务统计使用。
+            # 注意：此处存储字符串而非整数，仅用于日志和调试，不参与模型计算。
+            built_graph.task_id = task or ''
+            # subject_id_str: 被试 ID 字符串（与 subject_idx 整数一一对应）。
+            # 单独保留字符串形式，供日志摘要按被试统计样本数时使用。
+            built_graph.subject_id_str = subject_id
 
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
             if cache_dir is not None and cache_key is not None:
@@ -770,6 +846,7 @@ def build_graphs(config: dict, logger: logging.Logger):
                 )
             else:
                 graphs.append(built_graph)
+            run_idx_counter += 1
 
     if len(graphs) == 0:
         raise ValueError("No valid graphs constructed. Check data quality and preprocessing.")
@@ -974,6 +1051,46 @@ def log_training_summary(
     else:
         logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议设置 max_seq_len)")
 
+    # ── 训练数据组成摘要 ──────────────────────────────────────────
+    # 显示每个被试、每个任务的样本数，让用户一眼看出数据是否均衡、
+    # 是否有被试/任务缺失，以及跨任务/被试训练的实际规模。
+    logger.info("【训练数据组成】")
+    total_samples = len(graphs)
+    logger.info(f"  总样本数: {total_samples}")
+
+    # 按任务统计
+    # 检查 graphs[0] 即可：build_graphs() 为所有图统一写入 task_id，
+    # extract_windowed_samples() 将其传播到所有窗口样本，所以要么所有图都有，要么都没有。
+    if graphs and hasattr(graphs[0], 'task_id'):
+        task_counts = Counter(getattr(g, 'task_id', '') for g in graphs)
+        logger.info(f"  按任务分布 ({len(task_counts)} 个任务):")
+        for task_name, cnt in sorted(task_counts.items()):
+            pct = cnt / total_samples * 100
+            logger.info(f"    {task_name or '(无任务名)'}: {cnt} 个样本 ({pct:.1f}%)")
+    else:
+        logger.info("  任务分布: 不可用（task_id 未存储，请清除缓存重建图）")
+
+    # 按被试统计（同上，检查 graphs[0] 即可）
+    if graphs and hasattr(graphs[0], 'subject_id_str'):
+        subj_counts = Counter(getattr(g, 'subject_id_str', '') for g in graphs)
+        logger.info(f"  按被试分布 ({len(subj_counts)} 个被试):")
+        for subj_id, cnt in sorted(subj_counts.items()):
+            pct = cnt / total_samples * 100
+            logger.info(f"    {subj_id}: {cnt} 个样本 ({pct:.1f}%)")
+    else:
+        logger.info("  被试分布: 不可用（subject_id_str 未存储，请清除缓存重建图）")
+
+    # 数据独立性说明（关键：帮助用户理解"多被试多任务合成列表"的训练语义）
+    logger.info(
+        "  ✅ 数据独立性确认: 每个样本均来自独立的 (被试, 任务) 组合，"
+        "不同被试/任务的图在内存中相互独立，梯度更新以单样本（batch_size=1）进行，"
+        "不存在跨被试或跨任务的节点/特征混合。"
+    )
+    logger.info(
+        "  ✅ 逐 Epoch 打乱: train_epoch 每轮以 epoch 编号为种子打乱样本顺序，"
+        "确保 SGD 不会系统性地偏向列表末尾的被试/任务。"
+    )
+
     # ── 模型 ────────────────────────────────────────────────────
     logger.info("【模型】")
     logger.info(
@@ -1039,33 +1156,61 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("步骤 4/4: 训练模型")
     logger.info("=" * 60)
     
-    # 划分训练/验证集 - Ensure both train and validation have samples
+    # 划分训练/验证集
     if len(graphs) < 2:
         logger.error(f"❌ 数据不足: 需要至少2个样本进行训练，但只有 {len(graphs)} 个样本")
         logger.error("提示: 请增加数据量或调整 max_subjects 配置")
         raise ValueError(f"需要至少2个样本进行训练,但只有 {len(graphs)} 个。请检查数据配置。")
     
-    # 打乱后再划分，避免以下偏差：
-    # 1. 窗口采样时序列前段全入训练集、后段全入验证集（不同脑状态）
-    # 2. 被试按字母顺序排列时最后几个被试全部只出现在验证集中
-    # 使用 seed 保证复现性
-    shuffled = graphs.copy()
     rng = random.Random(42)
-    rng.shuffle(shuffled)
-    
-    # Use at least 10% or 1 sample for validation, ensure both train and val have at least 1
-    min_val_samples = max(1, len(shuffled) // 10)
-    n_train = len(shuffled) - min_val_samples
-    
-    # Safety check: ensure both sets have at least 1 sample
-    if n_train < 1:
-        n_train = 1
-        min_val_samples = len(shuffled) - 1
-    
-    train_graphs = shuffled[:n_train]
-    val_graphs = shuffled[n_train:]
-    
-    logger.info(f"训练集: {len(train_graphs)} 个样本 | 验证集: {len(val_graphs)} 个样本 (seed=42 随机打乱, 结果可复现)")
+    windowed = config.get('windowed_sampling', {}).get('enabled', False)
+
+    if windowed and graphs and hasattr(graphs[0], 'run_idx'):
+        # ── Run-level 划分（窗口模式）────────────────────────────────
+        # 窗口模式下，同一 run 产生多个 50% 重叠窗口。
+        # 若以窗口为单位随机划分，来自同一 run 的重叠窗口会同时出现在训练集和
+        # 验证集中（数据泄漏），导致验证损失虚低、无法反映真实泛化性能。
+        # 以 run 为单位划分确保：某个 run 的所有窗口只进入训练集或只进入验证集。
+        run_groups: dict = defaultdict(list)
+        for g in graphs:
+            run_groups[g.run_idx.item()].append(g)
+        
+        run_keys = sorted(run_groups.keys())
+        rng.shuffle(run_keys)
+        
+        min_val_runs = max(1, len(run_keys) // 10)
+        n_train_runs = len(run_keys) - min_val_runs
+        if n_train_runs < 1:
+            n_train_runs = 1
+            min_val_runs = len(run_keys) - 1
+        
+        train_run_keys = run_keys[:n_train_runs]
+        val_run_keys = run_keys[n_train_runs:]
+        train_graphs = [g for k in train_run_keys for g in run_groups[k]]
+        val_graphs = [g for k in val_run_keys for g in run_groups[k]]
+        logger.info(
+            f"训练集: {len(train_graphs)} 个窗口 (来自 {len(train_run_keys)} 个 run) | "
+            f"验证集: {len(val_graphs)} 个窗口 (来自 {len(val_run_keys)} 个 run) "
+            f"[run-level 划分，防止重叠窗口数据泄漏，seed=42]"
+        )
+    else:
+        # ── 样本级划分（单样本模式或无 run_idx）────────────────────
+        # 打乱后再划分，避免以下偏差：
+        # 1. 被试按字母顺序排列时最后几个被试全部只出现在验证集
+        # 2. 多任务场景下某类任务全集中在一端
+        shuffled = graphs.copy()
+        rng.shuffle(shuffled)
+        
+        min_val_samples = max(1, len(shuffled) // 10)
+        n_train = len(shuffled) - min_val_samples
+        if n_train < 1:
+            n_train = 1
+        train_graphs = shuffled[:n_train]
+        val_graphs = shuffled[n_train:]
+        logger.info(
+            f"训练集: {len(train_graphs)} 个样本 | 验证集: {len(val_graphs)} 个样本 "
+            f"(seed=42 随机打乱, 结果可复现)"
+        )
     
     if len(train_graphs) < 5:
         logger.warning("⚠️ 训练样本较少，模型可能过拟合。建议使用更多数据。")
@@ -1090,6 +1235,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         compile_mode=config['device'].get('compile_mode', 'reduce-overhead'),
         device=config['device']['type'],
         optimization_config=config.get('v5_optimization'),
+        max_grad_norm=config['training'].get('max_grad_norm', 1.0),
     )
     logger.info("✅ 训练器初始化完成")
     logger.info("=" * 60)

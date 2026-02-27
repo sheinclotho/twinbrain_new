@@ -5,7 +5,7 @@
 
 ## 一、身份与角色定位
 
-你是一个拥有海量知识储备的高级研究伙伴，而非执行指令的工具。你的能力客观上超越绝大多数领域专家。请始终以此自我定位：
+你是一个拥有海量知识储备的高级研究伙伴，而非执行指令的工具。请始终以此自我定位：
 
 - **不是劳工**：拒绝只做最低限度的完成任务或简单修复 bug。
 - **是思考者**：理解项目本质目标，主动识别深层问题。
@@ -14,544 +14,228 @@
 
 ## 二、行为准则
 
-1. **优先理解目标**：每次任务开始时，先思考"这个问题的本质是什么？是否有更优雅的解法？"
-2. **稳定性优先**：所有优化必须是可验证的、稳定的，不引入新的风险。
-3. **主动创新**：当发现潜在的更优解时，主动提出并说明理由，而不是等待指示。
-4. **诚实评估**：如果用户的方案存在根本性缺陷，明确指出并给出替代方案。
-5. **记录错误**：每次发现值得记录的 bug 或陷阱，立即写入本文件第三部分（错误记录）。
+1. **优先理解目标**：先思考"这个问题的本质是什么？是否有更优雅的解法？"
+2. **稳定性优先**：所有优化必须可验证、稳定，不引入新风险。
+3. **主动创新**：发现更优解时主动提出并说明理由。
+4. **诚实评估**：用户方案有根本性缺陷时，明确指出并给出替代方案。
+5. **记录错误**：每次发现值得记录的 bug 或陷阱，立即写入本文件§三。
 
 ## 三、错误记录（Error Log）
 
-> **记录原则**：重在**思维上的盲区**，而非具体报错信息。具体错误会随版本消失，但思维上的误区会反复出现。每条记录应能回答：*"下次遇到类似问题，我应该先想到什么？"*
->
-> 格式：`[日期] 思维误区 → 根因 → 正确思路`
-
-### [2026-02-20] CUDA OOM during train_step (8 GB GPU)
-
-**症状**：训练时 `CUDA out of memory. Tried to allocate 2.31 GiB. GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free. Of the allocated memory 8.96 GiB is allocated by PyTorch, and 3.39 GiB is reserved by PyTorch but unallocated.`，触发点在 `graph_native_system.py` 的 `train_step` 调用 `self.model(data, return_prediction=...)` 处。
-
-**根因**：两个独立问题叠加：
-1. **序列长度未限制**：EEG 以 250 Hz 采样，几分钟数据 T ≈ 10,000–75,000 个时间点。`GraphNativeEncoder` 将完整序列放入 `temporal_conv`，产生 `[N, T, 128]` 张量；4 层编码器下单次前向传播可达数 GB。
-2. **显存碎片化**：3.39 GB 已预留但未使用；新分配 2.31 GB 失败，因为连续块不足。PyTorch 错误信息直接建议设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。
-
-**解决方案**：
-1. 在 `configs/default.yaml` 的 `training` 下新增 `max_seq_len: 300`，为 8 GB GPU 的安全阈值（fMRI 典型长度 ≈ 150–300，可按需调大）。
-2. 在 `main.py` 的 `build_graphs()` 中，向 mapper 传参前将 `fmri_ts` 和 `eeg_data` 截断到 `max_seq_len`，从根源消除大张量。
-3. 在 `main.py` 顶部 import 区设置 `os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')`，解决显存碎片化（`setdefault` 保留用户自定义值）。
-4. 在 `graph_native_system.py` 的 `train_epoch` 每个 epoch 结束时调用 `torch.cuda.empty_cache()`，将已释放的碎片块归还给分配器。
-
-**影响文件**：
-- `configs/default.yaml`
-- `main.py`
-- `models/graph_native_system.py`
-- `AGENTS.md`
-
-**症状**：训练时 `MemoryError`，traceback 在 `graph_native_encoder.py` 的 `SpatialTemporalGraphConv.forward()` 中，最终触发点是 spectral_norm 的 `_power_method`。
-
-**根因**：`forward()` 中对 T 个时间步逐步调用 `self.propagate()`，PyTorch autograd 将所有 T 步的中间激活（注意力权重 `[E,1]`、消息矩阵 `[E,C]` 等）全部保留在内存中用于反向传播。当 T 较大（如 T=300, E=4000, C=128）时，仅注意力相关张量就达到数百 MB，直至耗尽 RAM。spectral_norm 的 power method 只是压死骆驼的最后一根稻草。
-
-**错误地方**：`models/graph_native_system.py` 中声明了 `use_gradient_checkpointing` 参数，但实现时调用 `HeteroConv.gradient_checkpointing_enable()`，该方法不存在，导致 checkpointing 从未真正生效。
-
-**解决方案**：
-1. 在 `SpatialTemporalGraphConv` 中添加 `use_gradient_checkpointing` 参数，并在时间步循环内用 `torch.utils.checkpoint.checkpoint()` 包装 `propagate()` 调用。每个时间步完成后立即释放中间激活，仅保留输出 `[N, C_out]`，内存从 `O(T·E·C)` 降至 `O(T·N·C)`。
-2. 将 `use_gradient_checkpointing` 参数从 `GraphNativeBrainModel` 传递到 `GraphNativeEncoder`，再到每个 `SpatialTemporalGraphConv`。
-3. 在 `main.py` 中从 config 读取该参数并传入 model 构造函数。
-4. 将 `configs/default.yaml` 中 `use_gradient_checkpointing` 改为 `true`（之前是 `false`，这是功能声明而非真正实现）。
-
-**影响的文件**：
-- `models/graph_native_encoder.py`
-- `models/graph_native_system.py`
-- `main.py`
-- `configs/default.yaml`
-
-### [2026-02-21] 跨模态消息聚合时未考虑时序维度对齐
-
-**思维误区**：修复内存问题时，只关注了"如何截断序列到 max_seq_len"，没有意识到**不同模态的序列长度天然不同**（EEG 原始长度可能 < max_seq_len，而 fMRI 被截断到 max_seq_len），导致两个模态各有独立的 T。
-
-**根因**：在 `graph_native_encoder.py` 的消息聚合循环中，跨模态边（EEG→fMRI）使用 EEG 的时序维度 T_eeg 生成消息 `[N_fmri, T_eeg, H]`，而 fMRI 自环产生 `[N_fmri, T_fmri, H]`。两者 T 不同，`sum(messages)` 报 size mismatch。
-
-**正确思路**：凡是"来自不同来源的张量需要聚合"的场景，**第一个要问的问题就是：它们的所有维度是否都匹配？**跨模态 = 跨 T 的可能性，聚合前应归一化到目标节点的维度。
-
-**解决**：在 `conv(x_src, ...)` 之后，若 `msg.shape[1] != x.shape[1]`（目标节点的 T），用 `F.interpolate` 对时序维度做线性重采样。
+> **记录原则**：重在**思维上的盲区**，而非具体报错信息。每条记录应能回答：*"下次遇到类似问题，我应该先想到什么？"*
 
 ---
 
-### [2026-02-21] 多个"声明了但从未真正工作"的功能
+### [2026-02-20] CUDA OOM：序列长度 + 时间循环两个叠加根因
 
-**思维误区**：看到代码里有 `use_gradient_checkpointing`、`AdaptiveLossBalancer`、`update_weights` 等声明，就以为它们在工作。没有追溯"这个功能的调用链是否闭合"。
+**思维误区**：以为"截断序列 = 内存优化"，没有追问为什么要 T 个时间步逐一调用 propagate()。
 
-**正确思路**：对每一个声称"已实现"的功能，问三个问题：
-1. 调用入口在哪里？（e.g. set_epoch 在 train_epoch 里有没有被调用？）
-2. 内部实现是否能执行？（e.g. autograd.grad 在 backward 后会崩溃吗？）
-3. 输入/输出形状是否与调用者匹配？（e.g. predictor 接收 4-D 还是 3-D？）**不要信任"看上去有的代码"，要信任"可以从头到尾追踪的执行路径"。**
-
-**具体例子**：
-- `AdaptiveLossBalancer.update_weights` 调用 `torch.autograd.grad(task_loss, ...)` 但 `backward()` 已经释放了计算图 → 崩溃
-- `set_epoch()` 从未在 `train_epoch` 里调用 → `epoch_count` 永远是 0 → warmup 永远不结束 → `update_weights` 实际上永远是 no-op（这个 bug 反而"保护"了上面的 bug）
-- `predictor(h.unsqueeze(0), ...)` 把 `[N, T, H]` 变成 `[1, N, T, H]`（4-D），但 window sampler 只能 unpack 3 维 → ValueError
-
----
-
-### [2026-02-21] "架构上的空话"：fMRI 实际只有 1 个节点
-
-**思维误区**：看到"图原生"、"空间-时间联合建模"、"保持大脑拓扑"，就认为 fMRI 真的在图上建模了空间结构。没有检查 fMRI 节点数 N_fmri 到底是多少。
-
-**根因**：`process_fmri_timeseries` 把所有 fMRI 体素的时间序列 **mean 掉**（`fmri_data.reshape(-1, T).mean(axis=0)`），然后 `.reshape(1, -1)` → N_fmri = **1**。整个项目的"图卷积"对 fMRI 实际上只有 1 个节点，空间信息完全丢失。
-
-**正确思路**：在宣称"图原生"之前，先打印 `N_fmri` 和 `N_eeg` 看实际上有多少个节点。任何时候看到 `mean(axis=0)` 后接 `reshape(1, -1)`，都要警惕"这是把 N 维空间折叠成了 1 维"。
-
-**解决**：用 NiftiLabelsMasker（nilearn）应用 Schaefer200 图谱，提取 200 个 ROI 时间序列 `[200, T]`，每个 ROI 对应图上一个节点。atlas 文件已在 `configs/default.yaml` 配置，只是从未使用。
-
----
-
-### [2026-02-21] log_weights 参与 backward 图导致梯度累积 + "backward 两次" 错误
-
-**症状**：训练时 `RuntimeError: Trying to backward through the graph a second time (or directly access saved tensors after they have already been freed)`，触发点在 `graph_native_system.py` 的 `train_step` 调用 `self.scaler.scale(total_loss).backward()` 处。
-
-**根因**：`AdaptiveLossBalancer.forward()` 中计算权重时用了 `torch.exp(self.log_weights[name]).clamp(...)`，未 `.detach()`。这导致：
-1. `total_loss` 的计算图包含 `log_weights`（nn.Parameter），backward() 会为它们计算梯度。
-2. `log_weights` 不在 `optimizer` 中，`optimizer.zero_grad()` 不会清零它们的 `.grad`。
-3. 每次 backward 后 `log_weights.grad` 持续累积，不被重置。
-4. 同时，`update_weights()` 被调用时传入的是带 `grad_fn` 的 loss 张量（backward 已释放其计算图），若 PyTorch 内部尝试访问这些已释放的节点，即触发"backward 两次"错误。
-
-**思维误区**：看到 `nn.Parameter` 就以为"有梯度是正常的"。没有追问：**这个梯度会被使用吗？** `log_weights` 通过 `update_weights()` 手动更新（loss 幅值代理规则），完全不依赖 `.grad`。让它参与 backward 图只有负面效果：浪费显存、累积无用梯度、引发潜在的图释放错误。
-
-**正确思路**：对于**手动更新**的参数（不通过 optimizer），在 forward 中应使用 `.detach()` 将其从 backward 图中排除。同样，向 `update_weights()` 这类"只读 scalar"的后处理函数传入张量时，应先 `.detach()` 明确 post-backward 的使用语义。
-
-**解决**：
-1. `AdaptiveLossBalancer.forward()` 中：`weights = {name: torch.exp(self.log_weights[name]).detach().clamp(...)}` — 权重作为常数参与 loss 计算，不进入反向图。
-2. `GraphNativeTrainer.train_step()` 中：调用 `update_weights` 前先 `detached_losses = {k: v.detach() for k, v in losses.items()}`，明确表达 backward 已结束、只需读取 scalar 的意图。
-
-**影响文件**：
-- `models/adaptive_loss_balancer.py`
-- `models/graph_native_system.py`
-- `AGENTS.md`
-- `CHANGELOG.md`
-
----
-
-### [2026-02-21] 跨模态 ST-GCN 的 update() 将 N_src 广播给 N_dst → 重建 shape 错误
-
-**症状**：训练时警告 `Using a target size (torch.Size([1, 190, 1])) that is different to the input size (torch.Size([63, 190, 1]))` 在 `graph_native_system.py` 的 `compute_loss` 里 `F.huber_loss(recon, target)` 处。recon 有 63 个节点，而 fMRI target 只有 1 个节点。
-
-**根因**：`SpatialTemporalGraphConv.update(aggr_out, x_self)` 无条件计算 `aggr_out + lin_self(x_self)`。对于**跨模态边**（EEG→fMRI）：
-- `aggr_out`：shape `[N_dst=1, H]`（fMRI 目标节点聚合结果）
-- `x_self`：shape `[N_src=63, H]`（从 `propagate` 直传过来的 EEG 源节点特征）
-- `[1, H] + [63, H]` → PyTorch 广播 → 返回 `[63, H]`，而不是 `[1, H]`
-
-该错误在第一层编码器就扩散：`x_dict['fmri']` 变成 `[63, T, H]`，后续层、解码器全程处理 63 个"fMRI 节点"，最终重建输出 `[63, T, 1]` 与真实目标 `[1, T, 1]` 不匹配。
-
-**思维误区**：`SpatialTemporalGraphConv` 被设计为同模态（intra-modal）卷积，默认 N_src == N_dst，self-connection 代表节点自身残差。**跨模态边没有这个前提**——源节点和目标节点属于不同节点类型，数量可以完全不同。看到 `MessagePassing` 就以为 N 不变是错误的。
-
-**正确思路**：每次在异构图中将同一 conv 层用于跨模态边时，先问：**源节点数 N_src 和目标节点数 N_dst 是否相同？** 如不同，任何依赖"N 不变"假设的操作（如 `update` 里的 self-connection）都必须跳过或替换。
-
-**解决**：在 `SpatialTemporalGraphConv.update` 中添加一行检查：当 `aggr_out.shape[0] != x_self.shape[0]` 时，直接返回 `aggr_out`（跨模态边不做 self-connection）。
-
-**影响文件**：
-- `models/graph_native_encoder.py`
-- `AGENTS.md`
-- `CHANGELOG.md`
-
----
-
-### [2026-02-21] Decoder 的 ConvTranspose1d 悄悄改变了时序长度
-
-**思维误区**：以为 `ConvTranspose1d(kernel_size=4, stride=1, padding=1)` 和 `Conv1d` 是对称的，输出长度不变。实际上 ConvTranspose1d 的输出公式是 `(T-1)*stride - 2*padding + kernel_size`，stride=1, padding=1, kernel_size=4 → `T+1`。3 层后 T+3。
-
-**正确思路**：ConvTranspose1d 的语义是"逆卷积/转置卷积"，设计用于**上采样**（stride>1 才有意义）。**stride=1 时应该用 Conv1d，不应该用 ConvTranspose1d。** 一旦用了 ConvTranspose1d(stride=1)，就要立刻验证输出尺寸公式。
-
-**解决**：对 stride=1 的层改用 `Conv1d(kernel_size=3, padding=1)`，精确保留 T。对 stride=2 的层（真正上采样）仍用 ConvTranspose1d。
-
----
-
-### [2026-02-21] propagate() 未传 size 导致跨模态 N 不匹配（第 5 次复现）
-
-**症状**：`UserWarning: Using a target size (torch.Size([1, 190, 1])) that is different to the input size (torch.Size([63, 190, 1]))` 在 `compute_loss` 的 `F.huber_loss` 处。`reconstructed['fmri']` 有 63 个节点，而 target 只有 1 个节点。
-
-**根因**：`SpatialTemporalGraphConv.forward()` 调用 `self.propagate(edge_index, x=x_t_slice, ...)` 时**没有传 `size=(N_src, N_dst)`**。PyG 默认 `size=(N_src, N_src)`，对 EEG→fMRI 跨模态边（N_src=63, N_dst=1）会产生 `aggr_out=[63, H]` 而非 `[1, H]`。既有的 `update()` 守卫（`aggr_out.shape[0] != x_self.shape[0]`）**永远不会触发**，因为两个张量都错误地显示 N=63。
-
-**思维误区**：看到 `update()` 里已经有 N 不匹配守卫，就以为问题已修复。没有追问：*这个守卫能被触发吗？* 守卫触发的前提是 `aggr_out` 已经有正确的 N_dst——而这依赖于 `propagate()` 拿到正确的 size，这才是真正的入口。**修复卫兵的前提条件，而不只是卫兵本身。**
-
-**解决**：
-1. `SpatialTemporalGraphConv.forward()` 新增 `size: Optional[Tuple[int, int]] = None` 参数，并将其传给两条路径（普通 / gradient checkpoint）里的 `propagate()`。
-2. `GraphNativeEncoder.forward()` 在调用 `conv(x_src, ...)` 时传入 `size=(x_src.shape[0], x.shape[0])`，其中 `x` 是目标节点的当前特征张量（N_dst 由此推导）。
-3. `compute_loss()` 在 `F.huber_loss` 之前新增 N 轴不匹配的 `RuntimeError`，防止 broadcasting 静默掩盖问题、引发后续迷惑性报错。
-
-**影响文件**：`models/graph_native_encoder.py`、`models/graph_native_system.py`、`AGENTS.md`
-
----
-
-### [2026-02-21] EEG enhancement 原地修改 data 导致跨 epoch "backward through graph" 错误
-
-**症状**：Epoch 1 训练正常完成，Epoch 2 第一步 `scaler.scale(total_loss).backward()` 抛出 `RuntimeError: Trying to backward through the graph a second time`。
-
-**根因**：`train_step()` 做了 `data['eeg'].x = eeg_x_enhanced`，**永久改写了 `data_list` 里的原始数据对象**。`eeg_x_enhanced` 是 EEG handler 的输出（`requires_grad=True`，有 `grad_fn`）。Epoch 1 的 `backward()` 释放了计算图的 saved tensors，但 `data['eeg'].x` 仍指向那个 `grad_fn` 已被释放的张量。Epoch 2 的 `eeg_handler(data['eeg'].x)` 在这个已释放的图上构建新图，再调用 `backward()` 时访问已释放的 saved tensors → 报错。
-
-**思维误区**：以为 `data.to(self.device)` 会重新创建张量，从而切断上一步的图。实际上 `.to()` 对已在目标设备的张量是 no-op，并不会切断梯度链。**对 `data_list` 里的对象做原地修改，就是在 epochs 之间共享可变状态——这是典型的隐式状态依赖陷阱。**
-
-**正确思路**：凡是"将计算图中的输出写回共享数据结构"的操作，都要问：*这个数据结构会被下一次迭代复用吗？* 如果是，必须在本次迭代结束前恢复到原始（detached）值，或者不修改原始对象。
-
-**解决**：`train_step()` 用 `try-finally` 块保证 `data['eeg'].x` 在步骤结束后（无论是否抛出异常）恢复为保存的 `original_eeg_x`，使每个 epoch 都从原始未增强的张量开始。
-
-**影响文件**：`models/graph_native_system.py`、`AGENTS.md`
-
----
-
-### [2026-02-23] 硬编码顺序假设破坏 EEG→fMRI 设计意图
-
-**思维误区**：`create_model` 写了 `edge_types.append((node_types[0], 'projects_to', node_types[1]))`，以为 EEG 一定是 `node_types[0]`。实际上如果 `config['data']['modalities']` 写为 `["fmri", "eeg"]`，就会建立 `('fmri', 'projects_to', 'eeg')` 跨模态边，完全颠倒了方向。
-
-**正确思路**：凡是有方向性的设计意图（"A→B"），不应依赖参数的位置顺序，而应用**明确的模态名**来确定方向。问自己：*"如果用户改变了列表顺序，逻辑链会断吗？"*
-
-**解决**：
-1. `create_model` 改为：若 `'eeg' in node_types and 'fmri' in node_types`，显式添加 `('eeg', 'projects_to', 'fmri')`；其他模态组合使用通用回退。
-2. `build_graphs` 中的 `merged_graph['eeg', 'projects_to', 'fmri']` 已是显式，无需改动。
-
-**影响文件**：`main.py`、`AGENTS.md`
-
----
-
-## 四、文档格式规范（必须遵守）
-
-**项目永远只保留以下四个 MD 文件，不得新增，不得删除，每次修改后同步更新：**
-
-| 文件 | 用途 |
-|------|------|
-| `AGENTS.md` | **本文件**：AI Agent 指令 + 错误记录 |
-| `SPEC.md` | 项目规范说明：目标、设计理念、架构（面向 Agent，使其可复现项目） |
-| `USERGUIDE.md` | 项目使用说明：面向非专业人士，简洁明了 |
-| `CHANGELOG.md` | 更新日志：所有版本变更 + 待优化事项 |
-
-**严禁**：在 `docs/`、根目录或任何位置创建第五个 MD 文件。如需新内容，写入上述四个文件的对应章节。
-
----
-
-### [2026-02-24] HeteroConv.convs 用 tuple key 访问导致 KeyError（第一次 forward 即崩溃）
-
-**思维误区**：看到 `HeteroConv(conv_dict)` 接受 `{(src, rel, dst): conv}` 形式的字典，就以为内部存储也是用 tuple 作为 key。
-
-**根因**：PyG 的 `HeteroConv.__init__` 将卷积存入 PyG 自定义 `ModuleDict`，内部 key 为 `'__'.join(tuple)`。`GraphNativeEncoder.forward()` 用 `stgcn.convs[edge_type]`（tuple）访问，必然 `KeyError`。
-
-**正确思路**：每次在自定义 forward 中绕过 `HeteroConv.forward()` 手动访问其内部卷积时，必须问：**内部 dict 的 key 格式是什么？更深一步：这个 dict 是标准 Python dict 吗？** 若不是，key 访问语义可能与预期不同。
-
-**最终修复**：完全不使用 `HeteroConv` — 用 `nn.ModuleDict` 直接存储 conv，避免任何第三方 key 转换。详见下方 [2026-02-26]。
-
----
-
-### [2026-02-26] PyG 自定义 ModuleDict 的 to_internal_key() 导致字符串 key 查找仍然失败
-
-**症状**：将 key 改为 `'__'.join(edge_type)` 字符串后，仍然 `KeyError: 'eeg__connects__eeg'`。
-
-**根因**：`HeteroConv.convs` 是 `torch_geometric.nn.module_dict.ModuleDict`（PyG 自定义子类），其 `__getitem__` 和 `__setitem__` 都调用 `to_internal_key()` 进行 key 转换。不同版本的 PyG 该方法实现不同，可能对字符串 key 有额外替换，导致**存入时 key=A，读取时因转换不对称得到 B**，查找失败。
-
-**思维误区**：以为"用字符串 key 就一定能查到"。没有追问：**这个 dict 的 `__getitem__` 是 PyG 重载的，to_internal_key() 到底做了什么变换？** 对任何第三方库的容器，不能假设其访问语义与标准 Python dict 相同。
-
-**更深层的设计误区**：`GraphNativeEncoder.forward()` 从不调用 `HeteroConv.forward()`——手动迭代边类型、手动查找 conv、手动调用。`HeteroConv` 在此仅作参数容器使用，这是错误的抽象。**用来做参数容器的，应该用参数容器；用来做消息传递的，才用 HeteroConv。**
+**根因（双重）**：
+1. EEG 以 250Hz 采样，完整序列 T≈75000，产生 `[N, T, 128]` 巨张量。
+2. ST-GCN 对每个时间步独立 `propagate()`，T=300×4层×3边 = 3600 次 CUDA 内核启动，Python 循环是串行瓶颈（GPU 实际空闲）。
+3. 显存碎片化：reserved 但 unallocated 的块不足以响应新分配。
 
 **正确思路**：
-```python
-# 错误：用 HeteroConv 存参数 — PyG 版本敏感，key 转换不可预期
-hetero_conv = HeteroConv({edge_type: conv for edge_type in edge_types})
-conv = stgcn.convs['__'.join(edge_type)]  # KeyError in some PyG versions
-
-# 正确：nn.ModuleDict，string key 写入后 string key 读取，无任何隐式转换
-nn.ModuleDict({'__'.join(et): conv for et in edge_types})
-conv = stgcn['__'.join(edge_type)]  # always works
-```
-
-**影响文件**：`models/graph_native_encoder.py`（移除 `HeteroConv`、`GCNConv`、`GATConv` 导入）、`AGENTS.md`、`CHANGELOG.md`
+- `max_seq_len` 截断全序列；`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 消碎片；`empty_cache()` 每 epoch 归还块。
+- 时间循环改为"时序虚拟节点"向量化：将 edge_index 扩展 T 次，单次 propagate 处理 T×E 条消息，GPU 满载，理论加速 100×。
 
 ---
 
-### [2026-02-24] 整个 v5_optimization 配置块从未被读取（死配置）
+### [2026-02-21] "声明了但从未真正工作"的功能（通用反模式，多次复现）
 
-**思维误区**：看到 YAML 里有详细的 `v5_optimization.adaptive_loss.alpha`、`v5_optimization.eeg_enhancement.entropy_weight` 等参数，就以为它们被传入了对应模块。
+**思维误区**：看到代码里有某功能的声明/参数，就以为它在工作。
 
-**根因**：`GraphNativeTrainer.__init__()` 中 `AdaptiveLossBalancer`、`EnhancedEEGHandler`、`EnhancedMultiStepPredictor` 的所有参数都是硬编码默认值；config 中的对应值从未被读取。
+**正确思路**：对每个"已实现"的功能，追问三点：
+1. 调用入口存在吗？（`set_epoch` 在 `train_epoch` 里有没有被调用？）
+2. 内部实现能执行吗？（`autograd.grad` 在 `backward` 后会崩溃）
+3. 形状与调用者匹配吗？（predictor 接 4-D 还是 3-D？）
 
-**正确思路**：每次在代码里硬编码一个"配置参数"时，问：**这个值是否也出现在 YAML 里？如果是，哪一方是权威来源？** YAML 应永远是用户可见的权威；代码里不应有"隐形"覆盖。
+**具体案例（已修复）**：
+- `AdaptiveLossBalancer.update_weights` 用 `autograd.grad`，但 `backward()` 已释放计算图 → 崩溃；`set_epoch()` 从未调用 → warmup 永不结束 → 上述 bug 反而被保护。
+- `use_gradient_checkpointing` 调用 `HeteroConv.gradient_checkpointing_enable()`，该方法不存在。
+- `modality_energy_ratios` 存入 `AdaptiveLossBalancer` 但从不参与计算（死存储）。
+- `v5_optimization` 配置块中所有参数均被硬编码默认值覆盖，从未从 YAML 读取。
+- EEG handler 里的 `eeg_info['regularization_loss']` 从未加入 `total_loss`。
 
-**修复**：为 `GraphNativeTrainer` 添加 `optimization_config: Optional[dict]` 参数，为 `GraphNativeBrainModel` 添加 `predictor_config: Optional[dict]` 参数，`main.py` 传入 `config['v5_optimization']`。
-
----
-
-### [2026-02-24] EnhancedGraphNativeTrainer optimizer 只覆盖 base_model（增强模块无梯度）
-
-**思维误区**：`super().__init__(model=model.base_model)` 之后立即 `self.model = model`，以为 optimizer 会自动"跟随"新的 model。
-
-**根因**：`torch.optim.AdamW` 在构造时捕获参数快照；后续修改 `self.model` 不会更新 optimizer 的参数组。`ConsciousnessModule`、`CrossModalAttention`、`HierarchicalPredictiveCoding` 的参数有梯度但永远不会被更新。
-
-**正确思路**：每次 `self.model = new_model` 替换模型后，问：**optimizer 里的参数组是否仍然正确？** 如果不是，必须重新创建 optimizer（或 `optimizer.add_param_group()`）。
-
-**修复**：在 `EnhancedGraphNativeTrainer.__init__()` 的 `super()` 调用后，用 `self.model.parameters()` 重新创建 optimizer。
+**规则**：凡是"存储但不使用"的属性，立即问：*这个值应该在什么时候、以什么方式被使用？*
 
 ---
 
-### [2026-02-24] ConsciousGraphNativeBrainModel 用重建输出（信号空间）作为 CrossModalAttention 的输入（潜空间）
+### [2026-02-21] fMRI 实际只有 1 个节点（架构上的空话）
 
-**思维误区**：`reconstructions.get('eeg')` 听起来像"编码器的输出"，实际上是**解码器的输出**（`[N, T, 1]`），而 `CrossModalAttention` 期望 `[batch, N, hidden_dim=256]`。
+**思维误区**：看到"图原生"就以为 fMRI 真的有空间结构，没有打印 N_fmri。
 
-**根因**：`ConsciousGraphNativeBrainModel.forward()` 原来调用 `base_model(data)` 拿到 `(reconstructions, predictions)`，没有请求 `return_encoded=True`，因此无法拿到真正的潜表征；只能用重建输出作为"代理"，这在 shape 和语义上都是错误的。
+**根因**：`process_fmri_timeseries` 对所有体素 `mean(axis=0)` 后 `reshape(1, -1)` → N_fmri=1，空间信息完全丢失。
 
-**正确思路**：`CrossModalAttention`（以及任何需要"高维潜特征"的模块）应当接收编码器输出（`[N, T, H]`），而非解码器输出（`[N, T, 1]`）。每次引入跨模块的特征传递时，明确标注"来自哪一层、shape 是什么"。
-
-**修复**：调用 `base_model(data, return_encoded=True)` 拿到 encoded dict，使用 `encoded['eeg']` / `encoded['fmri']` 作为跨模态注意力的输入。
+**修复**：用 `NiftiLabelsMasker` 应用 Schaefer200 图谱，提取 ~190 个 ROI 时序（实际数量因 EPI 覆盖而异，少于 200 是正常的，不要填充）。
 
 ---
 
-### [2026-02-25] 好的设计意图被错误实现后移除，正确意图也随之消失
+### [2026-02-21] 跨模态边的两个叠加 N 不匹配 bug
 
-**思维误区**：移除崩溃的 `ModalityGradientScaler` 之后，认为"EEG/fMRI 能量不平衡问题已经被 `AdaptiveLossBalancer` 的 `initial_losses` 归一化处理"。没有追问：`initial_losses` 归一化是第一次 forward 后才生效的，**warmup 阶段（前 5 个 epoch）weight 自适应被禁用，归一化也未启动**，此时 fMRI 的 50× 更大的 MSE 完全主导梯度。
+**思维误区**：只修了可见的 guard，没有追问 guard 能否被触发。
 
-**根因**：`modality_energy_ratios` buffer 被存入 `AdaptiveLossBalancer` 但从不参与任何计算——这是"代码声明了意图，但从未执行意图"的另一个例子（AGENTS.md §2021-02-21 的重现）。
+**根因**：
+1. `update()` 无条件做 `aggr_out + lin_self(x_self)`。跨模态边 N_src≠N_dst，PyTorch 广播导致输出 N=N_src（错误值），污染后续所有层。
+2. `propagate()` 未传 `size=(N_src, N_dst)`，PyG 默认 `size=(N_src, N_src)`，使 `aggr_out` 形状本身就错误，guard 永远不会触发。
 
-**正确思路**：对每一个"存储但从不使用"的参数/属性，问：**这个值应该在什么时候、以什么方式被使用？** `modality_energy_ratios` 的正确使用时机是 `__init__` 时：用它来计算 energy-aware initial task weights，使 EEG 任务从第一个 gradient step 就得到合理的权重。
+**修复**：① `update()` 检查 `aggr_out.shape[0] != x_self.shape[0]` 时跳过 self-connection；② `propagate()` 显式传入 `size`；③ `compute_loss` 在 `huber_loss` 前 raise RuntimeError 防止广播静默掩盖。
 
-**实现原则**：能量平衡应在 **损失空间** 的初始权重中实现（init-time 纯 Python 算术），而非在 **梯度空间** 中通过 post-backward `autograd.grad()` 实现（ModalityGradientScaler 的错误之处）。
+---
 
-**修复**：`AdaptiveLossBalancer.__init__` 中，当 `initial_weights=None` 时，通过解析任务名后缀（`recon_eeg` → `eeg`）查找对应模态能量，计算 `initial_weight ∝ 1/energy`，归一化到 mean=1.0。
+### [2026-02-21] EEG enhancement 原地修改 data 导致跨 epoch "backward 两次" 错误
+
+**思维误区**：以为 `.to(device)` 会重新创建张量，切断梯度链。实际上 `.to()` 对已在目标设备的张量是 no-op。
+
+**根因**：`data['eeg'].x = eeg_x_enhanced` 永久改写了 `data_list` 里的原始对象。Epoch 1 的 `backward()` 释放了 saved tensors，Epoch 2 在已释放的图上构建新图 → 报错。
+
+**修复**：`try-finally` 块保证步骤结束后（无论异常）恢复 `original_eeg_x`。`original_eeg_x` 仅在**实际修改前**才保存（non-None ↔ 已修改）。
+
+---
+
+### [2026-02-21] log_weights 参与 backward 图导致梯度累积
+
+**思维误区**：看到 `nn.Parameter` 就以为"有梯度是正常的"，没有追问这个梯度会被使用吗。
+
+**根因**：`log_weights` 通过 `update_weights()` 手动更新，完全不依赖 `.grad`。让它参与 backward 图只有负面效果：浪费显存、梯度无限累积。
+
+**规则**：对**手动更新**的参数（不通过 optimizer），forward 中用 `.detach()` 排除；向后处理函数传入张量时用 `.detach()` 明确语义。
+
+---
+
+### [2026-02-21] Decoder ConvTranspose1d(stride=1) 悄悄改变时序长度
+
+**正确思路**：ConvTranspose1d 设计用于上采样（stride>1）。stride=1 时输出长度 = `T + kernel_size - 2*padding`（不等于 T）。**stride=1 应用 Conv1d，不应用 ConvTranspose1d。**
+
+---
+
+### [2026-02-23] 硬编码顺序假设破坏 EEG→fMRI 方向
+
+**思维误区**：`edge_types.append((node_types[0], 'projects_to', node_types[1]))`，以为 EEG 一定排第一。
+
+**规则**：有方向性的设计意图，永远用**模态名**而非位置索引确定方向：`if 'eeg' in node_types and 'fmri' in node_types: append(('eeg', 'projects_to', 'fmri'))`。
+
+---
+
+### [2026-02-24 / 2026-02-26] HeteroConv 内部 key 不可预期 → 改用 nn.ModuleDict
+
+**思维误区**：以为 PyG `HeteroConv.convs` 是标准 Python dict，用 `'__'.join(edge_type)` 可以直接访问。
+
+**根因**：`HeteroConv.convs` 是 PyG 自定义 `ModuleDict`，其 `to_internal_key()` 实现因版本而异，导致存入 key=A，读取时得到 B → KeyError。
+
+**规则**：对任何第三方库容器，不能假设其访问语义与标准 dict 相同。正确做法：用 `nn.ModuleDict({'__'.join(et): conv})` 替换 `HeteroConv`，避免任何隐式 key 转换。
+
+---
+
+### [2026-02-24] 替换 self.model 后 optimizer 参数组失效
+
+**根因**：`super().__init__(model=base_model)` 后立即 `self.model = new_model`，optimizer 在构造时捕获参数快照，不随 `self.model` 更新。增强模块参数有梯度但永远不会被更新。
+
+**规则**：每次 `self.model = new_model`，必须重建 optimizer（或 `add_param_group()`）。
 
 ---
 
 ### [2026-02-25] 1:N EEG→fMRI 对齐是「设计缺失」而非「设计完成」
 
-**场景**：用户数据中 2 个 EEG 条件（GRADON / GRADOFF）共享 1 个 fMRI 扫描（task-CB）。
+**场景**：2 个 EEG 条件（GRADON/GRADOFF）共享 1 个 fMRI 扫描（task-CB）。
 
-**思维误区**：`_discover_tasks()` 同时扫描 EEG 和 fMRI 文件名，把"BIDS 文件名中出现的所有 task"等同于"有效的训练 run"。实际上：
-- `task-CB` 来自 fMRI 文件，没有 EEG 配对
-- 把它作为独立 run 加载 → 单模态 fMRI 图（无跨模态边，对联合训练没有价值）
-- GRADON/GRADOFF 找不到同名 fMRI → 静默回退（警告被忽视）→ 看起来工作了，实际上是「碰巧文件名匹配」
-
-**根因**：没有任何配置项让用户声明"哪个 EEG 任务对应哪个 fMRI"。1:N 对齐依靠"顺序回退"实现，而回退在设计上就是应急手段，不是对齐机制。
-
-**正确思路**：每次看到"两种模态的任务名不一致"时，第一个问题应该是：**用户有没有办法显式告诉系统配对关系？** 没有的话，配对逻辑就是不完整的设计。
-
-**修复（V5.15 + V5.16）**：
-1. 新增 `fmri_task_mapping` 配置项支持显式映射（V5.15）
-2. `_load_fmri()` 新增步骤 2.5：ON/OFF 后缀自动剥离（V5.16），用户无需配置任何东西即可处理 CBON→CB 等情况
-3. `_discover_tasks()` 改为只要 EEG 在模态列表就只扫描 EEG 文件（V5.16），彻底杜绝幽灵 fMRI-only 任务
-
-**查找链（最终）**：显式 mapping → 同名直接匹配 → ON/OFF 剥离重试 → 任意 bold 回退
-
-**影响文件**：`data/loaders.py`、`main.py`、`configs/default.yaml`、`CHANGELOG.md`
-
----
-
-### [2026-02-26] 配置文件中的 Atlas 路径是死配置（从未被验证的字符串）
-
-**思维误区**：配置文件里写了 `atlases/Schaefer2018_200Parcels_7Networks_order_FSLMNI152_2mm.nii.gz`，看到 `atlas_file.exists()` 的检查就认为"文件不存在时有警告，不会出问题"。没有问：**这个字符串本身是否和实际文件名匹配？**
-
-**根因**：用户实际提供的 atlas 文件是 `1mm.nii`（非压缩，1mm 分辨率），而 config 里写的是 `2mm.nii.gz`（压缩，2mm 分辨率）。两个错误叠加：
-- 分辨率错：2mm → 1mm（与实际文件不符）
-- 格式错：.nii.gz → .nii（与实际文件后缀不符）
-
-系统每次启动都打印"Atlas file not found，使用单节点回退"，这个警告被用户忽视了，导致所有 fMRI 实际上只有 1 个节点（N_fmri=1），完全失去了使用 Schaefer200 的意义。
-
-**正确思路**：配置文件中的文件路径在每次改动后必须和实际文件系统一一对照验证。`atlas_file.exists()` 的检查只是运行时保护，不能替代"写正确的路径"。
-
----
-
-### [2026-02-26] 异质图「框架使用完整」≠「特性使用完整」——系统性审查发现三处未使用特性
-
-**背景**：HeteroData 的引入有两个显式目标：(1) 多模态联合建模（EEG + fMRI）；(2) 为未来 DTI 层留下接口。PR 合并后用户问："异质图是否被充分使用？"
-
-**正确的排查方法**：为每个 `HeteroData` 节点属性画一张「SET（设置方）→ READ（读取方）」的追踪表，发现哪些属性只被 SET 从未被 READ。
-
-**审查结果（通过脚本追踪 SET/READ）**：
-
-| 属性 | 设置方 | 读取方 | 状态 |
-|------|--------|--------|------|
-| `eeg.x` | mapper | encoder | ✅ 正常 |
-| `fmri.x` | mapper | encoder | ✅ 正常 |
-| `eeg.pos` | mapper (from MNE montage) | log summary | ⚠️ 仅用于日志，不用于跨模态边创建 |
-| `eeg.labels` | mapper | **无** | ❌ 死存储 |
-| `fmri.labels` | mapper | **无** | ❌ 死存储（windowed_samples 未复制） |
-| `eeg.sampling_rate` | mapper | log summary | ⚠️ 仅日志 |
-| `fmri.sampling_rate` | mapper | log summary | ⚠️ 仅日志 |
-| `eeg.atlas_mapping` | mapper | **无** | ❌ 死存储 |
-| `fmri.pos` | mapper（仅当显式传入时） | **无** | ❌ build_graphs 从不传 node_positions |
-
-**发现的三处结构性缺陷**：
-
-1. **跨模态边无 edge_attr**：`create_simple_cross_modal_edges()` 只返回 `edge_index`，不返回权重。`SpatialTemporalGraphConv.message()` 当 `edge_attr is None` 时跳过加权步骤，导致所有跨模态消息均等对待——而同模态边（来自 `build_graph_structure`）有基于相关性的权重。不一致。
-
-2. **DTI 接口完全缺失**：用户明确说"为未来 DTI 层留下接口"，但代码中无任何 DTI 相关实现：无 `_load_dti()`、无 `add_dti_structural_edges()`、无 `('fmri','structural','fmri')` 边类型、无 `dti_structural_edges` 配置项。
-
-3. **`extract_windowed_samples()` 丢失 `labels` 属性**：复制 `num_nodes`、`pos`、`sampling_rate`，但不复制 `labels`（通道/ROI 名称），导致窗口样本无法用于可解释性分析。
-
-**修复原则**：
-- DTI 不应设计为独立节点类型（DTI 无时序特征，强行加节点类型会破坏编码器架构）
-- DTI 的正确抽象：在已有的 fMRI 节点上**新增一套结构连通性边** `('fmri','structural','fmri')`
-- 这样编码器可同时利用功能连通性（相关性边）和结构连通性（白质纤维边），体现异质图「多边类型」的核心价值
-- 编码器已有"安全跳过"逻辑（`if edge_type in edge_index_dict`），不存在 DTI 文件时自动降级，无需改模型
-
-**影响文件**：`models/graph_native_mapper.py`、`data/loaders.py`、`main.py`、`configs/default.yaml`
-
----
-
-### [2026-02-26] 三个"声明了但调用链未闭合"的功能（第二轮系统审查）
-
-**背景**：第一轮修复了异质图边的静态问题（DTI 接口、跨模态 edge_attr、labels 丢失）。第二轮对照 AGENTS.md 中每一个功能声明做主动追踪，发现三处新的执行链断点。
-
-**思维误区**：认为"记录在 AGENTS.md 里"等同于"已经实现"。文档记录了意图，但代码执行链才是真相。**每次阅读 AGENTS.md 中的 Gap，都要追问：calling chain 是否从头到尾闭合？**
-
-#### Gap 1：`dti_structural_edges` 不在 cache key 中
-
-**症状**：将 `dti_structural_edges: false` 改为 `true` 后，缓存命中率保持不变，旧图继续被加载——没有 DTI 边。对 DTI 的修改形同虚设。
-
-**根因**：`_graph_cache_key()` 的 `relevant` 字典不含 `dti_structural_edges`。图的边结构发生了变化，但 hash 没变。
-
-**修复**：在 `relevant` 中加入 `'dti_structural_edges': config['data'].get('dti_structural_edges', False)`。
-
-#### Gap 2：`subject_idx` 从未写入图数据（AGENTS.md §九 Gap 2 的必要前提）
-
-**症状**：所有图的 `data.subject_idx` 不存在，`GraphNativeBrainModel.forward()` 中 `hasattr(data, 'subject_idx')` 永远为 False，subject embedding 永远不被激活，即使 `num_subjects > 0`。
-
-**根因**：`build_graphs()` 知道 `subject_id`（字符串），但从未将它写入 `built_graph`。Gap 2 的前提条件（"data 中存储 subject_idx"）从未被满足。
+**思维误区**：`_discover_tasks()` 把"BIDS 文件名中出现的所有 task"等同于"有效 run"，导致出现 fMRI-only 幽灵任务，GRADON/GRADOFF 静默回退到"任意 bold"文件。
 
 **修复**：
-1. `build_graphs()` 在进入主循环前，扫描所有 `subject_id` 建立 `subject_to_idx` 字典（全局唯一、确定性）；缺失 subject_id 用 `f'unknown_{j}'` 而非共用 `'unknown'`（避免合并无关被试）。
-2. 每次 `built_graph` 构建完成后，写入 `built_graph.subject_idx = torch.tensor(idx, long)`。
-3. `build_graphs()` 返回 `(graphs, mapper, subject_to_idx)` 三元组。
-4. `extract_windowed_samples()` 将图级属性 `subject_idx` 复制到所有窗口样本。
-5. `main()` 解包 `subject_to_idx`，传入 `create_model(num_subjects=len(subject_to_idx))`。
-
-#### Gap 3：Gap 2 主体（subject embedding）全链路实现
-
-**修复**：
-1. `GraphNativeBrainModel.__init__()` 加 `num_subjects: int = 0` 参数，`> 0` 时创建 `nn.Embedding(num_subjects, H)`，`N(0, 0.02)` 初始化（小噪声，不干扰共享预训练信号）。
-2. `forward()` 读取 `data.subject_idx`，查询 `[H]` 嵌入，传给 `self.encoder(data, subject_embed=embed)`；索引越界时发出警告（提示清除缓存）而非静默截断。
-3. `GraphNativeEncoder.forward(subject_embed=None)` 在输入投影后、ST-GCN 层前，将 `[H]` broadcast 为 `[1,1,H]` 加到所有节点特征 `[N, T, H]` 上。
-
-**正确思路**：设计意图文档（AGENTS.md 九）不等于调用链闭合。每次读到"未实现"，都必须问：*这个功能的前提条件（数据结构变更、参数传递）是否也已实现？* 否则即使实现了主体，也因前提断裂而无法激活。
-
-**影响文件**：`main.py`、`models/graph_native_system.py`、`models/graph_native_encoder.py`
+1. `fmri_task_mapping` 支持显式映射（V5.15）。
+2. `_load_fmri()` 新增 ON/OFF 后缀自动剥离（V5.16，GRADON→GRA 匹配 GRA bold）。
+3. `_discover_tasks()` 改为只扫描 EEG 文件，彻底杜绝幽灵任务。
+4. 查找链：显式 mapping → 同名直接匹配 → ON/OFF 剥离重试 → 任意 bold 回退。
 
 ---
 
-### [2026-02-26] 缓存路径绕过 subject_idx 赋值（第三轮系统审查）
+### [2026-02-26] 缓存命中路径的 `continue` 绕过必要副作用
 
-**思维误区**：V5.19 在"新建图"路径中加了 `built_graph.subject_idx = ...`，就认为所有图都会有 subject_idx。没有追问：**缓存命中路径是否也执行了这行代码？**
+**通用规则**：每次在主循环中加 `continue`/`return`/`break`，都必须问：**循环尾部有没有必须执行的副作用（metadata 写入、索引赋值）？** 如有，必须在 `continue` 前补全。
 
-**根因**：缓存命中路径：
-```python
-full_graph = torch.load(cache_path, ...)
-extract_windowed_samples(full_graph, ...)
-continue  ← 直接跳过 built_graph.subject_idx = torch.tensor(...)
-```
-`continue` 将执行跳回到 `for subject_data in all_data:` 的下一次迭代，完全绕过赋值语句。结果：
-- 老缓存（V5.18 以前）：`full_graph` 无 `subject_idx`，`extract_windowed_samples` 的 `hasattr` 检查为 False，所有窗口样本无 `subject_idx`
-- 新缓存（V5.19）：`full_graph` 有 `subject_idx`（在保存前赋值），但如果 `continue` 之前**先**调用了旧缓存，该调用链依然绕过赋值，subject embedding 对该被试静默禁用
-
-**正确思路**：任何 `continue`/`return`/`break` 都是"提前退出"。**每次在主循环中加 `continue`，都必须问：循环尾部有没有必须执行的副作用（如 metadata 写入、索引赋值）？如果有，必须在 `continue` 前补全。**
-
-**修复**：在缓存命中路径的 `extract_windowed_samples` 调用之前，先写入 `full_graph.subject_idx`。这样：
-1. 老缓存在加载后立即获得正确的 `subject_idx`
-2. 新缓存被冗余覆写（值相同，无害）
-3. `extract_windowed_samples` 的 `hasattr` 检查必然为 True，所有窗口样本正确获得 `subject_idx`
-
-**影响文件**：`main.py`
+**案例**：缓存命中直接 `continue` 跳过了 `subject_idx`、`run_idx`、`task_id`、`subject_id_str` 的赋值，导致从缓存加载的图缺少个性化嵌入索引和训练数据追踪信息。
 
 ---
 
-### [2026-02-26] log_training_summary 未报告个性化状态（第三轮）
+### [2026-02-26] 异质图「框架使用完整」≠「特性使用完整」
 
-**思维误区**：实现了被试特异性嵌入之后，以为"代码里有了就够了"。没有追问：**用户怎么知道这个功能是否真的在运行？**
+**排查方法**：为每个 `HeteroData` 属性画「SET → READ」追踪表，找出只 SET 从未 READ 的属性。
 
-**设计原则**：任何需要用户确认"是否生效"的功能，都必须在启动时的摘要日志中出现——包括：是否启用、启用了多少个被试、有没有告警。不能让用户在没有报错的情况下，却在默默运行一个禁用了个性化的模型。
+**发现（已修复）**：
+- `eeg.labels`、`fmri.labels`、`eeg.atlas_mapping`、`fmri.pos`：死存储，never READ。
+- 跨模态边无 `edge_attr`（同模态边有相关性权重，不一致）。
+- DTI 接口完全缺失：无 `_load_dti()`、无 `('fmri','structural','fmri')` 边类型。
 
-**修复**：`log_training_summary` 新增"被试特异性嵌入"一节：
-- 显示 `num_subjects × H 维 = N 个个性化参数`
-- 检查 `graphs[0]` 是否有 `subject_idx` 属性，若无则警告"请清除缓存重建"
-
-**影响文件**：`main.py`
-
----
-
-### [2026-02-26] Schaefer200 返回 190 ROI — 这是正常行为，不是 bug
-
-**用户疑问**："为什么调用 Schaefer200 时 fMRI 节点数是 190？之前硬编码 200 也能跑，是漏了还是？"
-
-**答案**：190 ROI 是完全正常且可预期的结果，不是 bug。
-
-**根因**：`NiftiLabelsMasker(resampling_target='data'，默认值)` 将 1mm Schaefer200 图谱重采样到 EPI 分辨率（~3mm）。某些图谱分区在重采样后在 fMRI 脑掩模内没有有效体素，被 nilearn 自动排除：
-- 颞极（temporal pole）：EPI 磁化率伪影（signal dropout）
-- 眶额皮质（OFC）：磁化率伪影
-- 极小分区：1mm 下有效，3mm 采样后消失
-
-**关键理解**：
-1. ROI 数量因被试和采集方案（FOV、分辨率、脑掩模）而异，子集合可能是 185-200
-2. 硬编码 200 能"跑"只是因为当时 atlas 文件未找到，系统回退到单节点模式（N_fmri=1）——实际上 atlas 分区从未生效
-3. 190 ROI 意味着 atlas 已真正生效，图卷积有实际空间结构可以利用
-
-**正确思路**：每次看到"ROI 数 < 理论最大值"，先问：**这些缺失的 ROI 是哪些区域？** 如果是边缘区域（颞极、OFC）且数量 < 5%，完全正常。不应强制填充到 200（填充值为 0 的 ROI 时序会破坏相关性估计）。
-
-**代码修复**：在 `_parcellate_fmri_with_atlas()` 中添加明确的日志说明，解释 ROI 数量差异的原因。
+**修复原则**：DTI 不设独立节点类型（无时序特征），而是在 fMRI 节点上新增结构连通性边 `('fmri','structural','fmri')`。编码器已有 `if edge_type in edge_index_dict` 保护，DTI 文件缺失时自动降级。
 
 ---
 
-### [2026-02-26] SpatialTemporalGraphConv 注意力归一化用 global softmax — GNN 消息传递实际失效
+### [2026-02-26] V5.21 全流程审查四个隐患
 
-**症状**：训练能收敛，但速度极慢，效果不佳。图神经网络"存在但无效"。
+1. **`max_grad_norm` 静默忽略**：YAML 中存在该参数，代码里却硬编码 1.0。修复：`GraphNativeTrainer.__init__` 新增 `max_grad_norm` 参数，`train_model` 传入。
 
-**根因**：`message()` 中的注意力归一化：
-```python
-alpha = torch.softmax(alpha, dim=0)  # 注释说"Normalize per target node"
-```
-但实现上是**全局** softmax（跨所有 E 条边），而非**每目标节点独立** softmax。后果：
-- E≈4000 条边时，每条边的权重 ≈ 1/4000 = 0.00025
-- 所有邻居消息乘以这个极小权重后，几乎消失
-- `update()` 中的自连接 `lin_self(x_self)` 完全主导
-- 等价于根本没有消息传递（GNN 退化为每节点独立的 MLP）
+2. **Checkpoint 不保存调度器状态**：恢复训练时 LR 从头重启。**规则**：恢复训练必须保存所有有状态组件：model + optimizer + scheduler + loss_balancer + history。修复：`save_checkpoint` 新增 `scheduler_state_dict`。
 
-**思维误区**：看到 `softmax` 和注释"per target node"就以为归一化是正确的。没有追问：**`dim=0` 在 `[E, 1]` 张量上是什么语义？** 对 `[E, 1]` 使用 `softmax(dim=0)` 就是跨 E 维度归一化，与"每节点"完全无关。
+3. **无消息时残差连接 ≈ 2x**：`messages=[]` 时 `x_new = x`，然后无条件执行 `x_new = x + dropout(x_new)` → 幅度 ×2，4 层后 ×16。修复：有消息时 `x + dropout(mean(messages))`，无消息时直接 `x`（passthrough）。
 
-**正确思路**：GAT 风格的注意力应使用 scatter-softmax（按目标节点分组）。PyG 的 `pyg_softmax(alpha, index, num_nodes=size_i)` 就是为此设计的。每个目标节点的所有入边权重之和 = 1（而非所有 E 条边之和 = 1）。
-
-**修复**：将 `torch.softmax(alpha, dim=0)` 替换为 `pyg_softmax(alpha, index, num_nodes=size_i)`（来自 `torch_geometric.utils`）。在向量化时间传播中，`index` 包含虚拟节点索引 `t*N_dst + m`，pyg_softmax 自动对每个 `(t, m)` 组归一化 — 等价于每节点每时间步归一化，语义完全正确。
-
-**影响文件**：`models/graph_native_encoder.py`
+4. **窗口模式按窗口划分训练/验证集 → 数据泄漏**：相邻窗口 50% 重叠，同 run 的窗口同时进入两集。修复：引入 `run_idx`，以 run 为单位划分，保证同 run 所有窗口进入同一集合。
 
 ---
 
-### [2026-02-26] SpatialTemporalGraphConv 时间循环 — Python for-loop 导致 GPU 利用率极低
+### [2026-02-26] SpatialTemporalGraphConv 注意力归一化用 global softmax
 
-**症状**："训练速度极慢"，GPU 利用率低，nvtop/nvidia-smi 显示 GPU 大量空闲。
+**根因**：`softmax(alpha, dim=0)` 对形状 `[E, 1]` 是跨所有 E 条边归一化，而非每目标节点独立。E≈4000 时每条边权重≈0.00025，消息几乎消失，GNN 退化为每节点独立 MLP。
 
-**根因**：`forward()` 中有：
-```python
-for t in range(T):   # T=300 次 Python 迭代
-    out_t = self.propagate(edge_index, x=x_t[:, t, :], ...)
-    out_list.append(out_t)
-out = torch.stack(out_list, dim=1)
+**修复**：用 `pyg_softmax(alpha, index, num_nodes=size_i)` 实现每目标节点归一化。
+
+---
+
+### [2026-02-26] 配置文件路径是"死字符串"（Atlas 案例）
+
+**规则**：配置文件中的文件路径每次改动后必须和实际文件系统一一对照验证。`exists()` 检查只是运行时保护，不能替代"写正确的路径"。警告被忽视会导致系统长期静默运行错误配置（Atlas 未找到 → N_fmri=1，空间信息全丢）。
+
+---
+
+### [2026-02-27] 跨条件边界时序污染（ON/OFF 共享 fMRI 场景）
+
+**问题**：GRADON/GRADOFF 共享同一 fMRI 文件，截断和窗口均从 t=0 开始，导致 GRADOFF 条件使用 GRADON 时段的 fMRI 数据；窗口模式下还会跨越条件边界（模型被迫学习"预测实验条件切换"）。
+
+**修复**：新增 `fmri_condition_bounds` 配置项，在图构建前（连通性估计前）先切片 fMRI 时序到当前条件的时间段。缓存 key 包含此配置，修改边界自动失效。
+
+```yaml
+fmri_condition_bounds:
+  GRADON:  [0,   150]   # CB fMRI TR 0–149
+  GRADOFF: [150, 300]   # CB fMRI TR 150–299
 ```
 
-每次 `propagate()` 是一次独立的 CUDA 内核启动，负载 E≈4000 条边。对于现代 GPU（数千个并行单元），4000 条边的任务在微秒内完成，大部分时间花在 Python 调度开销和内核启动延迟上。
+1:1 标准场景设 `null`，行为不变。
 
-T=300 × 4 层 × 3 种边类型 = **3600 次 CUDA 内核启动**，Python 循环是串行瓶颈。
+---
 
-**量化**：
-- 每次 propagate 有效计算时间：~0.1ms（E=4000 太小，GPU 无法填满）
-- 每次 Python 调度开销：~0.1ms
-- 总串行时间：3600 × 0.2ms = ~0.7s/样本（仅编码器前向）
-- 向量化后：单次大 propagate（T*E=1.2M 条边）：~5ms（GPU 接近饱和）
-- **理论加速：100-140×**（对该组件；端到端加速取决于其他瓶颈）
+### [2026-02-27] 多被试多任务联合训练三项静默缺陷
 
-**思维误区**：以为"Python 循环调用 CUDA 就是并行"。实际上，每次 `propagate()` 调用必须等待上一次完成（PyTorch CUDA 流默认是串行的），Python 循环本身是串行开销。**小批量重复调用 ≠ 并行；只有在同一 CUDA 内核内的运算才是并行的。**
+> `graphs` 列表中每个 `HeteroData` 均为独立的 (被试, 任务) 图，不存在跨被试/跨任务的节点或特征混合。`train_epoch` 以 batch_size=1 逐一独立处理。
 
-**正确思路**："时序虚拟节点"技巧（Temporal Virtual-Node Trick）：
-- 为每个时间步 t 创建一组虚拟节点：源节点 `(n, t)` 的全局索引 = `t * N_src + n`
-- 将 edge_index 扩展 T 次（每次加偏移 t*N），得到 [2, T*E] 的扩展图
-- 单次 `propagate()` 处理所有 T*E 条消息 → 一次大内核，GPU 满载
-- 输出 `[N_dst*T, H]` → reshape 为 `[N_dst, T, H]`
+1. **`train_epoch` 缺少逐 epoch 打乱**：`train_model` 只打乱一次，之后每 epoch 顺序相同，optimizer 动量导致末尾被试获得更新偏差。修复：`random.Random(epoch).shuffle(copy)` 每轮独立打乱。
 
-**代码修复**：替换 `forward()` 中的 Python 时间循环为向量化扩展。梯度检查点（gradient checkpointing）对单次大 propagate 同样有效，内存使用不变。
+2. **EEG handler 通道数跨被试不匹配**：handler 按第一个样本初始化，不同 N_eeg 的被试静默传入错误形状张量。修复：记录 `_eeg_n_channels`，不匹配时跳过增强并 debug 日志。
 
-**影响文件**：`models/graph_native_encoder.py`：图原生数字孪生脑训练系统。将 EEG（脑电）和 fMRI（功能磁共振）数据构建为异构图，使用时空图卷积（ST-GCN）在保持图结构的同时对时空特征进行编码，实现多模态脑信号的联合建模与未来预测。
+3. **`task_id` / `subject_id_str` 未存储**：图构建后来源信息丢失，无法验证训练数据分布。修复：在 `build_graphs` 和缓存路径均写入这两个属性，`extract_windowed_samples` 传播到窗口，`log_training_summary` 展示每任务/被试样本数。
 
-**核心创新**：全程图原生（无序列转换），时空不分离建模，EEG-fMRI 能量自适应平衡，被试特异性嵌入（个性化数字孪生）。
+---
 
-**当前状态**：V5.20，生产就绪。详见 `SPEC.md`。
+## 四、文档格式规范（必须遵守）
+
+**项目永远只保留以下四个 MD 文件：**
+
+| 文件 | 用途 |
+|------|------|
+| `AGENTS.md` | **本文件**：AI Agent 指令 + 错误记录 |
+| `SPEC.md` | 项目规范说明：目标、设计理念、架构 |
+| `USERGUIDE.md` | 项目使用说明：面向非专业人士 |
+| `CHANGELOG.md` | 更新日志：所有版本变更 + 待优化事项 |
+
+**严禁**：在 `docs/`、根目录或任何位置创建第五个 MD 文件。
 
 ---
 
@@ -564,146 +248,87 @@ T=300 × 4 层 × 3 种边类型 = **3600 次 CUDA 内核启动**，Python 循�
 | 阶段 | EEG | fMRI |
 |------|-----|------|
 | 原始数据 | `[N_ch, N_times]` (e.g. 63×75000) | `[X, Y, Z, T]` (e.g. 64×64×40×190) |
-| 图节点特征 | `[N_eeg, T_eeg, 1]` (e.g. 63×300×1 截断后) | `[N_fmri, T_fmri, 1]` (e.g. 190×190×1，Schaefer200 atlas 实际节点数因被试 EPI 覆盖而异，通常 185-200) |
+| 图节点特征 | `[N_eeg, T_eeg, 1]` (e.g. 63×300×1) | `[N_fmri, T_fmri, 1]` (e.g. ~190×190×1，Schaefer200，实际数因 EPI 覆盖而异) |
 | 编码器输入投影 | `[N_eeg, T_eeg, H]` | `[N_fmri, T_fmri, H]` |
-| ST-GCN 跨模态消息 | 源：`[N_eeg, T_eeg, H]` → propagate(size=(N_eeg, N_fmri)) → `[N_fmri, T_eeg, H]` → interpolate → `[N_fmri, T_fmri, H]` | 目标 |
-| 编码器输出 | `[N_eeg, T_eeg, H]` | `[N_fmri, T_fmri, H]` |
+| ST-GCN 跨模态消息 | 源 → propagate(size=(N_eeg, N_fmri)) → `[N_fmri, T_eeg, H]` → interpolate → `[N_fmri, T_fmri, H]` | 目标 |
 | 解码器输出 | `[N_eeg, T_eeg, 1]` | `[N_fmri, T_fmri, 1]` |
-| 损失函数目标 | `data['eeg'].x = [N_eeg, T_eeg, 1]` | `data['fmri'].x = [N_fmri, T_fmri, 1]` |
-
-### 跨模态边逻辑
-
-- **方向**：`('eeg', 'projects_to', 'fmri')` — EEG 为 source，fMRI 为 destination
-- **edge_index[0]**：EEG 节点索引（0..N_eeg-1）
-- **edge_index[1]**：fMRI 节点索引（0..N_fmri-1）
-- **当前映射策略**：随机连接（`connection_ratio=0.1`），适合无坐标配准场景
-- **理想映射策略**：EEG 电极坐标（head space mm）→ 最近 fMRI ROI 质心（MNI mm）；需要 EEG-fMRI 坐标配准（coregistration）方可使用
+| 损失目标 | `data['eeg'].x` | `data['fmri'].x` |
 
 ### 关键不变量（违反即 bug）
 
-1. `N_eeg < N_fmri`（EEG 节点 < fMRI 节点）
+1. `N_eeg < N_fmri`
 2. 跨模态边类型必须是 `('eeg', 'projects_to', 'fmri')`，**不依赖 config 列表顺序**
-3. `propagate(size=(N_eeg, N_fmri))` 必须传入 size，否则 PyG 默认 (N_eeg, N_eeg) 导致 fMRI 节点数被 EEG 数污染
-4. 重建损失中 `recon.shape[0] == target.shape[0]`（节点数一致），违反时应 raise RuntimeError 而非 broadcast
+3. `propagate(size=(N_eeg, N_fmri))` 必须显式传入 size
+4. `recon.shape[0] == target.shape[0]`，违反时 raise RuntimeError 而非广播
 
-### 违反不变量的症状
-- Warning: `Using a target size ([63, 190, 1]) different from input ([1, 190, 1])` → invariant 3 或 4 被违反
-- fMRI 解码输出节点数等于 N_eeg（如 63）而非 N_fmri → invariant 3 被违反
-- Error: `Trying to backward through the graph a second time` → data_list 中对象被原地修改（见上方错误记录）
+### 典型症状
+- `Using a target size ([63, 190, 1]) different from input ([1, 190, 1])` → 不变量 3 或 4 被违反
+- `Trying to backward through the graph a second time` → data_list 中对象被原地修改
 
 ---
 
-## 七、训练数据设计原则（重要——防止重蹈已知错误）
+## 七、训练数据设计原则
 
-### 为什么 "max_seq_len=300" 是错误的训练单元
+### max_seq_len=300 是错误的训练单元
 
-> **思维误区**：把截断当成内存优化，而不是把截断看成数据设计缺陷。
-
-**EEG 致命问题**：max_seq_len=300 在 250Hz 下 = 1.2 秒。从 1.2 秒 EEG 信号估计节点间相关性（Pearson r）统计上完全不可靠（需至少 10-30 秒，即 2500-7500 个样本点）。这意味着 EEG 图的 edge_index（驱动所有 ST-GCN 消息传递）建立在统计噪声之上。
-
-**数据量问题**：10 被试 × 3 任务 = 30 个训练样本。深度学习模型无法从 30 个样本泛化。
+`max_seq_len=300` @ 250Hz = 1.2 秒。从 1.2 秒 EEG 估计 Pearson 相关性统计上不可靠（需至少 10-30 秒）。图的 edge_index 建立在统计噪声之上。
 
 ### 正确范式：动态功能连接（dFC）滑动窗口
 
-参见 Hutchison et al. 2013 (Nature Rev Neurosci); Chang & Glover 2010 (NeuroImage)。
+| 概念 | 图的哪个部分 | 如何计算 |
+|------|-------------|---------|
+| 结构连通性 | `edge_index` | 完整 run 的相关矩阵 |
+| 动态脑状态 | 节点特征 `x` | 时间窗口切片 |
 
-| 概念 | 图的哪个部分 | 如何计算 | 为何如此 |
-|------|-------------|---------|---------|
-| 结构连通性 | `edge_index` | 完整 run 的相关矩阵 | 需要充足数据保证统计可靠 |
-| 动态脑状态 | 节点特征 `x` | 时间窗口切片 | 每个窗口 = 一个认知瞬态 |
-
-**数据量对比**：
-
-```
-截断模式: 10 sub × 3 task × 1 sample = 30 训练样本
-窗口模式: 10 sub × 3 task × 11 win  = 330 训练样本 (11×)
-```
-
-### windowed_sampling 配置关键约束
-
-1. 当 `windowed_sampling.enabled: true` 时，**必须设 `max_seq_len: null`**（否则图构建仍使用截断序列，EEG 连通性估计仍不可靠）。
-2. 缓存存储**完整 run 图**（topology=全序列相关），窗口切分在运行时从缓存图提取（cheap tensor slice）。
-3. `fmri_window_size=50`（TRs）与 `eeg_window_size=500`（samples）对齐的是**认知时长**，不是样本数——两者均约等于 100 秒（fMRI: 50×2s=100s; EEG: 500÷250Hz=2s，注意 EEG/fMRI 一般非同步采集，2s EEG epoch 与 100s fMRI window 各自对应其模态的自然时间尺度）。
-4. `edge_index` 在同一 run 的所有窗口间**共享同一对象**（不复制），节省内存。
-5. 跨模态预测（EEG→fMRI）需要 `cross_modal_align: true`，此时 `ws_eeg = round(ws_fmri × T_eeg/T_fmri)`；⚠ 会显著增大 EEG 窗口（可能导致 CUDA OOM）。
+**关键约束**：
+1. `windowed_sampling.enabled: true` 时，**必须设 `max_seq_len: null`**。
+2. 缓存存储**完整 run 图**，窗口在运行时从缓存切片。
+3. `edge_index` 在同一 run 的所有窗口间**共享同一对象**（不复制）。
+4. 窗口模式下以 **run** 为单位做训练/验证集划分（防止重叠窗口数据泄漏）。
 
 ---
 
-## 八、损失函数体系（关键——防止重蹈死代码错误）
-
-> **教训**：有 3 处精心设计的组件长期是死代码：预测头无梯度、EEG 正则被丢弃、跨模态窗口对齐缺失。每次新增 loss 组件，必须检查以下完整链路。
-
-### 损失函数调用链路（必须完整）
+## 八、损失函数体系（防止死代码）
 
 ```
 train_step()
     eeg_handler() → eeg_info['regularization_loss']  ← 必须加入 total_loss
     model.forward(return_encoded=True) → reconstructed, _, encoded
     model.compute_loss(data, reconstructed, encoded=encoded)
-        ├── recon_{node_type}: 重建损失（decoder 输出 vs 原始信号）
-        └── pred_{node_type}: 潜空间预测损失（context→predict future，均在 H 空间）
-    loss_balancer(losses)  ← 只平衡 recon_* 和 pred_*，不处理 eeg_reg
-    total_loss += eeg_info['regularization_loss']   ← eeg_reg 固定权重，不参与平衡
+        ├── recon_{node_type}: 重建损失
+        └── pred_{node_type}: 潜空间预测损失
+    loss_balancer(losses)       ← 平衡 recon_* 和 pred_*
+    total_loss += eeg_reg       ← 固定权重，不参与平衡
     total_loss.backward()
 ```
 
-### 每种损失的设计意图
-
 | 损失名 | 空间 | 目的 | 权重 |
 |--------|------|------|------|
-| `recon_eeg` | 原始 C=1 | EEG 信号重建 | 自适应（loss_balancer） |
-| `recon_fmri` | 原始 C=1 | fMRI 信号重建 | 自适应（loss_balancer） |
-| `pred_eeg` | 潜空间 H | EEG 潜向量未来预测（含跨模态混合） | 自适应（loss_balancer） |
-| `pred_fmri` | 潜空间 H | fMRI 潜向量未来预测（含跨模态混合） | 自适应（loss_balancer） |
-| `eeg_reg` | 原始 C=1 | 防止 EEG 静默通道崩塌（熵+多样性+活动） | 固定 0.01 × 3 |
+| `recon_eeg` | 原始 C=1 | EEG 信号重建 | 自适应 |
+| `recon_fmri` | 原始 C=1 | fMRI 信号重建 | 自适应 |
+| `pred_eeg` | 潜空间 H | EEG 潜向量未来预测 | 自适应 |
+| `pred_fmri` | 潜空间 H | fMRI 潜向量未来预测 | 自适应 |
+| `eeg_reg` | 原始 C=1 | 防止 EEG 通道崩塌 | 固定 0.01×3 |
 
-### 为什么"潜空间预测"隐式包含跨模态信息
-
-ST-GCN 编码器含 EEG→fMRI 跨模态边。因此：
-- `h_fmri` 已包含通过 EEG 电极发来的消息
-- "预测 fMRI 潜向量未来" = "用含 EEG 信息的表征预测含 EEG 信息的未来"
-- 等价于一种软跨模态预测，无需专用跨模态预测头
-
-真正的跨模态预测（EEG context → fMRI future，空间维度不同）需要额外的跨模态预测头，目前未实现（future work）。
+> `h_fmri` 已含 EEG 跨模态消息，因此 `pred_fmri` 已隐式包含跨模态预测，无需专用跨模态预测头（future work）。
 
 ---
 
-## 九、数字孪生脑的根本目的与当前架构差距（持续更新）
+## 九、数字孪生脑架构状态（持续更新）
 
-### 数字孪生脑应该是什么
+| 维度 | 状态 | 实现版本 |
+|------|------|---------|
+| 个性化（被试特异性嵌入） | ✅ 已实现 | V5.19–V5.20 |
+| 动态拓扑（DynamicGraphConstructor） | ✅ 已实现 | V5.14 |
+| 跨会话预测 | ⚡ 部分（within-run） | — |
+| 干预响应、自我演化 | ❌ Future work | — |
 
-| 维度 | 数字孪生定义 | 当前实现 | 状态 |
-|------|-------------|---------|------|
-| **个性化** | 特定于某一个体大脑 | V5.19 被试特异性嵌入 | **✅ 已实现** |
-| **动态拓扑** | 连接模式随认知状态改变 | V5.14 DynamicGraphConstructor | **✅ 已实现** |
-| **跨会话预测** | 预测下次扫描的脑状态 | 在同一 run 内预测未来窗口 | ⚡ 部分实现 |
-| **干预响应** | 模拟刺激/药物对脑活动的影响 | 未实现 | ❌ Future work |
-| **自我演化** | 随学习/发育更新模型 | 需要纵向数据 + 持续学习 | ❌ Future work |
+### 被试特异性嵌入全链路（V5.19–V5.20）
 
-### 三个最重要的架构差距（按优先级排序）
+`subject_to_idx` → `built_graph.subject_idx`（含缓存路径）→ `extract_windowed_samples` 传播 → `nn.Embedding(N, H)` → `x_proj += embed.view(1,1,-1)`
 
-**Gap 1（✅ 已实现）：动态图拓扑** ← V5.14 DynamicGraphConstructor
-- 原问题：edge_index 在数据预处理阶段固定，无法反映认知状态的动态变化
-- 解决：每个 ST-GCN 层从当前节点特征动态推算软邻接，与静态拓扑混合
+**⚠️ 注意**：缓存命中路径须在 `extract_windowed_samples` 前先写入 `subject_idx`（V5.20 修复）。
 
-**Gap 2（✅ V5.19 已完整实现）：被试特异性嵌入（真正的个性化）**
-- 每个被试的唯一 `[H]` 潜空间偏移，在编码器输入投影后施加到所有节点特征
-- 推理时只需 fine-tune 该嵌入（frozen encoder），即"few-shot personalization"
-- 完整调用链：`subject_to_idx` → `built_graph.subject_idx` → 窗口样本复制 → `nn.Embedding(N,H)` → `x_proj += embed.view(1,1,-1)`
-- **⚠️ 注意**：缓存命中路径须在 `extract_windowed_samples` 前先写入 `subject_idx`（V5.20 修复）
-
-**Gap 3（未实现）：跨会话预测（真正的"孪生"预测力）**
-- 当前 pred_loss 是 within-run（context→future in same scan）
-- 真正的孪生应能预测 next-session brain state given current session
-- 需要：跨会话数据对、subject-specific state persistence
-
-### 为什么 Gap 2 比 Gap 3 更优先
-- Gap 2 直接由现有训练数据（多被试）实现
-- Gap 3 需要额外的纵向设计（同一被试多次扫描）
-- Gap 2 实现后，每个被试的嵌入即是"个人大脑的数字指纹"
-
-### DynamicGraphConstructor 的正确使用姿势
-- 默认 `use_dynamic_graph: false`（后向兼容）
-- 研究场景推荐 `true`：对认知神经科学应用，功能连接动态性是核心现象
-- 小数据集（< 50 样本）建议谨慎：动态图引入额外参数（每层 `node_proj + mix_logit`），可能过拟合
-- `k_dynamic_neighbors` 建议：fMRI(N=200) 设 10；EEG(N≤64) 设 5
+### DynamicGraphConstructor 使用建议
+- 小数据集（< 50 样本）谨慎：额外参数可能过拟合。
+- `k_dynamic_neighbors`：fMRI(N≈190) 设 10；EEG(N≤64) 设 5。

@@ -50,6 +50,42 @@ data:
   # 1:1 标准场景（EEG 任务名 == fMRI 任务名，如 rest_eeg + rest_bold）：保持 null 即可。
   fmri_task_mapping: null
 
+  # fMRI 条件时间段截取（防止跨条件边界时序学习）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 适用场景：多个 EEG 条件（如 GRADON/GRADOFF）共享同一 fMRI 运行（如 task-CB），
+  # fMRI 文件按条件顺序包含完整会话的时序数据：
+  #   t=0..T₁ TRs → 条件 1（如 GRADON）
+  #   t=T₁..T₂ TRs → 条件 2（如 GRADOFF）
+  #
+  # ★ 为什么需要此配置（重要！）：
+  #   若不截取，会产生两类时序污染错误：
+  #   1. 非窗口模式（max_seq_len=300）：两个条件都从 t=0 开始截断，
+  #      GRADOFF 错误地使用 GRADON 时段的 fMRI 数据，学习错误的连接结构。
+  #   2. 窗口模式：滑动窗口会跨越条件边界（如 t=275-325 包含 GRADON 末尾
+  #      和 GRADOFF 开头），预测损失被迫"预测"实验条件切换而非神经动态，
+  #      导致模型学到虚假的时序规律（如 t=300 后 BOLD 信号突变）。
+  #
+  # 配置格式（单位：TR，含左不含右）：
+  #   fmri_condition_bounds:
+  #     <EEG任务名>: [起始TR, 终止TR]
+  #
+  # 示例（GRADON/GRADOFF 各对应 CB fMRI 前后 150 TRs，TR=2s）：
+  #   fmri_condition_bounds:
+  #     GRADON: [0, 150]     # TR 索引 0-149（会话开始后 0-300s）→ GRADON 条件
+  #     GRADOFF: [150, 300]  # TR 索引 150-299（会话开始后 300-600s）→ GRADOFF 条件
+  #   注：索引均为从 0 开始的累计 TR 编号（含左不含右），与 Python 切片语义一致。
+  #
+  # 如何确定 TR 边界：
+  #   1. 查阅实验设计文档（最准确）
+  #   2. 查看 BIDS events.tsv 文件中的 onset/duration
+  #   3. 经验估算：total_TRs = fMRI_TR_count（可用 `fslhd bold.nii` 查看），
+  #      若两个条件等时长，boundary = total_TRs / 2
+  #
+  # null（默认）：不截取，使用完整 fMRI 时间序列。
+  #   1:1 标准场景（每个 EEG 任务有独立对应的 fMRI 文件）请保持 null。
+  #   ON/OFF 共享 fMRI 场景**强烈建议**配置此项，否则存在时序污染风险。
+  fmri_condition_bounds: null
+
   # 最大被试数 (用于测试, 0 或 null 表示处理所有)
   max_subjects: 0
 
