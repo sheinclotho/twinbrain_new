@@ -96,6 +96,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         # EEG 连通性方法：'correlation' vs 'coherence' 产生不同 edge_index/edge_attr，
         # 切换方法必须使旧缓存失效，否则 coherence 模式会使用 correlation 权重的旧图。
         'eeg_connectivity_method': config['graph'].get('eeg_connectivity_method', 'correlation'),
+        # EEG 逐通道 z-score 归一化：True（默认）。修改此项将改变 EEG 节点特征的数值
+        # 尺度，旧缓存中存储的是归一化前/后的值，切换后必须使缓存失效并重建。
+        'eeg_normalize': True,
         # 注意：k_cross_modal 不纳入缓存键。
         # 跨模态边在每次加载缓存时从节点特征动态重建（代价低，仅矩阵乘法），
         # 因此修改 k_cross_modal 无需重建缓存。
@@ -1335,23 +1338,29 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 logger.error(f"❌ Validation loss is NaN/Inf at epoch {epoch}. Stopping training.")
                 raise ValueError("Validation diverged: loss is NaN or Inf")
             
-            # Format R² values for logging (show all modalities)
-            r2_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(r2_dict.items()))
+            # Format R² values for logging — separate reconstruction from prediction.
+            # Prediction R² (pred_r2_*) is the primary quality indicator and is
+            # shown first, followed by reconstruction R² (r2_*).
+            _pred_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_')}
+            _recon_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('r2_')}
+            _pred_r2_str  = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_pred_r2_items.items()))
+            _recon_r2_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_recon_r2_items.items()))
+            _r2_display = "  ".join(filter(None, [_pred_r2_str, _recon_r2_str]))
             logger.info(
                 f"✓ Epoch {epoch}/{config['training']['num_epochs']}: "
                 f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
-                f"{r2_str}, "
+                f"{_r2_display}, "
                 f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
 
             # ── R² < 0 警报：模型差于均值基线时明确告警 ─────────────────
-            # R² < 0 表示模型重建误差 > 信号总方差，即比"永远预测均值"还差。
-            # 这是模型科学失效的明确信号，非专业用户无法从裸数字判断。
             for _r2k, _r2v in r2_dict.items():
                 if _r2v < 0.0:
+                    _is_pred = _r2k.startswith('pred_r2_')
+                    _metric_desc = "预测能力" if _is_pred else "重建效果"
                     logger.warning(
-                        f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型重建效果差于均值基线预测，"
-                        "当前模型尚未从数据中学到有效信号。"
+                        f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
+                        "尚未从数据中学到有效信号。"
                         " 请检查数据质量、atlas 加载、或降低学习率后重试。"
                     )
 
@@ -1411,9 +1420,11 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
 
     # ── 训练可信度摘要 ─────────────────────────────────────────────────────
     # 向非专业用户提供一次性、人类可读的科学可信度评估：
-    # 1. 最佳模型的 R² 指标及其含义
-    # 2. 是否存在过拟合风险
-    # 3. 结论：模型是否可信用于后续分析
+    # 重要性排序：预测 R² (pred_r2_*) > 重建 R² (r2_*)
+    # 1. 信号空间预测 R²（模型核心能力：根据过去预测未来脑活动）
+    # 2. 重建 R²（自编码质量：模型对当前输入信号的还原能力）
+    # 3. 是否存在过拟合风险
+    # 4. 综合结论
     _sep = "=" * 60
     logger.info(_sep)
     logger.info("📊 训练可信度摘要 (Training Credibility Summary)")
@@ -1421,26 +1432,51 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
     logger.info(f"  最佳模型: Epoch {best_epoch}, val_loss={best_val_loss:.4f}")
     if best_r2_dict:
         _all_trustworthy = True
-        for _r2k, _r2v in sorted(best_r2_dict.items()):
-            if _r2v >= 0.3:
-                _sym, _rating = "✅", "良好重建能力 (R² ≥ 0.3，达到神经影像研究可用标准)"
-            elif 0.1 <= _r2v < 0.3:
-                _sym, _rating = "⚠️", "有限重建能力 (0.1 ≤ R² < 0.3，建议增加数据量或调整模型)"
-                _all_trustworthy = False
-            elif 0.0 <= _r2v < 0.1:
-                _sym, _rating = "⚠️", "极弱重建能力 (0 ≤ R² < 0.1，模型几乎未学到有效信号)"
-                _all_trustworthy = False
+
+        # ── 1. 预测 R²（模型首要能力）──────────────────────────────────
+        _pred_items = {k: v for k, v in best_r2_dict.items() if k.startswith('pred_r2_')}
+        _recon_items = {k: v for k, v in best_r2_dict.items() if k.startswith('r2_')}
+
+        def _r2_rating(r2v, label):
+            if r2v >= 0.3:
+                return "✅", f"{label}良好 (R² ≥ 0.3，达到神经影像研究可用标准)"
+            elif 0.1 <= r2v < 0.3:
+                return "⚠️", f"{label}有限 (0.1 ≤ R² < 0.3，建议增加数据量或调整模型)"
+            elif 0.0 <= r2v < 0.1:
+                return "⚠️", f"{label}极弱 (0 ≤ R² < 0.1，模型几乎未学到有效信号)"
             else:
-                _sym, _rating = "⛔", "模型不可信：差于均值基线 (R² < 0，请检查数据或重新训练)"
-                _all_trustworthy = False
-            logger.info(f"  {_sym} {_r2k}={_r2v:.3f} — {_rating}")
+                return "⛔", f"{label}不可信：差于均值基线 (R² < 0，请检查数据或重新训练)"
+
+        if _pred_items:
+            logger.info("  【预测能力 ★ 主要指标】(根据历史脑活动预测未来)")
+            for _k, _v in sorted(_pred_items.items()):
+                _sym, _rating = _r2_rating(_v, "预测")
+                logger.info(f"    {_sym} {_k}={_v:.3f} — {_rating}")
+                if _v < 0.3:
+                    _all_trustworthy = False
+
+        if _recon_items:
+            logger.info("  【重建能力】(自编码器对输入信号的还原质量)")
+            for _k, _v in sorted(_recon_items.items()):
+                _sym, _rating = _r2_rating(_v, "重建")
+                logger.info(f"    {_sym} {_k}={_v:.3f} — {_rating}")
+                if _v < 0.3:
+                    _all_trustworthy = False
+
+        # Fallback: older dict without pred_ prefix
+        if not _pred_items and not _recon_items:
+            for _r2k, _r2v in sorted(best_r2_dict.items()):
+                _sym, _rating = _r2_rating(_r2v, "")
+                logger.info(f"  {_sym} {_r2k}={_r2v:.3f} — {_rating}")
+                if _r2v < 0.3:
+                    _all_trustworthy = False
+
         if _all_trustworthy:
-            logger.info("  ✅ 结论：最佳模型在所有模态上达到可信重建水平 (R² ≥ 0.3)")
+            logger.info("  ✅ 结论：最佳模型在所有指标上达到可信水平 (R² ≥ 0.3)")
         else:
             logger.warning(
-                "  ⚠️ 结论：部分或全部模态的 R² 低于可信阈值 (R² < 0.3)。"
-                " 当前最佳模型的重建能力有限，建议检查数据质量、atlas 配置"
-                " 或增加训练数据后重训。"
+                "  ⚠️ 结论：部分或全部指标的 R² 低于可信阈值 (R² < 0.3)。"
+                " 建议检查数据质量、atlas 配置或增加训练数据后重训。"
             )
     else:
         logger.warning("  R² 未计算（训练中从未执行验证，请检查 val_frequency 配置）")

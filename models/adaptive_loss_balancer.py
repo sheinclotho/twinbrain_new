@@ -84,21 +84,38 @@ class AdaptiveLossBalancer(nn.Module):
 
         # ── Energy-aware initial task weights ──────────────────────────────
         # Design note (rescues ModalityGradientScaler's valid intent):
-        # EEG has ~50x lower signal amplitude than fMRI.  All tasks at weight=1.0
-        # means fMRI reconstruction loss dominates from step 1, and the model treats
-        # EEG as noise during warmup (when adaptation is disabled).
-        # Setting initial_weight ∝ 1/energy means:
-        #   recon_eeg starts at 50×, recon_fmri at 1× (normalised to mean=1)
-        # No autograd.grad() needed — pure init-time arithmetic, zero runtime overhead.
+        # EEG (z-scored after our normalization fix) and fMRI have the same
+        # amplitude scale (~1), so modality_energy_ratios are now effectively
+        # equal and the main differentiator is task type (recon vs pred).
+        #
+        # Prediction is the model's primary objective (digital-twin brain):
+        # - pred_* tasks receive PRED_TASK_PRIORITY initial-weight boost
+        # - Within each task type, energy ratios still balance EEG vs fMRI
+        #   (kept for legacy and cases where EEG is NOT pre-normalised)
+        #
+        # Final weight formula per task:
+        #   w ∝ task_priority / modality_energy
+        # where task_priority = PRED_TASK_PRIORITY for pred_*, 1.0 for recon_*
+        PRED_TASK_PRIORITY = 2.0  # prediction tasks get 2× weight vs reconstruction
         if initial_weights is None:
             if modality_energy_ratios is None:
-                modality_energy_ratios = {'eeg': 0.02, 'fmri': 1.0}
+                # After EEG per-channel z-score normalisation (map_eeg_to_graph),
+                # both EEG and fMRI have ~unit variance, so the modality energy
+                # ratio is ~1:1.  Setting eeg=1.0 / fmri=1.0 means the only
+                # differentiation between tasks is the pred/recon priority below.
+                # (Legacy value was eeg=0.02 / fmri=1.0, calibrated for raw MNE
+                # Volts.  That is now incorrect because EEG is pre-normalised.)
+                modality_energy_ratios = {'eeg': 1.0, 'fmri': 1.0}
             raw: Dict[str, float] = {}
             for name in task_names:
                 # Match task name suffix to a known modality (e.g. 'recon_eeg' → 'eeg')
                 matched = next((m for m in self.modality_names if name.endswith(m)), None)
                 energy = modality_energy_ratios.get(matched, 1.0) if matched else 1.0
-                raw[name] = 1.0 / (energy + 1e-8)
+                # Prediction tasks get PRED_TASK_PRIORITY over reconstruction tasks.
+                # This encodes the model's primary objective: predict future
+                # brain activity, not just reconstruct the current input.
+                task_priority = PRED_TASK_PRIORITY if name.startswith('pred_') else 1.0
+                raw[name] = task_priority / (energy + 1e-8)
             mean_w = sum(raw.values()) / len(raw)
             initial_weights = {k: v / mean_w for k, v in raw.items()}
             logger.debug(f"Energy-seeded initial task weights: {initial_weights}")

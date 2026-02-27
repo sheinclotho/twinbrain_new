@@ -351,7 +351,21 @@ class GraphNativeBrainMapper:
             threshold=self.threshold_eeg,
             k_nearest=self.k_nearest_eeg,
         )
-        
+
+        # Per-channel z-score normalisation.
+        # MNE stores EEG in Volts (~1e-5 range); fMRI is z-scored to ~1 by
+        # NiftiLabelsMasker(standardize=True) or process_fmri_timeseries().
+        # Without normalisation the ~1e10 amplitude gap causes the adaptive
+        # loss balancer to drive the EEG reconstruction weight toward its
+        # minimum (the EEG MSE/Huber loss is negligibly small in absolute
+        # terms), so the decoder never learns to reconstruct EEG and R²_eeg
+        # collapses to large negative values.
+        # Connectivity is computed from the raw timeseries above (Pearson r
+        # and MSC are both scale-invariant, so this order is correct).
+        ts_mean = timeseries.mean(axis=1, keepdims=True)
+        ts_std  = timeseries.std(axis=1, keepdims=True) + 1e-8
+        timeseries = (timeseries - ts_mean) / ts_std
+
         # Node features: temporal EEG signals
         # Shape: [N, T, 1]
         x = torch.tensor(timeseries, dtype=torch.float32, device=self.device).unsqueeze(-1)

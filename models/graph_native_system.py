@@ -1292,87 +1292,159 @@ class GraphNativeTrainer:
     def validate(self, data_list: List[HeteroData]) -> Tuple[float, Dict[str, float]]:
         """
         Validation pass.
-        
+
         Computes the same loss terms as training (reconstruction + prediction)
         so that early stopping is driven by the actual optimisation objective.
-        Previously this only computed reconstruction loss, making val_loss
-        artificially lower than train_loss regardless of overfitting.
-        
-        Additionally computes per-modality R² (coefficient of determination)
-        on reconstructed signals, providing a direct, interpretable measure
-        of model quality independent of loss function choice or signal scale.
-        R² = 0: model predicts the mean (no better than baseline).
-        R² = 1: perfect reconstruction.
-        R² < 0: model is worse than mean prediction (catastrophic failure).
-        
+
+        Metrics computed
+        ----------------
+        1. Reconstruction R² (r2_<node_type>):
+           How well the model reconstructs the input signal.
+           R² = 1 − SS_res/SS_tot.  R² = 1 → perfect; R² = 0 → mean baseline;
+           R² < 0 → worse than mean baseline (failure).
+
+        2. Signal-space prediction R² (pred_r2_<node_type>):
+           **Primary quality indicator** — how well the model predicts future
+           brain signals from past signals.
+           Procedure: encode full sequence → split context (first 2/3) / future
+           (last 1/3) → run predictor on context latent → decode predicted
+           latent back to signal space → compare against actual future signal.
+           This is the real "digital-twin" capability metric.
+
         Args:
             data_list: List of validation data
-            
+
         Returns:
             Tuple of:
                 avg_loss: Average validation loss (scalar)
-                r2_dict: Per-modality R² {'r2_eeg': float, 'r2_fmri': float}
+                r2_dict: Per-modality metrics dict, keys:
+                    'r2_<nt>'      — reconstruction R²
+                    'pred_r2_<nt>' — signal-space prediction R² (★ primary)
         """
         self.model.eval()
         total_loss = 0.0
-        # Accumulators for R²: running SS_res and SS_tot per modality
+        # Accumulators for reconstruction R²
         ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         ss_tot: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
-        
-        for data in data_list:
-            data = data.to(self.device)
-            
-            # Request encoded representations when prediction is enabled so that
-            # compute_loss() can include the latent-space prediction loss —
-            # the same terms that are optimised during training.
-            if self.model.use_prediction:
-                reconstructed, _, encoded = self.model(
-                    data, return_prediction=False, return_encoded=True
-                )
-            else:
-                reconstructed, _ = self.model(data, return_prediction=False)
-                encoded = None
-            
-            losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-            total_loss += sum(losses.values()).item()
+        # Accumulators for signal-space prediction R²
+        pred_ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_tot: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
 
-            # ── R² per modality ─────────────────────────────────────────────
-            # R² = 1 - SS_res / SS_tot, accumulated over the full validation set
-            # (not averaged per sample) for a more stable estimate.
-            for node_type in self.node_types:
-                if (
-                    node_type in data.node_types
-                    and node_type in reconstructed
-                ):
-                    target = data[node_type].x          # [N, T, C]
-                    recon  = reconstructed[node_type]   # [N, T', C]
-                    T_min  = min(target.shape[1], recon.shape[1])
-                    target = target[:, :T_min, :]
-                    recon  = recon[:, :T_min, :]
-                    if recon.shape[0] != target.shape[0]:
-                        continue  # shape mismatch — already handled by compute_loss
-                    target_mean = target.mean()
-                    ss_res[node_type] += ((target - recon) ** 2).sum().item()
-                    ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
-        
+        with torch.no_grad():
+            for data in data_list:
+                data = data.to(self.device)
+
+                # Forward pass — always request encoded representations so that:
+                # a) compute_loss() can include the latent prediction loss, and
+                # b) we can compute signal-space prediction R² below.
+                if self.model.use_prediction:
+                    reconstructed, _, encoded = self.model(
+                        data, return_prediction=False, return_encoded=True
+                    )
+                else:
+                    reconstructed, _ = self.model(data, return_prediction=False)
+                    encoded = None
+
+                losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
+                total_loss += sum(losses.values()).item()
+
+                # ── Reconstruction R² per modality ──────────────────────────
+                for node_type in self.node_types:
+                    if node_type in data.node_types and node_type in reconstructed:
+                        target = data[node_type].x       # [N, T, C]
+                        recon  = reconstructed[node_type]  # [N, T', C]
+                        T_min  = min(target.shape[1], recon.shape[1])
+                        target = target[:, :T_min, :]
+                        recon  = recon[:, :T_min, :]
+                        if recon.shape[0] != target.shape[0]:
+                            continue
+                        target_mean = target.mean()
+                        ss_res[node_type] += ((target - recon) ** 2).sum().item()
+                        ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
+
+                # ── Signal-space prediction R² per modality ─────────────────
+                # The predictor operates in latent space; we decode its output
+                # back to signal space so we can measure the genuinely useful
+                # "given the past, how well can you predict the future signal?"
+                # capability — the primary metric for a digital-twin brain model.
+                if self.model.use_prediction and encoded is not None:
+                    pred_latents: Dict[str, torch.Tensor] = {}
+                    pred_T_ctx: Dict[str, int] = {}
+
+                    for node_type in self.node_types:
+                        if node_type not in encoded:
+                            continue
+                        h = encoded[node_type]  # [N, T, H]
+                        T = h.shape[1]
+                        if T < self.model._PRED_MIN_SEQ_LEN:
+                            continue
+                        T_ctx = int(T * self.model._PRED_CONTEXT_RATIO)
+                        context = h[:, :T_ctx, :]
+                        # Use same predictor as compute_loss()
+                        pred_windows, _, _ = self.model.predictor(
+                            context, return_uncertainty=False
+                        )
+                        pred_latents[node_type] = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+                        pred_T_ctx[node_type] = T_ctx
+
+                    # System-level graph propagation of predictions
+                    if pred_latents:
+                        pred_latents = self.model.prediction_propagator(pred_latents, data)
+
+                    if pred_latents:
+                        # Decode predicted latents to signal space.
+                        # Build a temporary HeteroData where each node type's
+                        # .x is the predicted latent [N, pred_steps, H].
+                        pred_enc = data.clone()
+                        for nt, pred_lat in pred_latents.items():
+                            pred_enc[nt].x = pred_lat
+                        pred_signals = self.model.decoder(pred_enc)  # {nt: [N, pred_steps', C]}
+
+                        for node_type, pred_sig in pred_signals.items():
+                            if node_type not in data.node_types:
+                                continue
+                            T_ctx = pred_T_ctx.get(node_type)
+                            if T_ctx is None:
+                                continue
+                            future_sig = data[node_type].x[:, T_ctx:, :]  # [N, T_fut, C]
+                            n_steps = min(pred_sig.shape[1], future_sig.shape[1])
+                            if n_steps < 1:
+                                continue
+                            if pred_sig.shape[0] != future_sig.shape[0]:
+                                continue
+                            pred_aligned   = pred_sig[:, :n_steps, :]
+                            future_aligned = future_sig[:, :n_steps, :]
+                            future_mean = future_aligned.mean()
+                            pred_ss_res[node_type] += ((future_aligned - pred_aligned) ** 2).sum().item()
+                            pred_ss_tot[node_type] += ((future_aligned - future_mean) ** 2).sum().item()
+
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
 
-        # Compute R² per modality
+        # ── Assemble R² dict ────────────────────────────────────────────────
         r2_dict: Dict[str, float] = {}
+
+        # Reconstruction R²
         for node_type in self.node_types:
             tot = ss_tot[node_type]
-            if tot > 1e-12:
-                r2 = 1.0 - ss_res[node_type] / tot
-            else:
-                r2 = 0.0  # undefined (zero-variance target) → treat as 0
+            r2 = 1.0 - ss_res[node_type] / tot if tot > 1e-12 else 0.0
             r2_dict[f'r2_{node_type}'] = r2
-            # Track history per modality
             key = f'val_r2_{node_type}'
             if key not in self.history:
                 self.history[key] = []
             self.history[key].append(r2)
-        
+
+        # Signal-space prediction R² (★ primary metric)
+        if self.model.use_prediction:
+            for node_type in self.node_types:
+                tot = pred_ss_tot[node_type]
+                pred_r2 = 1.0 - pred_ss_res[node_type] / tot if tot > 1e-12 else 0.0
+                r2_dict[f'pred_r2_{node_type}'] = pred_r2
+                key = f'val_pred_r2_{node_type}'
+                if key not in self.history:
+                    self.history[key] = []
+                self.history[key].append(pred_r2)
+
         return avg_loss, r2_dict
     
     def save_checkpoint(self, path: Path, epoch: int):

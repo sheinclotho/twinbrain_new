@@ -357,10 +357,11 @@ v5_optimization:
     update_frequency: 10
     # 预热 epoch 数（预热期权重固定为初始值，保证模型先有稳定梯度）
     warmup_epochs: 5
-    # EEG/fMRI 信号能量比（用于初始化权重，防止 fMRI 信号幅度主导损失）
-    # EEG 信号典型幅度 ~10μV，fMRI BOLD ~1–5%；此比值使初始损失量级一致。
+    # EEG/fMRI 信号能量比（用于初始化权重）
+    # 注意：EEG 在 map_eeg_to_graph() 中已逐通道 z-score 归一化，与 fMRI 尺度相同；
+    # 因此设为 1:1 即可。若使用未归一化的 EEG 数据，可调低 eeg 值（如 0.02）。
     modality_energy_ratios:
-      eeg: 0.02
+      eeg: 1.0
       fmri: 1.0
   
   # EEG 通道增强（解决"静默通道"导致的训练退化）
