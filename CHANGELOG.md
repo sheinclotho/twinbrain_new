@@ -1,8 +1,53 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-26  
-**版本**：V5.22  
+**最后更新**：2026-02-27  
+**版本**：V5.23  
 **状态**：生产就绪
+
+---
+
+## [V5.23] 2026-02-27 — 跨条件边界时序污染修复
+
+### 🔍 问题背景
+
+用户发现：在 ON/OFF 多条件共享 fMRI 实验范式中（GRADON/GRADOFF 条件共用 task-CB 扫描），系统没有机制确保每个条件只学习自己对应的 fMRI 时间段。
+
+### 🐛 时序污染分析（两种模式均受影响）
+
+**非窗口模式** (`windowed_sampling.enabled: false`)：
+- GRADON 和 GRADOFF 的 `max_seq_len` 截断都从 `t=0` 开始
+- GRADOFF 错误地使用 GRADON 时段的 fMRI 数据（相同的神经影像特征）
+- 导致：两个实验条件的 fMRI 图结构完全相同，失去条件区分能力
+
+**窗口模式** (`windowed_sampling.enabled: true`)：
+- 滑动窗口从 CB fMRI 的 `t=0` 延伸至整个 run 末尾
+- 跨条件边界的窗口（如边界 TR=150 处的窗口 `[135:185]`）同时包含两个条件的数据
+- 预测损失：`context=[135:163]` → 预测 `target=[163:185]`，而 TR=150 处有实验条件切换
+- 模型被迫学习"如何预测实验条件切换"而非神经时序动态 → 引入虚假规律
+
+### ✅ 修复方案
+
+新增 `fmri_condition_bounds` 配置项：
+```yaml
+fmri_condition_bounds:
+  GRADON: [0, 150]    # CB fMRI 前 150 TRs 对应 GRADON 条件
+  GRADOFF: [150, 300] # CB fMRI 后 150 TRs 对应 GRADOFF 条件
+```
+
+**作用位置**：在 `mapper.map_fmri_to_graph()` 调用**之前**截取，确保：
+1. 连通性矩阵从条件特异性时间段估计（不含另一条件的神经活动）
+2. `max_seq_len` 截断和滑动窗口均在条件特异性范围内操作
+3. 不存在跨条件边界的训练样本
+
+**缓存兼容性**：`fmri_condition_bounds` 已加入 `_graph_cache_key()` 哈希计算，修改边界后旧缓存自动失效并重建。
+
+**1:1 标准场景**（每个 EEG 任务有独立的 fMRI 文件）：保持 `fmri_condition_bounds: null`，行为与之前完全一致。
+
+### 📁 修改文件
+
+- `main.py`：`_graph_cache_key()` 加入新参数；`build_graphs()` 增加条件时间段截取
+- `configs/default.yaml`：新增 `fmri_condition_bounds` 配置项（详细注释）
+- `AGENTS.md`：记录此类时序污染模式
 
 ---
 

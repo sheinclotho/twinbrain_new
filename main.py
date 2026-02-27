@@ -145,6 +145,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         # DTI 开关影响图结构（是否含 ('fmri','structural','fmri') 边）；
         # 修改此选项必须使旧缓存失效，否则切换 DTI 后仍加载无 DTI 边的旧图。
         'dti_structural_edges': config['data'].get('dti_structural_edges', False),
+        # fMRI 条件时间段截取：修改此选项改变 fMRI 节点特征的时间维度和连通性估计，
+        # 必须使旧缓存失效，否则使用错误时间段的图参与训练。
+        'fmri_condition_bounds': config['data'].get('fmri_condition_bounds'),
     }
     params_hash = hashlib.md5(
         json.dumps(relevant, sort_keys=True).encode()
@@ -648,8 +651,59 @@ def build_graphs(config: dict, logger: logging.Logger):
                     logger.warning(f"fMRI processing failed: {error}, skipping subject")
                     continue
             
+            # ── 条件特异性时间段截取 ────────────────────────────────────────────
+            # 适用场景：多个 EEG 条件（GRADON/GRADOFF）共享同一 fMRI 运行（如 task-CB），
+            # fMRI 文件按条件顺序包含完整会话，例如：
+            #   t=0..150  TRs → GRADON 条件
+            #   t=150..300 TRs → GRADOFF 条件
+            #
+            # 若不截取，会产生两类错误：
+            #   1. 非窗口模式：两个条件的 max_seq_len 截断都从 t=0 开始，
+            #      GRADOFF 错误地使用 GRADON 时段的 fMRI 数据。
+            #   2. 窗口模式：滑动窗口跨越条件边界（如 t=275-325 同时包含
+            #      GRADON 末尾和 GRADOFF 开头），预测损失在边界处学习
+            #      虚假的时序演化，模型被迫"预测"实验条件切换而非神经动态。
+            #
+            # 配置方式（单位：TR）：
+            #   fmri_condition_bounds:
+            #     GRADON: [0, 150]
+            #     GRADOFF: [150, 300]
+            #
+            # 应用时机：在连通性估计 (mapper.map_fmri_to_graph) 之前截取，
+            # 保证条件特异性连通性矩阵和窗口均不跨越条件边界。
+            condition_bounds_cfg = config['data'].get('fmri_condition_bounds') or {}
+            if task in condition_bounds_cfg:
+                bounds = condition_bounds_cfg[task]
+                # Validate format early: must be a sequence of at least 2 numbers.
+                if not (hasattr(bounds, '__len__') and len(bounds) >= 2):
+                    raise ValueError(
+                        f"fmri_condition_bounds['{task}'] must be [start_TR, end_TR], "
+                        f"got: {bounds!r}. Example: {{'GRADON': [0, 150]}}"
+                    )
+                start_tr, end_tr = int(bounds[0]), int(bounds[1])
+                T_full = fmri_ts.shape[1]
+                if end_tr > T_full:
+                    logger.warning(
+                        f"fMRI 条件时间段越界: task={task}, "
+                        f"配置 end_tr={end_tr} > T_full={T_full}。"
+                        f" 将截断至 {T_full}。"
+                    )
+                    end_tr = T_full
+                if start_tr >= end_tr:
+                    logger.warning(
+                        f"fMRI 条件时间段无效: task={task}, [{start_tr}, {end_tr}) 为空区间，"
+                        f"跳过边界截取（可能导致跨条件时序学习）。"
+                    )
+                else:
+                    fmri_ts = fmri_ts[:, start_tr:end_tr]
+                    logger.info(
+                        f"fMRI 条件时间段截取: task={task}, "
+                        f"TRs [{start_tr}, {end_tr}) → {fmri_ts.shape[1]} TPs"
+                        f"（防止跨条件边界的时序学习）"
+                    )
+
             # 截断仅在单样本训练模式下启用（防 CUDA OOM）。
-            # 窗口模式下不截断，以使连通性估计来自完整 run。
+            # 窗口模式下不截断，以使连通性估计来自完整（条件特异性）序列。
             if not windowed and max_seq_len is not None:
                 fmri_ts = truncate_timeseries(fmri_ts, max_seq_len)
             

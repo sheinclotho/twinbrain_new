@@ -772,3 +772,44 @@ x_new = x + self.dropout(x_new)
 
 **修复**：引入 `run_idx`（每个 (被试, 任务) run 的全局顺序索引）。`build_graphs` 为每个 run 的完整图赋值 `run_idx`，`extract_windowed_samples` 将其复制到所有子窗口。`train_model` 在窗口模式下按 `run_idx` 分组，以 run 为单位做 90/10 划分，保证同一 run 的所有窗口都进入同一集合。
 
+
+---
+
+### [2026-02-27] 跨条件边界的时序污染（ON/OFF 共享 fMRI 场景）
+
+**问题来源**：用户指出"如果它学习了250-350的时序演化，就可能出现很大的错误"，即当两个 EEG 条件（GRADON/GRADOFF）共享同一 fMRI 文件时，系统没有机制防止窗口跨越条件边界。
+
+**根因分析（两种模式均受影响）**：
+
+```
+数据结构：
+  task-GRADON_eeg.set  → 条件1 EEG（t=0..T_cond1）
+  task-GRADOFF_eeg.set → 条件2 EEG（t=0..T_cond2）
+  task-CB_bold.nii     → 完整 fMRI 运行（t=0..T_cond1+T_cond2，包含两个条件）
+
+非窗口模式（max_seq_len=300）的错误：
+  GRADON 和 GRADOFF 都从 t=0 开始截断 → 两者使用完全相同的 fMRI 数据
+  GRADOFF 条件错误地使用 GRADON 时段的 fMRI 连接结构
+
+窗口模式的错误：
+  滑动窗口从 CB fMRI 的 t=0 一直到末尾，包括跨条件的窗口：
+  e.g., 边界 t=300（TR=150），窗口 [275:325] 包含 GRADON 末尾 + GRADOFF 开头
+  预测损失：context=[275:308] → 预测 target=[308:325]，而 t=300 处有实验条件切换
+  模型被迫学习"预测实验条件切换"，而非神经时序动态
+```
+
+**正确思路**：不同条件使用 fMRI 数据的不同时间段。条件边界的判定必须在**图构建前**（连通性估计前）和**窗口切分前**均已完成。"在图里面"而非"在图外面"修复这个问题，是因为连通性矩阵本身也应该从条件特异性时间段估计。
+
+**修复**：新增 `fmri_condition_bounds` 配置项：
+```yaml
+fmri_condition_bounds:
+  GRADON: [0, 150]    # CB fMRI 前 150 TRs → GRADON 时段
+  GRADOFF: [150, 300] # CB fMRI 后 150 TRs → GRADOFF 时段
+```
+
+在 `build_graphs()` 中，所有后续处理（连通性估计、max_seq_len 截断、窗口采样）均在截取后的条件特异性 fMRI 序列上进行。`_graph_cache_key()` 也包含此配置项，修改边界后缓存自动失效。
+
+**1:1 标准场景**（每个 EEG 任务有独立 fMRI 文件）：`fmri_condition_bounds: null`，行为不变。
+
+**影响文件**：`main.py`、`configs/default.yaml`、`AGENTS.md`、`CHANGELOG.md`
+
