@@ -632,6 +632,48 @@ current = output                       # BUG: 256 ≠ 128 → 第2步崩溃
 
 ---
 
+### [2026-02-27] 预测功能第四轮审查：GRU 累积输出维度未投影（Round 3 遗漏的对称问题）
+
+**背景**：第四轮独立审查，假设所有已修复项都可能存在遗漏。
+
+---
+
+**盲区 — GRU 累积预测维度错误（P0 运行时崩溃）**
+
+**思维误区**：以为"Round 3 修复了 GRU 输出投影"就等于"GRU 自回归循环完全正确"。没有追问：**修复了反馈路径，累积路径是否也修了？**
+
+**根因**：Round 3 的修复代码：
+
+```python
+output, hidden = predictor(current, hidden)  # output: [B, 1, 256]
+predictions.append(output)                   # ← 仍然累积 256 维！（遗漏）
+current = output_proj(output)                # ← 反馈正确投影到 128 维 ✓
+```
+
+`predictions` 累积的是 `hidden_dim=256` 维的原始 GRU 输出，而下游所有消费者都期待 `input_dim=128`：
+- `upsamplers[i]` = `ConvTranspose1d(in_channels=128)` → 收到 256 → **CRASH**
+- `fusion` = `Linear(input_dim*3=384)` → 收到 768 → **CRASH**
+- `prediction_propagator` = `SpatialTemporalGraphConv(in_channels=128)` → 收到 256 → **CRASH**
+
+**影响的3处位置**：
+1. `HierarchicalPredictor._autoregressive_predict()` — GRU 模式（`use_transformer=False`）
+2. `EnhancedMultiStepPredictor.predict_next()` GRU分支
+3. `EnhancedMultiStepPredictor.forward()` GRU分支
+
+**修复**：在所有3处，将"累积"与"反馈"统一为同一个投影后的变量：
+
+```python
+# 修复后（每处完全对称）：
+output, hidden = predictor(current, hidden)
+projected = output_proj(output) if output_proj is not None else output
+predictions.append(projected)   # ← 累积 128 维 ✓
+current = projected              # ← 反馈 128 维 ✓
+```
+
+**根本规则**：**自回归循环中"用于累积（append）"的张量和"用于反馈（current=）"的张量必须是同一个对象。** 如果两者不同，必须追问：两者的维度是否一致，下游消费者期待哪个维度？
+
+---
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -653,7 +695,8 @@ current = output                       # BUG: 256 ≠ 128 → 第2步崩溃
 | HierarchicalPredictor 上采样器 BatchNorm1d→GroupNorm（静默归零修复） | ✅ 已修复 | V5.32 |
 | use_uncertainty 配置文档准确化（默认关闭） | ✅ 已修复 | V5.32 |
 | use_uncertainty Python 默认值同步 YAML（True→False） | ✅ 已修复 | V5.33 |
-| GRU 自回归滚动输出投影（维度崩溃修复） | ✅ 已修复 | V5.33 |
+| GRU 自回归滚动输出投影——反馈维度修复 | ✅ 已修复 | V5.33 |
+| GRU 自回归滚动输出投影——累积维度修复（对称完整） | ✅ 已修复 | V5.34 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

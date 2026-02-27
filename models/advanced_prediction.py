@@ -427,13 +427,17 @@ class HierarchicalPredictor(nn.Module):
         for _ in range(num_steps):
             # Predict next step
             output, hidden = predictor(current, hidden)
-            predictions.append(output)
             
-            # Project output back to input_dim before using it as the next
-            # input.  This is the standard GRU decoder pattern: the hidden
-            # representation (hidden_dim) is separate from the input space
-            # (input_dim); a learned projection bridges the two.
-            current = output_proj(output) if output_proj is not None else output
+            # Project GRU hidden output (hidden_dim) back to input_dim.
+            # The projected tensor serves BOTH purposes:
+            #   1. Accumulated into predictions (must be input_dim for upsamplers/fusion)
+            #   2. Fed back as next-step input (must be input_dim for GRU input_size)
+            # Round 3 fixed (2) but left (1) accumulating raw hidden_dim output,
+            # causing crashes in upsamplers (ConvTranspose1d expects input_dim) and
+            # in the fusion layer (Linear(input_dim * num_scales, ...) expects input_dim).
+            projected = output_proj(output) if output_proj is not None else output
+            predictions.append(projected)
+            current = projected
         
         # Concatenate predictions
         return torch.cat(predictions, dim=1)
@@ -849,9 +853,9 @@ class EnhancedMultiStepPredictor(nn.Module):
             else:
                 # Simple GRU autoregressive rollout.
                 # Use self.gru_output_proj to project GRU output (hidden_dim)
-                # back to input_dim before using it as the next-step input.
-                # Without this projection, step 2+ would receive hidden_dim
-                # features when the GRU expects input_dim → crash.
+                # back to input_dim.  The projected tensor is used BOTH for
+                # accumulation into predictions (propagator / loss expect input_dim)
+                # and as next-step feedback (GRU input_size = input_dim).
                 _, hidden = self.predictor(context)
                 
                 # Autoregressive prediction
@@ -859,11 +863,12 @@ class EnhancedMultiStepPredictor(nn.Module):
                 predictions = []
                 for _ in range(self.prediction_steps):
                     output, hidden = self.predictor(current, hidden)
-                    predictions.append(output)
-                    current = (
+                    projected = (
                         self.gru_output_proj(output)
                         if self.gru_output_proj is not None else output
                     )
+                    predictions.append(projected)
+                    current = projected
                 pred_mean = torch.cat(predictions, dim=1)
                 pred_std = None
             
@@ -922,21 +927,23 @@ class EnhancedMultiStepPredictor(nn.Module):
             pred, _ = self.predictor(context, self.prediction_steps)
         else:
             # GRU: autoregressive rollout from last context step.
-            # Use self.gru_output_proj to project GRU hidden output (hidden_dim)
-            # back to input_dim before using it as the next-step input.
-            # Without this projection, step 2+ would receive hidden_dim features
-            # when the GRU expects input_dim → RuntimeError on the second step.
+            # The projected tensor is used BOTH for accumulation and feedback:
+            # - accumulation: propagator / prediction loss expect input_dim (not hidden_dim)
+            # - feedback:     GRU input_size = input_dim (not hidden_dim)
+            # Round 3 fixed the feedback path but left accumulation using raw hidden_dim
+            # output, causing crashes downstream (upsamplers / propagator / fusion).
             _, hidden = self.predictor(context)
             current = context[:, -1:, :]
             preds = []
             for _ in range(self.prediction_steps):
                 output, hidden = self.predictor(current, hidden)
-                preds.append(output)
-                current = (
+                projected = (
                     self.gru_output_proj(output)
                     if self.gru_output_proj is not None else output
                 )
-            pred = torch.cat(preds, dim=1)  # [batch, prediction_steps, H]
+                preds.append(projected)
+                current = projected
+            pred = torch.cat(preds, dim=1)  # [batch, prediction_steps, input_dim]
 
         return pred
 
