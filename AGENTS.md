@@ -514,6 +514,69 @@ pred_latents = predictor.predict_next(h_ctx[nt])  # 真正因果预测
 
 ---
 
+### [2026-02-27] 预测功能第二轮审查：归一化层选型盲区 + 配置误导
+
+**背景**：对预测系统进行独立第二轮审查，假设所有地方都可能有问题。
+
+---
+
+**盲区 1 — BatchNorm1d 在 prediction_steps_scaled=1 时静默归零粗尺度（P0 静默失效）**
+
+**思维误区**：以为"前一轮修复了整数除法 → 预测步数不再为零 → 一切正常"，
+没有追问"steps=1 时，归一化层是否还有问题"。
+
+**根因**：上一轮修复将 `future_steps_scaled = max(1, future_steps // scale_factor)` 后，
+预测步数不再为零。但上采样器中的 `BatchNorm1d(input_dim)` 接收形状 `[batch=1, input_dim=128, time=1]`：
+- 每通道仅有 N×L = 1×1 = **1 个样本**
+- var = 0 → normalized = (x − x) / sqrt(eps) = **0**
+- output = gamma × 0 + beta = **0**（BatchNorm 初始化 gamma=1, beta=0）
+
+粗尺度和中等尺度的上采样输出全为零，Fusion 输入 `cat([zeros, zeros, valid_fine])`，
+层级预测**静默退化为单尺度**——在 NPI 风格（prediction_steps=1）这一最重要的科学配置下，
+多尺度层级架构完全失效，但不会有任何报错或警告。
+
+**修复**：`nn.BatchNorm1d(input_dim)` → `nn.GroupNorm(1, input_dim)`
+
+GroupNorm(num_groups=1, num_channels=C) 将所有 C 个通道作为一个组归一化，
+每个样本使用 C×L×N 个值计算统计量。对 `[1, 128, 1]`：128 个值 → 统计量有意义。
+
+归一化层比较（对 [batch=1, channels=128, time=1]）：
+| 层 | 每次统计的元素数 | 适用性 |
+|----|----|------|
+| BatchNorm1d(C) | N×L = 1×1 = 1 | 🔴 退化 |
+| InstanceNorm1d(C) | L = 1 | 🔴 退化 |
+| GroupNorm(C, C) = InstanceNorm | L = 1 | 🔴 退化 |
+| GroupNorm(1, C) | C×L×N = 128 | ✅ 正常 |
+
+**规则**：**在 batch_size=1 的图神经网络场景中，凡 L（时间/空间维度）可能为 1 的地方，
+必须选用不依赖 batch 维度和时间维度的归一化层（GroupNorm(1, C) 或 LayerNorm）。**
+
+---
+
+**盲区 2 — 配置注释声称"启用 NLL 损失"但实际从未执行**
+
+**思维误区**：以为"配置里写 use_uncertainty: true + NLL 损失"就代表 NLL 损失在工作。
+
+**根因**：
+1. `predict_next()` 硬编码 `return_uncertainty=False`
+2. `compute_loss()` → `predict_next()` → uncertainty_head 从不被调用
+3. `uncertainty_head` 参数存在于模型中但永远不会收到梯度
+4. `default.yaml` 注释"启用 NLL 损失"是**错误的描述**
+
+**后果**：
+- 用户相信已启用不确定性估计，实际上什么都没发生
+- 浪费 ~input_dim×1.5 个永不更新的参数
+- 如果用户依赖不确定性估计做临床决策，将产生虚假安全感
+
+**修复**：
+- 更正 `default.yaml` 注释，明确说明"当前版本为后处理工具，不参与训练损失"
+- 将默认值从 `true` 改为 `false`（诚实接口原则：默认配置只启用真正工作的功能）
+
+**规则**：**凡是"声明了但从未真正工作"的配置选项，默认值必须为 false，且注释必须如实描述实际状态。**
+（参见 AGENTS.md §三 [2026-02-21] "声明了但从未真正工作"的功能）
+
+---
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -530,11 +593,12 @@ pred_latents = predictor.predict_next(h_ctx[nt])  # 真正因果预测
 | 断点续训（--resume） | ✅ 已实现 | V5.30 |
 | 时序数据增强（noise + scale，可选） | ✅ 已实现（默认关闭） | V5.30 |
 | NPI 风格 context_length 可配置 | ✅ 已实现 | V5.31 |
-| HierarchicalPredictor NPI 兼容（prediction_steps=1） | ✅ 已修复 | V5.31 |
+| HierarchicalPredictor NPI 兼容（prediction_steps=1 整数除法） | ✅ 已修复 | V5.31 |
 | validate() 真因果 pred_R²（因果编码） | ✅ 已修复 | V5.31 |
+| HierarchicalPredictor 上采样器 BatchNorm1d→GroupNorm（静默归零修复） | ✅ 已修复 | V5.32 |
+| use_uncertainty 配置文档准确化（默认关闭） | ✅ 已修复 | V5.32 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
-| 时序数据增强（noise + scale，可选） | ✅ 已实现（默认关闭） | V5.30 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

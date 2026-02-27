@@ -235,14 +235,29 @@ class HierarchicalPredictor(nn.Module):
                     stride=scale_factor,
                     padding=scale_factor // 2,
                 ),
-                # BUG FIX: nn.LayerNorm(input_dim) here normalizes the LAST dimension.
-                # After ConvTranspose1d the tensor is [batch, input_dim, T_up] — the last
-                # dim is T_up (variable length), NOT input_dim.  LayerNorm would raise
-                # "normalized_shape (input_dim,) does not match input.shape[-1] = T_up"
-                # whenever T_up != input_dim.
-                # BatchNorm1d(input_dim) operates on [N, C, L] format correctly:
-                # it normalises each of the C=input_dim channels across batch×L.
-                nn.BatchNorm1d(input_dim),
+                # Normalisation after ConvTranspose1d must work for ANY (batch, time) size.
+                #
+                # Rejected options and why:
+                #   nn.LayerNorm(input_dim): normalises the LAST dim; after ConvTranspose1d
+                #     the tensor is [batch, input_dim, T_up] so the last dim is T_up, not
+                #     input_dim — raises shape mismatch when T_up != input_dim.
+                #   nn.BatchNorm1d(input_dim): normalises each of the C channels across
+                #     N × L.  With TwinBrain's batch_size=1 and the NPI case where
+                #     future_steps_scaled=1, input is [1, input_dim, 1] → N×L = 1 element
+                #     per channel → var = 0 → normalised output = 0 for ALL channels.
+                #     Coarse-scale prediction becomes a zero tensor → hierarchy silently
+                #     degrades to single-scale for the most scientifically relevant NPI
+                #     configuration (prediction_steps=1).
+                #   nn.InstanceNorm1d(input_dim): normalises per-sample per-channel across L.
+                #     With L=1: same var=0 problem as BatchNorm1d.
+                #
+                # Chosen: nn.GroupNorm(1, input_dim)
+                #   Groups the entire channel axis (all input_dim channels) into ONE group per
+                #   sample, then normalises across all C×L elements in that group.
+                #   For [1, input_dim=128, 1]: uses 128 elements → statistics are well-defined
+                #   regardless of batch size or time length.  Equivalent to LayerNorm over
+                #   the channel dim applied in (N, C, L) format.
+                nn.GroupNorm(1, input_dim),
                 nn.GELU(),
             )
             self.upsamplers.append(upsampler)

@@ -408,9 +408,22 @@ v5_optimization:
     # true：使用 Transformer（长程依赖）；false：使用 GRU（短程、更快）
     # 建议：序列长度 < 100 用 GRU（内存低），> 100 用 Transformer。
     use_transformer: true
-    # true：输出预测均值 + 方差（不确定性估计），启用 NLL 损失
-    # 不确定性信号可用于下游任务的置信度度量
-    use_uncertainty: true
+    # 不确定性估计头（预留接口，当前版本为后处理工具，不参与训练损失）
+    # ─────────────────────────────────────────────────────────────
+    # true：在预测头内注册一个 uncertainty_head（Linear → GELU → Linear），
+    #       可通过 predictor.predictor(context, return_uncertainty=True) 手动获取
+    #       对预测均值的对数方差估计（解释为置信区间大小的代理指标）。
+    #
+    # ⚠ 当前限制：uncertainty_head 不参与训练损失计算（NLL 损失**未**启用）。
+    #   predict_next() 始终以 return_uncertainty=False 调用，
+    #   因此 uncertainty_head 参数在训练中不接收梯度，其输出不保证有意义。
+    #   若需可靠的不确定性估计，应在完成充分训练后：
+    #   1. 手动调用: predictor.predictor(h_ctx, future_steps, return_uncertainty=True)
+    #   2. 解读输出 log_var 作为定性置信度参考（非定量校准）
+    #
+    # false（建议，默认）：不注册 uncertainty_head，节省 ~input_dim×1.5 个参数。
+    # 对大多数用户建议保持 false 直到明确需要不确定性量化。
+    use_uncertainty: false
     # 时间尺度数（Hierarchical 模式下的粗-中-细层数）
     # 建议：3（2^2, 2^1, 2^0 下采样因子，覆盖不同频率成分）。
     num_scales: 3
