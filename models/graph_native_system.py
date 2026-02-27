@@ -510,8 +510,7 @@ class GraphNativeBrainModel(nn.Module):
             # Validate range; out-of-range usually means a stale cache was loaded
             # after num_subjects changed — warn instead of silently remapping.
             if s_idx.item() < 0 or s_idx.item() >= self.num_subjects:
-                import logging as _log
-                _log.getLogger(__name__).warning(
+                logger.warning(
                     f"subject_idx={s_idx.item()} out of range [0, {self.num_subjects-1}]. "
                     f"This likely means a cached graph was built with a different "
                     f"num_subjects.  Clearing the graph cache and re-running will fix this. "

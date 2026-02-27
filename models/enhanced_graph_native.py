@@ -471,12 +471,12 @@ class EnhancedGraphNativeTrainer(GraphNativeTrainer):
             if self.use_amp:
                 self.scaler.scale(total_loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
                 self.optimizer.step()
 
             if self.use_adaptive_loss:
