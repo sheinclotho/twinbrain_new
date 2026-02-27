@@ -674,6 +674,66 @@ current = projected              # ← 反馈 128 维 ✓
 
 ---
 
+### [2026-02-27] 预测功能第五轮审查：avg_pool1d 崩溃前守卫 + pred_enc 初始化 + N守卫 + 训练状态污染
+
+**背景**：第五轮独立审查，重新审视每个函数，假设所有已修复项都可能仍有遗漏。
+
+---
+
+**盲区 1 — avg_pool1d 在返回前内部崩溃（P2 潜在崩溃）**
+
+**思维误区**：以为"检查 x_down.shape[1] == 0 就能保护空张量"——没有追问：**PyTorch 是在返回前还是返回后抛出异常？**
+
+**根因**：`F.avg_pool1d` 在计算出 `output_len ≤ 0` 时**直接在函数内部**抛出 "Output size is too small"，*在*返回之前。所以"在 avg_pool1d 调用之后检查结果"永远不会执行。触发条件：`_PRED_MIN_SEQ_LEN=4`、`_PRED_CONTEXT_RATIO=2/3` → T_ctx=2 < scale_factor=4。
+
+```python
+# 错误修复（Round 4 分析的方案）：
+x_down = F.avg_pool1d(...)   # ← 已经崩溃，走不到下面
+if x_down.shape[1] == 0:     # ← 永远不会执行
+    ...
+
+# 正确修复（Round 5）：
+if x.shape[1] < scale_factor:   # ← 在调用前检查
+    logger.debug(f"... zero prediction for this scale ...")
+    pred_up = torch.zeros(...)
+    scale_predictions.append(pred_up)
+    continue
+x_down = F.avg_pool1d(...)      # ← 安全
+```
+
+**规则**：**对所有可能抛出内部异常的函数（不仅仅是返回错误值），必须在调用前就验证前置条件，不能依赖检查返回值。**
+
+---
+
+**盲区 2 — validate() pred_enc 用原始信号初始化导致 decoder 维度崩溃（P2 潜在崩溃）**
+
+**根因**：
+```python
+pred_enc = data.clone()  # x shape = [N, T, C=1] — 原始信号！
+for nt, pred_lat in pred_latents.items():
+    pred_enc[nt].x = pred_lat  # 只覆盖了 pred_latents 中的 modality
+# 未被覆盖的 modality: pred_enc[nt].x = [N, T, 1]
+# decoder: Conv1d(in_channels=128) 收到 1 通道 → CRASH
+```
+触发条件：某个 modality 因 T < `_PRED_MIN_SEQ_LEN` 被跳过。
+
+**修复**：先从 `h_ctx_dict` 初始化（正确 H=128 维），再用 pred_latents 覆盖。
+未被预测的 modality 的 context latent 喂给 decoder 不影响 R² 评估（`pred_T_ctx.get(nt) is None` 在 Step 6 跳过它们）。
+
+---
+
+**盲区 3 — compute_loss() pred_loss 缺少 N 不匹配守卫（P3 不一致）**
+
+`recon_loss` 有 `if recon.shape[0] != target.shape[0]: raise RuntimeError(...)` 守卫；`pred_loss` 没有。**修复**：添加 `if pred_mean.shape[0] != future_target.shape[0]: logger.warning(...); continue`，与 recon_loss 保持一致的防御性编程。
+
+---
+
+**盲区 4 — UncertaintyAwarePredictor 强制 .train() 污染 eval 状态（P2）**
+
+MC dropout 路径中 `self.base_predictor.train()` 被无条件调用，在 validate() 的 `@torch.no_grad()` 上下文中也会执行，污染 BatchNorm running stats。**修复**：`was_training = self.base_predictor.training`，try/finally 恢复。
+
+---
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -697,6 +757,10 @@ current = projected              # ← 反馈 128 维 ✓
 | use_uncertainty Python 默认值同步 YAML（True→False） | ✅ 已修复 | V5.33 |
 | GRU 自回归滚动输出投影——反馈维度修复 | ✅ 已修复 | V5.33 |
 | GRU 自回归滚动输出投影——累积维度修复（对称完整） | ✅ 已修复 | V5.34 |
+| avg_pool1d 调用前守卫（短 context 崩溃修复） | ✅ 已修复 | V5.35 |
+| validate() pred_enc 从 h_ctx_dict 初始化（decoder 维度修复） | ✅ 已修复 | V5.35 |
+| pred_loss N 不匹配守卫（防御性一致性） | ✅ 已修复 | V5.35 |
+| UncertaintyAwarePredictor MC dropout eval 状态恢复 | ✅ 已修复 | V5.35 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

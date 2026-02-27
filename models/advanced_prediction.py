@@ -322,6 +322,31 @@ class HierarchicalPredictor(nn.Module):
 
             # Downsample context
             if scale_factor > 1:
+                # Guard: avg_pool1d requires context_len >= scale_factor to
+                # produce at least 1 output step.  output_len formula:
+                #   floor((L - kernel) / stride) + 1
+                # When L < kernel: output_len ≤ 0 → PyTorch raises "Output size
+                # is too small" *inside* avg_pool1d (before we could check the
+                # result shape).  This is triggered by the combination:
+                #   _PRED_MIN_SEQ_LEN=4, _PRED_CONTEXT_RATIO=2/3
+                #   → T_ctx = int(4 * 2/3) = 2 < scale_factor=4
+                # Fix: check BEFORE calling avg_pool1d.  When the context is
+                # too short for this scale, substitute a zero prediction so the
+                # fusion layer always receives a full [B, future_steps, input_dim]
+                # tensor.  The fusion layer learns to down-weight zero-filled
+                # scales (they carry no signal) without disrupting training.
+                if x.shape[1] < scale_factor:
+                    logger.debug(
+                        f"HierarchicalPredictor scale {i} (factor={scale_factor}): "
+                        f"context length {x.shape[1]} < scale_factor → using zero "
+                        f"prediction for this scale (fusion will learn to down-weight it)."
+                    )
+                    pred_up = torch.zeros(
+                        x.shape[0], future_steps, self.input_dim, device=x.device
+                    )
+                    scale_predictions.append(pred_up)
+                    continue
+
                 # Average pooling to downsample
                 x_down = F.avg_pool1d(
                     x.transpose(1, 2),
@@ -330,7 +355,7 @@ class HierarchicalPredictor(nn.Module):
                 ).transpose(1, 2)
             else:
                 x_down = x
-            
+
             # Predict at this scale
             if isinstance(predictor, TransformerPredictor):
                 # For transformer, we need to extend sequence with future slots
@@ -651,15 +676,23 @@ class UncertaintyAwarePredictor(nn.Module):
                 return prediction, None
             
             # Multiple forward passes with dropout
-            self.base_predictor.train()  # Enable dropout
-            
-            predictions = []
-            for _ in range(self.num_mc_samples):
-                if isinstance(self.base_predictor, HierarchicalPredictor):
-                    pred, _ = self.base_predictor(x, future_steps)
-                else:
-                    pred = self.base_predictor(x)
-                predictions.append(pred)
+            # Save training state so we don't corrupt eval mode when this is
+            # called during validation.  .train() enables Dropout and switches
+            # BatchNorm to use mini-batch statistics; if we leave the module in
+            # training mode after the MC samples the subsequent eval-mode forward
+            # passes in validate() will use wrong normalisation statistics.
+            was_training = self.base_predictor.training
+            self.base_predictor.train()  # Enable dropout for MC sampling
+            try:
+                predictions = []
+                for _ in range(self.num_mc_samples):
+                    if isinstance(self.base_predictor, HierarchicalPredictor):
+                        pred, _ = self.base_predictor(x, future_steps)
+                    else:
+                        pred = self.base_predictor(x)
+                    predictions.append(pred)
+            finally:
+                self.base_predictor.train(was_training)  # restore original state
             
             # Compute mean and std
             predictions = torch.stack(predictions, dim=0)  # [num_samples, batch, time, dim]

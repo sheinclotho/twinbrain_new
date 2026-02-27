@@ -672,6 +672,17 @@ class GraphNativeBrainModel(nn.Module):
             # Prediction loss: propagated prediction vs. actual future.
             for node_type, pred_mean in pred_means.items():
                 future_target = future_targets[node_type]
+                # Guard N-mismatch (same defensive contract as recon_loss):
+                # propagator is expected to preserve N, but raise explicitly if
+                # not rather than silently broadcasting or producing wrong gradients.
+                if pred_mean.shape[0] != future_target.shape[0]:
+                    logger.warning(
+                        f"pred_loss skipped for '{node_type}': "
+                        f"pred has {pred_mean.shape[0]} nodes but target has "
+                        f"{future_target.shape[0]}.  This may indicate a bug in "
+                        f"GraphPredictionPropagator."
+                    )
+                    continue
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
                 if aligned_steps > 0:
                     if self.loss_type == 'huber':
@@ -1441,9 +1452,28 @@ class GraphNativeTrainer:
 
                     if pred_latents:
                         # ── Step 5: Decode latent predictions to signal space ─
+                        # Seed pred_enc from h_ctx_dict (encoded context latents,
+                        # shape [N, T_ctx, H=hidden_channels]) rather than raw data
+                        # (shape [N, T, C=1]).  The decoder's first Conv1d expects
+                        # in_channels=hidden_channels, so starting from the raw data
+                        # would crash for any modality not overridden by pred_latents
+                        # (e.g. modalities skipped because T < _PRED_MIN_SEQ_LEN).
+                        # Starting from h_ctx_dict ensures every modality has the
+                        # correct feature dimension regardless of whether it was
+                        # predicted; the pred_T_ctx guard in Step 6 prevents those
+                        # modalities from contributing to the pred_R² metric.
+                        #
+                        # Tensor aliasing: data.clone() performs a deep copy of all
+                        # node/edge tensors (PyG HeteroData.clone() calls .clone() on
+                        # each stored tensor).  The subsequent .x assignments create
+                        # new references in pred_enc only; data is not modified.
+                        # This validate() function runs under @torch.no_grad() so
+                        # there are no gradient graphs that could be affected.
                         pred_enc = data.clone()
+                        for nt, h_ctx in h_ctx_dict.items():
+                            pred_enc[nt].x = h_ctx   # [N, T_ctx, H] — correct H for decoder
                         for nt, pred_lat in pred_latents.items():
-                            pred_enc[nt].x = pred_lat
+                            pred_enc[nt].x = pred_lat  # override with predicted latent
                         pred_signals = self.model.decoder(pred_enc)  # {nt: [N, pred_steps', C]}
 
                         for node_type, pred_sig in pred_signals.items():
