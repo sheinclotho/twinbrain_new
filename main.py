@@ -1194,12 +1194,25 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     # 训练循环
     best_val_loss = float('inf')
     best_epoch = 0
+    best_r2_dict: dict = {}   # R² at best-val-loss epoch, used in credibility summary
     patience_counter = 0
     no_improvement_warning_shown = False
     epoch_times = []
     output_dir = Path(config['output']['output_dir'])
     best_checkpoint_path = output_dir / "best_model.pt"
-    
+
+    # ── 早停配置说明 ──────────────────────────────────────────────────────
+    # patience_counter 以"验证次数"为单位递增（非 epoch 数），
+    # 因此实际等效 epoch 耐心值 = early_stopping_patience × val_frequency。
+    _val_freq = config['training']['val_frequency']
+    _early_patience = config['training']['early_stopping_patience']
+    _effective_epoch_patience = _val_freq * _early_patience
+    logger.info(
+        f"早停设置: 每 {_val_freq} epoch 验证一次 | "
+        f"连续 {_early_patience} 次验证无改善触发早停 | "
+        f"等效 {_effective_epoch_patience} epoch 的实际耐心值"
+    )
+
     for epoch in range(1, config['training']['num_epochs'] + 1):
         epoch_start_time = time.time()
         
@@ -1253,6 +1266,27 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
                 f"{r2_str}, "
                 f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
+
+            # ── R² < 0 警报：模型差于均值基线时明确告警 ─────────────────
+            # R² < 0 表示模型重建误差 > 信号总方差，即比"永远预测均值"还差。
+            # 这是模型科学失效的明确信号，非专业用户无法从裸数字判断。
+            for _r2k, _r2v in r2_dict.items():
+                if _r2v < 0.0:
+                    logger.warning(
+                        f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型重建效果差于均值基线预测，"
+                        "当前模型尚未从数据中学到有效信号。"
+                        " 请检查数据质量、atlas 加载、或降低学习率后重试。"
+                    )
+
+            # ── 过拟合检测：训练/验证损失比超阈值时警告 ─────────────────
+            if train_loss > 0 and val_loss > 0:
+                _overfit_ratio = val_loss / train_loss
+                if _overfit_ratio > 3.0:
+                    logger.warning(
+                        f"  ⚠️ 过拟合风险: val_loss/train_loss={_overfit_ratio:.1f}× > 3.0"
+                        "，训练损失远低于验证损失。"
+                        " 建议: 增大 weight_decay、减少 num_encoder_layers 或增加训练数据。"
+                    )
             
             # Warn if no improvement after many epochs
             if epoch >= 50 and best_val_loss == float('inf') and not no_improvement_warning_shown:
@@ -1264,20 +1298,25 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
                 improvement = (best_val_loss - val_loss) / best_val_loss * 100 if best_val_loss != float('inf') else 100
                 best_val_loss = val_loss
                 best_epoch = epoch
+                best_r2_dict = r2_dict.copy()   # 同步记录该 epoch 的 R²
                 patience_counter = 0
                 
                 # 保存检查点
                 trainer.save_checkpoint(best_checkpoint_path, epoch)
+                _r2_at_best = "  ".join(f"{k}={v:.3f}" for k, v in sorted(best_r2_dict.items()))
                 if improvement != 100:
-                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f} (提升 {improvement:.1f}%)")
+                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f}, {_r2_at_best} (提升 {improvement:.1f}%)")
                 else:
-                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f}")
+                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f}, {_r2_at_best}")
             else:
                 patience_counter += 1
             
             # 早停
             if patience_counter >= config['training']['early_stopping_patience']:
-                logger.info(f"⏹️ 早停触发: {patience_counter} 个epoch无改进")
+                logger.info(
+                    f"⏹️ 早停触发: 连续 {patience_counter} 次验证"
+                    f" (约 {patience_counter * _val_freq} epoch) 无改进"
+                )
                 break
         else:
             logger.info(
@@ -1293,6 +1332,43 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     logger.info("训练完成!")
     logger.info(f"最佳验证损失: {best_val_loss:.4f}")
 
+    # ── 训练可信度摘要 ─────────────────────────────────────────────────────
+    # 向非专业用户提供一次性、人类可读的科学可信度评估：
+    # 1. 最佳模型的 R² 指标及其含义
+    # 2. 是否存在过拟合风险
+    # 3. 结论：模型是否可信用于后续分析
+    _sep = "=" * 60
+    logger.info(_sep)
+    logger.info("📊 训练可信度摘要 (Training Credibility Summary)")
+    logger.info(_sep)
+    logger.info(f"  最佳模型: Epoch {best_epoch}, val_loss={best_val_loss:.4f}")
+    if best_r2_dict:
+        _all_trustworthy = True
+        for _r2k, _r2v in sorted(best_r2_dict.items()):
+            if _r2v >= 0.3:
+                _sym, _rating = "✅", "良好重建能力 (R² ≥ 0.3，达到神经影像研究可用标准)"
+            elif 0.1 <= _r2v < 0.3:
+                _sym, _rating = "⚠️", "有限重建能力 (0.1 ≤ R² < 0.3，建议增加数据量或调整模型)"
+                _all_trustworthy = False
+            elif 0.0 <= _r2v < 0.1:
+                _sym, _rating = "⚠️", "极弱重建能力 (0 ≤ R² < 0.1，模型几乎未学到有效信号)"
+                _all_trustworthy = False
+            else:
+                _sym, _rating = "⛔", "模型不可信：差于均值基线 (R² < 0，请检查数据或重新训练)"
+                _all_trustworthy = False
+            logger.info(f"  {_sym} {_r2k}={_r2v:.3f} — {_rating}")
+        if _all_trustworthy:
+            logger.info("  ✅ 结论：最佳模型在所有模态上达到可信重建水平 (R² ≥ 0.3)")
+        else:
+            logger.warning(
+                "  ⚠️ 结论：部分或全部模态的 R² 低于可信阈值 (R² < 0.3)。"
+                " 当前最佳模型的重建能力有限，建议检查数据质量、atlas 配置"
+                " 或增加训练数据后重训。"
+            )
+    else:
+        logger.warning("  R² 未计算（训练中从未执行验证，请检查 val_frequency 配置）")
+    logger.info(_sep)
+
     # ── 恢复最佳模型（Optimization 4）────────────────────────────────────
     # 训练结束（含早停）后，trainer.model 处于最后一个 epoch 的状态。
     # 自动加载 best_model.pt，确保后续推理/评估使用验证集最优权重，
@@ -1301,9 +1377,10 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     if best_checkpoint_path.exists() and best_val_loss < float('inf'):
         try:
             trainer.load_checkpoint(best_checkpoint_path)
+            _r2_loaded = "  ".join(f"{k}={v:.3f}" for k, v in sorted(best_r2_dict.items())) if best_r2_dict else "N/A"
             logger.info(
                 f"✅ 已自动恢复最佳模型 "
-                f"(epoch={best_epoch}, val_loss={best_val_loss:.4f})"
+                f"(epoch={best_epoch}, val_loss={best_val_loss:.4f}, {_r2_loaded})"
             )
         except Exception as _e:
             logger.warning(
