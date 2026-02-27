@@ -407,6 +407,103 @@ class ConsciousnessVisualizer:
         self._save_or_show(save_as or 'predictive_coding_hierarchy.png')
 
 
+def plot_training_curves(
+    history: Dict[str, list],
+    output_dir,
+    best_epoch: Optional[int] = None,
+    best_r2_dict: Optional[Dict[str, float]] = None,
+) -> None:
+    """Save training-loss and R² curves after training completes.
+
+    Generates two PNG files in ``output_dir``:
+    - ``training_loss_curve.png``: train_loss + val_loss vs epoch
+    - ``training_r2_curve.png``: val R² per modality vs validation index
+      (only when R² history is present in ``history``)
+
+    Gracefully skips if matplotlib is unavailable or if ``history`` is empty.
+
+    Args:
+        history: Trainer history dict with keys such as 'train_loss',
+            'val_loss', and optionally 'val_r2_eeg', 'val_r2_fmri', etc.
+        output_dir: Directory (str or Path) where PNGs are saved.
+        best_epoch: Epoch index (1-based) of the best model, for annotation.
+        best_r2_dict: R² values at the best epoch, for annotation.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')   # non-interactive backend; safe on headless servers
+        import matplotlib.pyplot as _plt
+    except ImportError:
+        return  # matplotlib unavailable — skip silently
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_loss = history.get('train_loss', [])
+    val_loss   = history.get('val_loss',   [])
+
+    # ── Loss curve ─────────────────────────────────────────────────────────
+    if train_loss or val_loss:
+        fig, ax = _plt.subplots(figsize=(8, 4))
+        if train_loss:
+            ax.plot(range(1, len(train_loss) + 1), train_loss, label='Train Loss',
+                    color='steelblue', linewidth=1.5)
+        if val_loss:
+            # val_loss is recorded only at validation epochs; x-coordinates are
+            # inferred from val_frequency but we don't have it here, so use
+            # sequential indices and label the axis accordingly.
+            ax.plot(range(1, len(val_loss) + 1), val_loss, label='Val Loss',
+                    color='tomato', linewidth=1.5, marker='o', markersize=3)
+            # Annotate best validation point
+            best_val_idx = int(min(range(len(val_loss)), key=lambda i: val_loss[i]))
+            ax.annotate(
+                f'best\n{val_loss[best_val_idx]:.4f}',
+                xy=(best_val_idx + 1, val_loss[best_val_idx]),
+                xytext=(best_val_idx + 1 + max(1, len(val_loss) // 20), val_loss[best_val_idx]),
+                fontsize=7,
+                arrowprops=dict(arrowstyle='->', color='gray', lw=1),
+                color='gray',
+            )
+        ax.set_xlabel('Epoch / Validation Index')
+        ax.set_ylabel('Loss')
+        ax.set_title('TwinBrain V5 — Training Loss Curve')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        loss_path = output_dir / 'training_loss_curve.png'
+        fig.savefig(loss_path, dpi=120, bbox_inches='tight')
+        _plt.close(fig)
+
+    # ── R² curve ───────────────────────────────────────────────────────────
+    # Collect all val_r2_* keys present in history
+    r2_keys = sorted(k for k in history if k.startswith('val_r2_') and history[k])
+    if r2_keys:
+        fig, ax = _plt.subplots(figsize=(8, 4))
+        colors = ['steelblue', 'tomato', 'forestgreen', 'darkorange', 'purple']
+        for idx, key in enumerate(r2_keys):
+            vals = history[key]
+            label = key.replace('val_r2_', 'R² ')
+            ax.plot(range(1, len(vals) + 1), vals,
+                    label=label, color=colors[idx % len(colors)],
+                    linewidth=1.5, marker='o', markersize=3)
+        # Reference lines
+        ax.axhline(0.3, color='green',  linestyle='--', linewidth=0.8, alpha=0.6, label='R²=0.3 (good)')
+        ax.axhline(0.0, color='orange', linestyle='--', linewidth=0.8, alpha=0.6, label='R²=0 (baseline)')
+        ax.set_xlabel('Validation Index')
+        ax.set_ylabel('R² (coefficient of determination)')
+        ax.set_title('TwinBrain V5 — Validation R² Curve')
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        # Annotate best R² values if provided
+        if best_r2_dict:
+            note = '  '.join(f'{k}={v:.3f}' for k, v in sorted(best_r2_dict.items()))
+            ax.set_xlabel(f'Validation Index\n[Best model: {note}]', fontsize=8)
+        fig.tight_layout()
+        r2_path = output_dir / 'training_r2_curve.png'
+        fig.savefig(r2_path, dpi=120, bbox_inches='tight')
+        _plt.close(fig)
+
+
 def create_sample_visualizations(output_dir: str = 'visualization_examples'):
     """
     Create sample visualizations with dummy data.

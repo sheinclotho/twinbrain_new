@@ -26,6 +26,13 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _row_zscore(mat: torch.Tensor) -> torch.Tensor:
+    """Row-wise z-score normalisation.  Returns (mat - row_mean) / (row_std + eps)."""
+    mu  = mat.mean(dim=1, keepdim=True)
+    std = mat.std(dim=1, keepdim=True) + 1e-8
+    return (mat - mu) / std
+
+
 class GraphNativeBrainMapper:
     """
     Unified brain data mapper that maintains graph structure.
@@ -570,27 +577,42 @@ class GraphNativeBrainMapper:
         self,
         merged_data: HeteroData,
         connection_ratio: float = 0.1,
+        k_cross_modal: int = 5,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Create simple cross-modal edges for merged heterograph using random connections.
+        Create cross-modal edges for merged heterograph.
 
-        Returns both edge_index AND uniform edge_attr (weight=1.0) so that
-        cross-modal messages are treated consistently with intra-modal edges
-        (which carry correlation-based edge_attr from build_graph_structure).
-        Without edge_attr the SpatialTemporalGraphConv.message() skips the
-        weighting step entirely, silently treating all cross-modal connections
-        as equally important regardless of spatial proximity.
+        **Correlation-based (preferred)**: When both modalities have temporal
+        features, compute the EEG-fMRI temporal correlation matrix
+        [N_eeg, N_fmri] and keep the top-``k_cross_modal`` most-correlated
+        fMRI ROIs for each EEG channel.  Edge weights = |Pearson r|.
 
-        This is a simplified helper that creates random connections when no
-        explicit mapping is available. For distance-based connections with
-        anatomically meaningful weights, use create_cross_modal_edges() instead.
+        Neuroscientific motivation: Neurovascular coupling (NVC) means that
+        local field potentials / high-frequency EEG power are linearly correlated
+        with the BOLD signal in the overlying cortical area (Logothetis 2001;
+        Laufs 2008).  Using temporal correlation as edge weight lets the
+        model allocate more cross-modal message-passing capacity to EEG
+        channels that genuinely drive the BOLD response in each ROI.
+
+        **Fallback (random)**: Used when T_eeg ≠ T_fmri and temporal
+        interpolation is not appropriate (e.g. the modalities come from
+        different recording sessions), or when node features are unavailable.
+        In this case ``connection_ratio`` controls sparsity and weights are
+        uniform (1.0), preserving backward-compatible behaviour.
+
+        Returns both edge_index AND edge_attr so that cross-modal messages
+        are treated consistently with intra-modal edges (which carry
+        correlation-based edge_attr from build_graph_structure).
 
         Args:
-            merged_data: HeteroData with 'eeg' and 'fmri' nodes
-            connection_ratio: Fraction of possible edges to create
+            merged_data: HeteroData with 'eeg' and 'fmri' nodes.
+            connection_ratio: Fraction of possible edges for random fallback.
+            k_cross_modal: Top-k fMRI ROIs per EEG channel for correlation-based
+                edges.  Default 5 gives ≈5×N_eeg edges — comparable in density
+                to the intra-modal k-nearest graphs.
 
         Returns:
-            (edge_index [2, E], edge_attr [E, 1]) or None if modalities not present
+            (edge_index [2, E], edge_attr [E, 1]) or None if modalities absent.
         """
         if 'eeg' not in merged_data.node_types or 'fmri' not in merged_data.node_types:
             return None
@@ -615,24 +637,83 @@ class GraphNativeBrainMapper:
         # Use helper method to determine device
         target_device = self._get_graph_device(merged_data)
 
-        # Create random connections (can be improved with anatomical mapping)
+        # ── Attempt correlation-based cross-modal edges ─────────────────────
+        # Neurovascular coupling: EEG channels with high temporal correlation to
+        # a fMRI ROI's BOLD signal should receive stronger cross-modal messages.
+        # Strategy:
+        #   1. Extract EEG [N_eeg, T_eeg] and fMRI [N_fmri, T_fmri] timeseries.
+        #   2. Down-sample the higher-rate modality to the other's time grid via
+        #      adaptive average pooling (causal, no look-ahead).
+        #   3. Compute [N_eeg, N_fmri] absolute Pearson correlation matrix on GPU.
+        #   4. Top-k per EEG channel → sparse edge_index with |r| as edge_attr.
+        # If anything fails, fall through to the random-connection fallback.
+        try:
+            eeg_x = merged_data['eeg'].x   # [N_eeg,  T_eeg,  1]
+            fmri_x = merged_data['fmri'].x  # [N_fmri, T_fmri, 1]
+
+            if eeg_x is not None and fmri_x is not None:
+                T_eeg  = eeg_x.shape[1]
+                T_fmri = fmri_x.shape[1]
+
+                # Squeeze channel dim and move to GPU for matrix multiplication
+                eeg_ts  = eeg_x.squeeze(-1).to(target_device, dtype=torch.float32)   # [N_eeg,  T_eeg]
+                fmri_ts = fmri_x.squeeze(-1).to(target_device, dtype=torch.float32)  # [N_fmri, T_fmri]
+
+                # ── Temporal alignment ──────────────────────────────────────
+                # Adaptive average pooling down-samples whichever modality has
+                # more time-points.  This is equivalent to computing the mean
+                # within each non-overlapping window — a faithful low-pass
+                # summary at the coarser modality's time-scale.
+                T_target = min(T_eeg, T_fmri)
+                if T_eeg != T_target:
+                    # EEG has more time-points: pool to fMRI rate
+                    eeg_ts = torch.nn.functional.adaptive_avg_pool1d(
+                        eeg_ts.unsqueeze(0), T_target
+                    ).squeeze(0)           # [N_eeg, T_target]
+                if T_fmri != T_target:
+                    # fMRI has more time-points: pool to EEG rate (unusual)
+                    fmri_ts = torch.nn.functional.adaptive_avg_pool1d(
+                        fmri_ts.unsqueeze(0), T_target
+                    ).squeeze(0)           # [N_fmri, T_target]
+
+                # ── Pearson correlation matrix [N_eeg, N_fmri] ─────────────
+                # Row-wise z-score so that corr[i,j] = <z_eeg_i, z_fmri_j> / T
+                eeg_z  = _row_zscore(eeg_ts)   # [N_eeg, T]
+                fmri_z = _row_zscore(fmri_ts)  # [N_fmri, T]
+
+                corr = torch.mm(eeg_z, fmri_z.T) / T_target  # [N_eeg, N_fmri]
+                corr = torch.abs(corr)  # unsigned connectivity (same as intra-modal)
+
+                # ── Top-k per EEG channel ───────────────────────────────────
+                k = min(k_cross_modal, N_fmri)
+                topk_vals, topk_idx = torch.topk(corr, k, dim=1)  # [N_eeg, k]
+
+                # Build edge_index [2, N_eeg*k]
+                src = torch.arange(N_eeg, device=target_device).unsqueeze(1).expand(-1, k).reshape(-1)
+                dst = topk_idx.reshape(-1)
+                edge_index = torch.stack([src, dst], dim=0)      # [2, N_eeg*k]
+                edge_attr  = topk_vals.reshape(-1, 1).clamp(0.0, 1.0)  # [N_eeg*k, 1]
+
+                logger.info(
+                    f"Created {edge_index.shape[1]} correlation-based cross-modal edges "
+                    f"(top-{k} per EEG channel, mean |r|={edge_attr.mean().item():.3f})"
+                )
+                return edge_index, edge_attr
+
+        except Exception as _exc:
+            logger.warning(
+                f"Correlation-based cross-modal edges failed ({_exc}); "
+                f"falling back to random connections."
+            )
+
+        # ── Fallback: random connections ───────────────────────────────────
+        # Used when temporal alignment is infeasible or node features are absent.
         num_edges = max(1, int(N_eeg * N_fmri * connection_ratio))
-
-        # Random pairs - use target device to match existing graph
-        eeg_indices = torch.randint(0, N_eeg, (num_edges,), device=target_device)
+        eeg_indices  = torch.randint(0, N_eeg,  (num_edges,), device=target_device)
         fmri_indices = torch.randint(0, N_fmri, (num_edges,), device=target_device)
-
         edge_index = torch.stack([eeg_indices, fmri_indices], dim=0)
-
-        # Uniform edge weights (1.0): consistent with the fill_value=1.0 used by
-        # add_self_loops() in build_graph_structure.  The encoder's message() fn
-        # multiplies messages by edge_attr when present; providing uniform weights
-        # keeps cross-modal messages on the same scale as intra-modal messages and
-        # allows future upgrades (e.g. distance-based weights) to work transparently.
-        edge_attr = torch.ones(num_edges, 1, dtype=torch.float32, device=target_device)
-
+        edge_attr  = torch.ones(num_edges, 1, dtype=torch.float32, device=target_device)
         logger.info(f"Created {num_edges} random cross-modal edges (uniform weight=1.0)")
-
         return edge_index, edge_attr
 
     def add_dti_structural_edges(

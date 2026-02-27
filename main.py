@@ -38,6 +38,7 @@ from data.loaders import BrainDataLoader
 from models.graph_native_mapper import GraphNativeBrainMapper
 from models.graph_native_system import GraphNativeBrainModel, GraphNativeTrainer
 from utils.helpers import setup_logging, set_seed, save_config, create_output_dir
+from utils.visualization import plot_training_curves
 
 
 def truncate_timeseries(ts: np.ndarray, max_len: int) -> np.ndarray:
@@ -95,6 +96,9 @@ def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
         # EEG 连通性方法：'correlation' vs 'coherence' 产生不同 edge_index/edge_attr，
         # 切换方法必须使旧缓存失效，否则 coherence 模式会使用 correlation 权重的旧图。
         'eeg_connectivity_method': config['graph'].get('eeg_connectivity_method', 'correlation'),
+        # 注意：k_cross_modal 不纳入缓存键。
+        # 跨模态边在每次加载缓存时从节点特征动态重建（代价低，仅矩阵乘法），
+        # 因此修改 k_cross_modal 无需重建缓存。
     }
     params_hash = hashlib.md5(
         json.dumps(relevant, sort_keys=True).encode()
@@ -527,14 +531,27 @@ def build_graphs(config: dict, logger: logging.Logger):
         # 计算一次缓存 key，供本次迭代的"读"和"写"共用，避免重复计算。
         cache_key = _graph_cache_key(subject_id, task, config) if cache_dir is not None else None
 
-        # ── 尝试从缓存加载 ──────────────────────────────────────
-        # 缓存命中时直接加载 .pt 文件，完全跳过 EEG/fMRI 原始数据的读取与预处理。
-        # 这是「缓存感知加载」的核心：原始数据仅在缓存缺失时才会被读取。
         if cache_dir is not None and cache_key is not None:
             cache_path = cache_dir / cache_key
             if cache_path.exists():
                 try:
                     full_graph = torch.load(cache_path, map_location='cpu', weights_only=False)
+                    # ── 跨模态边：在每次加载时从节点特征重新计算 ────────────
+                    # 设计原则：跨模态边不是"原始数据衍生物"（需要原始EEG/fMRI），
+                    # 而是节点特征的函数（仅需图内的 x 张量，代价 O(N_eeg×N_fmri×T)）。
+                    # 将其存入缓存会带来两个问题：
+                    #   1. k_cross_modal 变化时旧缓存失效，需要访问原始数据重建；
+                    #   2. 用户调整跨模态连接策略后，看不到任何效果（仍用旧边）。
+                    # 每次加载时重建可以保证：无论缓存来自哪个版本，
+                    # 跨模态边始终由当前配置（k_cross_modal, eeg_connectivity_method）决定。
+                    if 'fmri' in full_graph.node_types and 'eeg' in full_graph.node_types:
+                        _cross = mapper.create_simple_cross_modal_edges(
+                            full_graph,
+                            k_cross_modal=config['graph'].get('k_cross_modal', 5),
+                        )
+                        if _cross is not None:
+                            full_graph['eeg', 'projects_to', 'fmri'].edge_index = _cross[0]
+                            full_graph['eeg', 'projects_to', 'fmri'].edge_attr = _cross[1]
                     # 被试索引（AGENTS.md §九 Gap 2）：
                     # 缓存图可能由 V5.18 或更早版本保存，不含 subject_idx。
                     # 使用当前运行时的 subject_to_idx 补写，保证嵌入对缓存图同样生效。
@@ -561,7 +578,9 @@ def build_graphs(config: dict, logger: logging.Logger):
                     n_cached += 1
                     run_idx_counter += 1
                     logger.debug(
-                        f"从缓存加载图: {cache_key}"
+                        f"从缓存加载图: {cache_key} "
+                        f"[节点类型: {list(full_graph.node_types)}, "
+                        f"边类型: {[str(et) for et in full_graph.edge_types]}]"
                         + (f" → {len(win_samples)} 个窗口" if windowed else "")
                     )
                     continue
@@ -730,7 +749,10 @@ def build_graphs(config: dict, logger: logging.Logger):
                 # create_simple_cross_modal_edges 返回 (edge_index, edge_attr)，
                 # 其中 edge_attr 为均匀权重（1.0），保持与同模态边一致的加权语义。
                 if 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
-                    cross_result = mapper.create_simple_cross_modal_edges(built_graph)
+                    cross_result = mapper.create_simple_cross_modal_edges(
+                        built_graph,
+                        k_cross_modal=config['graph'].get('k_cross_modal', 5),
+                    )
                     if cross_result is not None:
                         cross_edges, cross_weights = cross_result
                         built_graph['eeg', 'projects_to', 'fmri'].edge_index = cross_edges
@@ -775,11 +797,36 @@ def build_graphs(config: dict, logger: logging.Logger):
             built_graph.subject_id_str = subject_id
 
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
+            # 缓存内容：
+            #   - eeg 节点：x [N_eeg, T, 1]、num_nodes、pos、sampling_rate
+            #   - fmri 节点：x [N_fmri, T, 1]、num_nodes、pos、sampling_rate
+            #   - ('eeg','connects','eeg') 同模态边（来自 EEG 连通性估计）
+            #   - ('fmri','connects','fmri') 同模态边（来自 fMRI 连通性估计）
+            #   ⚠ 跨模态边 ('eeg','projects_to','fmri') 不持久化：
+            #     每次加载时从节点特征动态重建，使 k_cross_modal 修改立即生效
+            #     而无需清空缓存或访问原始数据。
             if cache_dir is not None and cache_key is not None:
                 try:
                     cache_path = cache_dir / cache_key
-                    torch.save(built_graph, cache_path)
-                    logger.debug(f"图已缓存: {cache_key}")
+                    # 构建只含同模态数据的缓存图（跨模态边在加载时重建）
+                    _cache_graph = HeteroData()
+                    for _nt in built_graph.node_types:
+                        _cache_graph[_nt].x = built_graph[_nt].x
+                        for _attr in ('num_nodes', 'pos', 'sampling_rate', 'labels'):
+                            if hasattr(built_graph[_nt], _attr):
+                                setattr(_cache_graph[_nt], _attr, getattr(built_graph[_nt], _attr))
+                    for _et in built_graph.edge_types:
+                        if _et == ('eeg', 'projects_to', 'fmri'):
+                            continue  # 跨模态边：不缓存，每次加载时重建
+                        _cache_graph[_et].edge_index = built_graph[_et].edge_index
+                        if hasattr(built_graph[_et], 'edge_attr'):
+                            _cache_graph[_et].edge_attr = built_graph[_et].edge_attr
+                    torch.save(_cache_graph, cache_path)
+                    logger.debug(
+                        f"图已缓存: {cache_key} "
+                        f"[节点类型: {list(_cache_graph.node_types)}, "
+                        f"同模态边类型: {[str(et) for et in _cache_graph.edge_types]}]"
+                    )
                 except Exception as e:
                     logger.warning(f"缓存保存失败 ({subject_id}/{task}): {e}")
 
@@ -1098,7 +1145,8 @@ def log_training_summary(
     logger.info(sep)
 
 
-def train_model(model, graphs, config: dict, logger: logging.Logger):
+def train_model(model, graphs, config: dict, logger: logging.Logger,
+                resume_checkpoint: Optional[str] = None):
     """训练模型"""
     logger.info("=" * 60)
     logger.info("步骤 4/4: 训练模型")
@@ -1185,8 +1233,37 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         optimization_config=config.get('v5_optimization'),
         max_grad_norm=config['training'].get('max_grad_norm', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+        augmentation_config=config['training'].get('augmentation'),
     )
     logger.info("✅ 训练器初始化完成")
+
+    # ── 断点续训（--resume）─────────────────────────────────────────────────
+    # 若提供了检查点路径，加载已保存的 model/optimizer/scheduler/loss_balancer 状态，
+    # 并从 checkpoint_epoch + 1 继续训练，而非从 epoch 1 重头开始。
+    _start_epoch = 1
+    if resume_checkpoint is not None:
+        resume_path = Path(resume_checkpoint)
+        if resume_path.exists():
+            try:
+                saved_epoch = trainer.load_checkpoint(resume_path)
+                # load_checkpoint returns the saved epoch number (int).
+                # Guard against None in case an old checkpoint had no 'epoch' key.
+                _start_epoch = (int(saved_epoch) + 1) if saved_epoch is not None else 1
+                logger.info(
+                    f"🔄 断点续训: 从 epoch {_start_epoch} 继续"
+                    f" (已加载检查点 {resume_path})"
+                )
+            except Exception as _re:
+                logger.warning(
+                    f"⚠️ 检查点加载失败 ({resume_path}): {_re}。"
+                    f" 将从 epoch 1 重新开始训练。"
+                )
+        else:
+            logger.warning(
+                f"⚠️ 检查点路径不存在: {resume_path}。"
+                f" 将从 epoch 1 重新开始训练。"
+            )
+
     logger.info("=" * 60)
     logger.info("开始训练循环")
     logger.info("=" * 60)
@@ -1213,7 +1290,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
         f"等效 {_effective_epoch_patience} epoch 的实际耐心值"
     )
 
-    for epoch in range(1, config['training']['num_epochs'] + 1):
+    for epoch in range(_start_epoch, config['training']['num_epochs'] + 1):
         epoch_start_time = time.time()
         
         # 训练
@@ -1368,6 +1445,23 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
     else:
         logger.warning("  R² 未计算（训练中从未执行验证，请检查 val_frequency 配置）")
     logger.info(_sep)
+
+    # ── 训练曲线可视化 ─────────────────────────────────────────────────────
+    # 训练结束后自动将 loss + R² 历史绘制为 PNG 图像，
+    # 保存到输出目录，方便非专业用户直观判断训练质量。
+    try:
+        plot_training_curves(
+            history=trainer.history,
+            output_dir=output_dir,
+            best_epoch=best_epoch,
+            best_r2_dict=best_r2_dict if best_r2_dict else None,
+        )
+        logger.info(
+            f"📈 训练曲线图已保存: "
+            f"training_loss_curve.png, training_r2_curve.png"
+        )
+    except Exception as _viz_err:
+        logger.debug(f"训练曲线绘制跳过: {_viz_err}")
 
     # ── 恢复最佳模型（Optimization 4）────────────────────────────────────
     # 训练结束（含早停）后，trainer.model 处于最后一个 epoch 的状态。
@@ -1544,6 +1638,14 @@ def main():
         default=42,
         help='随机种子 (default: 42)'
     )
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        metavar='CHECKPOINT',
+        help='从指定检查点文件恢复训练 (例如: outputs/twinbrain_v5_xxx/best_model.pt)。'
+             '加载后从保存的 epoch+1 继续，保留 model/optimizer/scheduler 状态。'
+    )
     args = parser.parse_args()
     
     # 加载配置
@@ -1576,6 +1678,8 @@ def main():
     logger.info(f"输出目录: {output_dir}")
     logger.info(f"设备: {config['device']['type']}")
     logger.info(f"随机种子: {args.seed}")
+    if args.resume:
+        logger.info(f"断点续训: {args.resume}")
     logger.info("=" * 60)
     
     try:
@@ -1602,7 +1706,7 @@ def main():
         log_training_summary(config, graphs, model, logger)
         
         # 步骤4: 训练
-        train_model(model, graphs, config, logger)
+        train_model(model, graphs, config, logger, resume_checkpoint=args.resume)
         
         logger.info("=" * 60)
         logger.info("✅ 所有任务完成!")
