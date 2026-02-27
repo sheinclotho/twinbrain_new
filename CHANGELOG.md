@@ -1,12 +1,126 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-27  
-**版本**：V5.27  
+**版本**：V5.28  
 **状态**：生产就绪
 
 ---
 
-## [V5.27] 2026-02-27 — 代码审查：Bug 修复 + 死代码清理 + 推理接口完善
+## [V5.28] 2026-02-27 — 训练优化四项：梯度累积 + SWA + R² 指标 + 最佳模型恢复；EEG 频谱相干性连通性
+
+### 背景
+
+对完整代码库（data loading → model design → graph construction → training flow → prediction）进行系统审查，发现以下改进机会并逐一实现。
+
+---
+
+### 优化 1：梯度累积 (Gradient Accumulation)
+
+**问题**：当前 batch_size=1（每步处理一个图），梯度估计噪声大，小数据集（N<100 样本）训练不稳定。
+
+**方案**：
+- `GraphNativeTrainer` 新增 `gradient_accumulation_steps` 参数（默认=1，后向兼容）
+- `train_step()` 新增 `do_zero_grad`、`do_optimizer_step`、`loss_scale` 参数
+- `train_epoch()` 以 `ga = gradient_accumulation_steps` 为步长管理梯度累积；loss 除以 ga 保持梯度期望不变
+- AMP 路径：`scaler.step()` 和 `scaler.update()` 仅在边界步调用
+- 配置：`training.gradient_accumulation_steps: 1`（建议小数据集设为 4）
+
+**科学依据**：等效 batch_size = actual_batch × accumulation_steps，更大批次在统计上减少梯度方差（Goodfellow et al. 2016 Deep Learning Ch.8）。
+
+---
+
+### 优化 2：随机权重平均 (SWA)
+
+**问题**：SGD（AdamW）找到的单一终点权重往往位于"尖锐谷底"，对分布偏移（如不同被试）敏感；CHANGELOG.md 明确标记为高优先级剩余优化。
+
+**方案**：
+- 主训练循环结束（含最佳模型恢复）后，可选运行 SWA 阶段
+- 使用 `torch.optim.swa_utils.AveragedModel` + `SWALR` 以恒定低 LR 继续训练并对权重取平均
+- SWA 结束后对训练数据做一次前向传播更新 BatchNorm 统计量（GraphNativeDecoder 含 BatchNorm1d）
+- SWA 模型与主训练最佳模型均做验证集评估（含 R² 指标），各自保存
+- 配置：`training.use_swa: false`、`training.swa_epochs: 10`、`training.swa_lr_ratio: 0.05`
+- 优雅降级：PyTorch < 1.6 时跳过（ImportError 捕获）
+
+**科学依据**：Izmailov et al. (2018) "Averaging Weights Leads to Wider Optima and Better Generalization"：SWA 找到更平坦的极小值，在 CV/NLP 任务上提升泛化 3-8%，对神经影像小数据集的被试间 OOD 泛化尤其有价值。
+
+---
+
+### 优化 3：验证集 R² 指标
+
+**问题**：`validate()` 只返回 loss 值；loss 绝对值受数据规模和损失函数类型影响，跨实验不可比；无法判断模型是否具备有效的信号重建能力。
+
+**方案**：
+- `validate()` 返回类型改为 `Tuple[float, Dict[str, float]]`（avg_loss, r2_dict）
+- 对每个模态独立计算 R²（解释方差比）：`R² = 1 - SS_res / SS_tot`，在完整验证集上累积而非按样本平均（更稳定）
+- 存入 `self.history['val_r2_{node_type}']`
+- `train_model()` 中同步更新 `val_loss, r2_dict = trainer.validate(val_graphs)` 并在 epoch 日志中显示
+
+**科学依据**：R² 直接衡量模型解释信号方差的比例，与神经影像重建文献中的"解释方差"一致；R² > 0.3 通常认为具有实用重建能力（Liu et al. 2019）。
+
+---
+
+### 优化 4：训练后自动恢复最佳模型
+
+**问题**：训练结束（含早停）后，`trainer.model` 处于最后一个 epoch 的状态，而非 val_loss 最低的状态；最佳模型已保存为 `best_model.pt` 但从未自动加载，用户必须手动操作。
+
+**方案**：
+- `train_model()` 中记录 `best_epoch` 变量
+- 训练循环结束后自动调用 `trainer.load_checkpoint(best_checkpoint_path)` 恢复最佳状态
+- 加载失败时 warning 而非 error（降级为使用最后 epoch 的模型）
+
+**科学依据**：训练的目标是获得泛化性最好的模型；早停后继续的 epoch 可能导致进一步过拟合，恢复最佳 checkpoint 是 Keras、PyTorch-Lightning 等所有主流框架的标准行为。
+
+---
+
+### 优化 5：EEG 频谱相干性连接（可配置）
+
+**问题**：`_compute_eeg_connectivity()` 注释已写"Use coherence-based connectivity"，但实现仍调用 Pearson 相关；对振荡性神经信号，Pearson 相关忽略了频段特异性同步（alpha/beta/gamma）。
+
+**方案**：
+- `GraphNativeBrainMapper.__init__` 新增 `eeg_connectivity_method` 参数（默认 `'correlation'`，后向兼容）
+- 新增 `_compute_eeg_connectivity_spectral()` 方法：使用 numpy rfft 计算宽带幅度相干性（wideband MSC）；值域 [0,1]；vectorized（矩阵乘法，无 Python 循环）
+- `_compute_eeg_connectivity()` 根据参数分发；`correlation` 路径完全不变
+- `_graph_cache_key()` 加入 `eeg_connectivity_method`：切换方法后旧缓存自动失效
+- 配置：`graph.eeg_connectivity_method: "correlation"`
+
+**算法**（wideband MSC）：
+```
+F = rfft(X, axis=1)          # [N_ch, n_freq] complex
+cross_mean = F @ F^H / n_freq  # [N_ch, N_ch] complex cross-spectral matrix
+psd_mean = mean(|F|², axis=1)  # [N_ch]
+MSC = |cross_mean|² / outer(psd_mean, psd_mean)
+connectivity = sqrt(clip(MSC, 0, 1))  # magnitude coherence
+```
+
+**科学依据**：Nunez et al. (1997) EEG Coherence；Bullmore & Sporns (2009) Nat Rev Neurosci；相干性比 Pearson 相关更能捕捉 alpha (8-12Hz)、beta (13-30Hz) 神经振荡的频段特异性同步。
+
+---
+
+### 修改文件
+
+| 文件 | 变更 |
+|------|------|
+| `models/graph_native_mapper.py` | `eeg_connectivity_method` 参数；`_compute_eeg_connectivity_spectral()`；`_compute_eeg_connectivity()` 分发 |
+| `models/graph_native_system.py` | `gradient_accumulation_steps`；`train_step` 新增 3 参数；`train_epoch` 累积逻辑；`validate()` 返回 Tuple + R²；`history` 新键 |
+| `main.py` | `_graph_cache_key()` 加入 `eeg_connectivity_method`；mapper 构造传参；trainer 构造传 `gradient_accumulation_steps`；`validate()` 解包；`best_epoch` 跟踪；最佳模型自动恢复；SWA 阶段（含 BN 更新、验证、保存） |
+| `configs/default.yaml` | `graph.eeg_connectivity_method`；`training.gradient_accumulation_steps`；`training.use_swa/swa_epochs/swa_lr_ratio` |
+
+---
+
+### 剩余优化机会（已记录，待实现）
+
+- **高优先级**：
+  - 推理 API（`predict()` 函数）：训练完成后在新数据上运行推理
+  - 多 GPU / DataParallel 支持（当前仅单 GPU）
+- **中优先级**：
+  - 层级学习率衰减（LLRD）：编码器浅层更小 LR
+  - 跨模态注意力学习（learnable cross-modal attention gate）：替代静态随机边
+- **低优先级**：
+  - 频段特异性 EEG 连通性（分 alpha/beta/gamma 频段各建一套图）
+
+---
+
+
 
 ### Bug 修复
 

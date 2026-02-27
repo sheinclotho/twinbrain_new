@@ -1309,7 +1309,8 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
             logger.warning(
                 f"⚠️ 最佳模型自动恢复失败: {_e}。"
                 f" 当前模型为最后一个 epoch 的状态。"
-                f" 可手动调用 trainer.load_checkpoint('{best_checkpoint_path}')。"
+                f" 可手动调用 trainer.load_checkpoint('{best_checkpoint_path}')。",
+                exc_info=True,
             )
 
     # ── SWA 阶段（Optimization 2，可选）────────────────────────────────────
@@ -1361,19 +1362,26 @@ def train_model(model, graphs, config: dict, logger: logging.Logger):
                     f"train_loss={swa_train_loss:.4f}"
                 )
 
-            # 3. Update BatchNorm statistics using a forward pass over training data.
-            #    Required because the SWA-averaged weights never saw batch statistics;
-            #    without this step, BatchNorm in GraphNativeDecoder uses stale stats.
+            # 3. Update BatchNorm running statistics.
+            #    The SWA-averaged weights never processed any real batch; BN layers
+            #    (present in GraphNativeDecoder) still have stale running_mean/var
+            #    from the original training run.  We use PyTorch's built-in
+            #    update_bn() which resets running stats and re-estimates them via a
+            #    cumulative moving average over the entire training set.
+            #    update_bn() sets the model to train() mode internally and uses
+            #    the iterable's items as positional arguments to swa_model.forward().
+            #    GraphNativeBrainModel.forward(data) accepts a single HeteroData
+            #    positional argument with all other params defaulting, so the
+            #    plain list iteration works correctly.
             logger.info("  更新 SWA 模型 BatchNorm 统计量...")
             try:
-                with torch.no_grad():
-                    for bn_data in train_graphs:
-                        bn_data_dev = bn_data.to(trainer.device)
-                        swa_model(bn_data_dev, return_prediction=False)
+                update_bn(train_graphs, swa_model, device=trainer.device)
+                logger.info("  ✅ BatchNorm 统计量已更新")
             except Exception as _bn_err:
                 logger.warning(
                     f"  BatchNorm 更新遇到问题: {_bn_err}。"
-                    f" SWA 模型 BN 统计量可能不准确。"
+                    f" SWA 模型 BN 统计量可能不准确。",
+                    exc_info=True,
                 )
 
             # 4. Validate SWA model directly (without swapping trainer.model

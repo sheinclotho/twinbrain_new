@@ -413,7 +413,10 @@ class GraphNativeBrainMapper:
         """
         N_ch, T = timeseries.shape
         # rfft for real-valued signals: output shape [N_ch, T//2 + 1]
-        F = np.fft.rfft(timeseries.astype(np.float64), axis=1)
+        # float64 is required for numerical precision in the cross-spectrum
+        # computation; only convert if not already float64 to avoid redundant copy.
+        ts_f64 = timeseries if timeseries.dtype == np.float64 else timeseries.astype(np.float64)
+        F = np.fft.rfft(ts_f64, axis=1)
         n_freq = F.shape[1]
 
         # Mean cross-power matrix [N_ch, N_ch] complex:
@@ -427,7 +430,14 @@ class GraphNativeBrainMapper:
         psd_outer = np.outer(psd_mean, psd_mean) + 1e-12
         msc = (np.abs(cross_mean) ** 2) / psd_outer
 
-        # Take square root for magnitude coherence (better dynamic range)
+        # Convert MSC (magnitude squared coherence, range [0,1²]) to
+        # magnitude coherence (sqrt of MSC, range [0,1]).  This is analogous
+        # to taking the absolute Pearson correlation: both represent the
+        # linear coupling strength between 0 (independent) and 1 (identical),
+        # and the sqrt provides better dynamic range since MSC ∈ [0,1] clusters
+        # near 1 for strongly coupled channels while sqrt(MSC) spreads the
+        # values more uniformly.  The result is directly comparable to the
+        # absolute Pearson correlation used in correlation-based connectivity.
         connectivity = np.sqrt(np.clip(msc, 0.0, 1.0)).astype(np.float32)
         np.fill_diagonal(connectivity, 1.0)
         return connectivity
