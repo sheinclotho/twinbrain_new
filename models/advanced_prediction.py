@@ -26,6 +26,40 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _transformer_seq2seq_predict(
+    predictor: 'TransformerPredictor',
+    context: torch.Tensor,
+    n_steps: int,
+) -> torch.Tensor:
+    """Seq2seq prediction with a TransformerPredictor.
+
+    Extends the context with ``n_steps`` placeholder tokens (initialised with
+    the last context step) and applies a causal mask so each future position
+    can only attend to earlier positions (standard autoregressive inference).
+
+    Used by both ``UncertaintyAwarePredictor._base_predict()`` and the
+    ``elif self.use_transformer`` branches in
+    ``EnhancedMultiStepPredictor.predict_next()`` and ``.forward()``.
+
+    Args:
+        predictor: TransformerPredictor instance.
+        context: Context tensor ``[batch, ctx_len, input_dim]``.
+        n_steps: Number of future steps to return.
+
+    Returns:
+        Predicted future tensor ``[batch, n_steps, input_dim]``.
+    """
+    future_init = context[:, -1:, :].repeat(1, n_steps, 1)
+    x_extended = torch.cat([context, future_init], dim=1)
+    seq_len = x_extended.shape[1]
+    causal_mask = torch.triu(
+        torch.ones(seq_len, seq_len, device=context.device) * float('-inf'),
+        diagonal=1,
+    )
+    pred_all = predictor(x_extended, mask=causal_mask)
+    return pred_all[:, -n_steps:, :]
+
+
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding for transformer."""
     
@@ -631,6 +665,37 @@ class UncertaintyAwarePredictor(nn.Module):
                 nn.Linear(input_dim // 2, input_dim),
             )
     
+    def _base_predict(
+        self,
+        x: torch.Tensor,
+        future_steps: Optional[int],
+    ) -> torch.Tensor:
+        """Dispatch a single forward call to the base predictor.
+
+        Each base predictor type has a different calling convention:
+        - HierarchicalPredictor: forward(x, future_steps) → (pred, scales)
+        - TransformerPredictor:  forward(x_extended, mask) → full_seq
+          Requires seq2seq extension (context + future placeholders + causal mask).
+          Simply calling forward(x) returns the same-length output [B, ctx_len, H],
+          NOT the desired [B, future_steps, H].
+        - nn.GRU and others: forward(x) → output (used directly)
+
+        This helper is called from the gaussian and dropout paths in forward()
+        to avoid duplicating the dispatch logic at every call site.
+        """
+        if isinstance(self.base_predictor, HierarchicalPredictor):
+            pred, _ = self.base_predictor(x, future_steps)
+            return pred
+        elif isinstance(self.base_predictor, TransformerPredictor):
+            # Delegate to the module-level helper that handles seq2seq extension.
+            # future_steps=None is only possible when called without a valid step
+            # count; we fall back to the context length as a safe default.
+            n_steps = future_steps if future_steps is not None else x.shape[1]
+            return _transformer_seq2seq_predict(self.base_predictor, x, n_steps)
+        else:
+            # nn.GRU (and any other future predictor types): direct call.
+            return self.base_predictor(x)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -651,10 +716,7 @@ class UncertaintyAwarePredictor(nn.Module):
         """
         if self.uncertainty_method == 'gaussian':
             # Forward through base predictor
-            if isinstance(self.base_predictor, HierarchicalPredictor):
-                prediction_mean, _ = self.base_predictor(x, future_steps)
-            else:
-                prediction_mean = self.base_predictor(x)
+            prediction_mean = self._base_predict(x, future_steps)
             
             if not return_uncertainty:
                 return prediction_mean, None
@@ -669,11 +731,7 @@ class UncertaintyAwarePredictor(nn.Module):
             # MC dropout for uncertainty estimation
             if not return_uncertainty:
                 # Single forward pass
-                if isinstance(self.base_predictor, HierarchicalPredictor):
-                    prediction, _ = self.base_predictor(x, future_steps)
-                else:
-                    prediction = self.base_predictor(x)
-                return prediction, None
+                return self._base_predict(x, future_steps), None
             
             # Multiple forward passes with dropout
             # Save training state so we don't corrupt eval mode when this is
@@ -686,11 +744,7 @@ class UncertaintyAwarePredictor(nn.Module):
             try:
                 predictions = []
                 for _ in range(self.num_mc_samples):
-                    if isinstance(self.base_predictor, HierarchicalPredictor):
-                        pred, _ = self.base_predictor(x, future_steps)
-                    else:
-                        pred = self.base_predictor(x)
-                    predictions.append(pred)
+                    predictions.append(self._base_predict(x, future_steps))
             finally:
                 self.base_predictor.train(was_training)  # restore original state
             
@@ -786,6 +840,7 @@ class EnhancedMultiStepPredictor(nn.Module):
         self.context_length = context_length
         self.prediction_steps = prediction_steps
         self.use_hierarchical = use_hierarchical
+        self.use_transformer = use_transformer  # needed to dispatch predict_next/forward correctly
         self.use_uncertainty = use_uncertainty
         
         # Create base predictor
@@ -883,6 +938,15 @@ class EnhancedMultiStepPredictor(nn.Module):
             elif self.use_hierarchical:
                 pred_mean, _ = self.predictor(context, self.prediction_steps)
                 pred_std = None
+            elif self.use_transformer:
+                # Non-hierarchical flat TransformerPredictor: delegate to the
+                # shared seq2seq helper.  Falling through to the GRU else-branch
+                # would fail because TransformerPredictor.forward returns a single
+                # Tensor, not (output, hidden).
+                pred_mean = _transformer_seq2seq_predict(
+                    self.predictor, context, self.prediction_steps
+                )
+                pred_std = None
             else:
                 # Simple GRU autoregressive rollout.
                 # Use self.gru_output_proj to project GRU output (hidden_dim)
@@ -958,6 +1022,16 @@ class EnhancedMultiStepPredictor(nn.Module):
             )
         elif self.use_hierarchical:
             pred, _ = self.predictor(context, self.prediction_steps)
+        elif self.use_transformer:
+            # Non-hierarchical flat TransformerPredictor: delegate to the
+            # module-level seq2seq helper which extends context with future
+            # placeholders and applies a causal mask.
+            # (Falling to the GRU else-branch would call
+            #  _, hidden = TransformerPredictor(context) → ValueError since
+            #  TransformerPredictor returns a Tensor, not (output, hidden).)
+            pred = _transformer_seq2seq_predict(
+                self.predictor, context, self.prediction_steps
+            )
         else:
             # GRU: autoregressive rollout from last context step.
             # The projected tensor is used BOTH for accumulation and feedback:

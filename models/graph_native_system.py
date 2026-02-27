@@ -1402,6 +1402,13 @@ class GraphNativeTrainer:
                 if self.model.use_prediction:
                     pred_latents: Dict[str, torch.Tensor] = {}
                     pred_T_ctx: Dict[str, int] = {}
+                    # h_ctx_dict is assigned inside `if ctx_T_map:` below and
+                    # referenced inside `if pred_latents:`.  The current logic
+                    # guarantees pred_latents non-empty → ctx_T_map non-empty →
+                    # h_ctx_dict assigned, but initializing here makes this
+                    # invariant explicit and prevents UnboundLocalError if the
+                    # code is extended in the future.
+                    h_ctx_dict: Dict[str, torch.Tensor] = {}
 
                     # ── Step 1: Determine context split per modality ──────────
                     # Use the full-sequence latent length (from encoded above,

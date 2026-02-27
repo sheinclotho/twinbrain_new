@@ -734,6 +734,55 @@ MC dropout 路径中 `self.base_predictor.train()` 被无条件调用，在 vali
 
 ---
 
+### [2026-02-27] 预测功能第六轮审查：非层级 TransformerPredictor 错误分派 + UAP shape 错误 + h_ctx_dict 初始化
+
+**背景**：第六轮独立审查，系统性验证所有配置组合。
+
+---
+
+**盲区 1 — 非层级 TransformerPredictor 分派到 GRU 分支（P2 运行时崩溃/静默错误）**
+
+**思维误区**：以为"修复了 GRU 投影就修好了所有 else 分支"，没有追问：**else 分支覆盖了哪些配置？**
+
+**根因**：`EnhancedMultiStepPredictor.__init__()` 存储了 `self.use_hierarchical` 和 `self.use_uncertainty`，但**未存储 `self.use_transformer`**。当 `use_hierarchical=False, use_transformer=True, use_uncertainty=False` 时：
+- `self.predictor = TransformerPredictor(...)` (返回单一 Tensor)
+- `predict_next()` 和 `forward()` 的 `else` 分支执行 `_, hidden = self.predictor(context)`
+- TransformerPredictor 返回 `[B, T, H]`（不是 `(output, hidden)`）
+- batch_size ≠ 2 时崩溃；batch_size = 2 时静默产生错误结果
+
+**修复**：
+1. `__init__` 中保存 `self.use_transformer = use_transformer`
+2. 在 `predict_next()` 和 `forward()` 中添加 `elif self.use_transformer:` 分支
+3. 提取模块级辅助函数 `_transformer_seq2seq_predict(predictor, context, n_steps)` — 消除3处重复的 seq2seq 扩展逻辑（extend context + causal mask + take last n_steps）
+
+---
+
+**盲区 2 — UncertaintyAwarePredictor 包装 TransformerPredictor 时返回错误形状（P2 静默错误）**
+
+**思维误区**：以为"修复了 EnhancedMultiStepPredictor 的分派就覆盖了 UAP 的分派"，没有追问：**UAP.forward() 的 isinstance 分支是否正确处理 TransformerPredictor？**
+
+**根因**：`UncertaintyAwarePredictor.forward()` 中 gaussian/dropout 路径只检查 `isinstance(self.base_predictor, HierarchicalPredictor)`；对非 Hierarchical 的情况调用 `self.base_predictor(x)`（TransformerPredictor 返回 `[B, ctx_len, H]`，不是 `[B, future_steps, H]`）。
+
+**修复**：提取 `UncertaintyAwarePredictor._base_predict(x, future_steps)` 辅助方法，使用 `_transformer_seq2seq_predict` 正确处理 TransformerPredictor；gaussian/dropout 所有分支统一调用 `_base_predict`，消除重复的 isinstance 分散逻辑。
+
+---
+
+**盲区 3 — validate() h_ctx_dict 未初始化（P3 鲁棒性）**
+
+`h_ctx_dict` 仅在 `if ctx_T_map:` 块内赋值，在 `if pred_latents:` 块内使用。当前逻辑保证安全（pred_latents 非空 → ctx_T_map 非空 → h_ctx_dict 已赋值），但这是隐式不变式。
+
+**修复**：在 `if ctx_T_map:` 之前添加 `h_ctx_dict: Dict[str, torch.Tensor] = {}` 显式初始化，使不变式变得显式，防止未来代码修改破坏此假设。
+
+**配置空间全覆盖审查结果**：
+| 配置 | 状态 |
+|------|------|
+| use_hierarchical=True（默认） | ✅ 正确 |
+| use_hierarchical=False, use_transformer=False (GRU) | ✅ 正确 |
+| use_hierarchical=False, use_transformer=True | **已修复 V5.36** |
+| use_uncertainty=True 包装任意 base | **已修复 V5.36**（UAP._base_predict） |
+
+---
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -761,6 +810,10 @@ MC dropout 路径中 `self.base_predictor.train()` 被无条件调用，在 vali
 | validate() pred_enc 从 h_ctx_dict 初始化（decoder 维度修复） | ✅ 已修复 | V5.35 |
 | pred_loss N 不匹配守卫（防御性一致性） | ✅ 已修复 | V5.35 |
 | UncertaintyAwarePredictor MC dropout eval 状态恢复 | ✅ 已修复 | V5.35 |
+| 非层级 TransformerPredictor 错误分派修复（predict_next/forward） | ✅ 已修复 | V5.36 |
+| UAP._base_predict 统一分派（TransformerPredictor shape 修复） | ✅ 已修复 | V5.36 |
+| _transformer_seq2seq_predict 模块级辅助函数（DRY 消重） | ✅ 已实现 | V5.36 |
+| validate() h_ctx_dict 显式初始化（鲁棒性） | ✅ 已修复 | V5.36 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 
