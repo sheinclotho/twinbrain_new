@@ -720,6 +720,7 @@ class GraphNativeTrainer:
         optimization_config: Optional[Dict] = None,
         max_grad_norm: float = 1.0,
         gradient_accumulation_steps: int = 1,
+        augmentation_config: Optional[Dict] = None,
     ):
         """
         Initialize trainer.
@@ -749,6 +750,13 @@ class GraphNativeTrainer:
                 data, stabilising gradient estimates on small datasets without extra memory.
                 The loss is scaled by 1/gradient_accumulation_steps before backward() to
                 keep gradient magnitudes consistent regardless of the accumulation count.
+            augmentation_config: Optional dict from config['training']['augmentation'].
+                Supported keys:
+                  enabled (bool): master switch (default False — backward compatible).
+                  noise_std (float): std of Gaussian noise added to node features
+                      (default 0.01; relative to z-scored signals so 1% amplitude).
+                  scale_range ([min, max]): random amplitude scaling per sample
+                      (default [0.9, 1.1]; None to disable).
         """
         self._optimization_config = optimization_config or {}
         self.model = model.to(device)
@@ -756,6 +764,20 @@ class GraphNativeTrainer:
         self.node_types = node_types
         self.max_grad_norm = max_grad_norm
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
+
+        # Temporal augmentation config (applied only during training, not validation)
+        _aug = augmentation_config or {}
+        self._aug_enabled    = bool(_aug.get('enabled', False))
+        self._aug_noise_std  = float(_aug.get('noise_std', 0.01))
+        _sr = _aug.get('scale_range', [0.9, 1.1])
+        self._aug_scale_min  = float(_sr[0]) if _sr else 1.0
+        self._aug_scale_max  = float(_sr[1]) if _sr else 1.0
+        if self._aug_enabled:
+            logger.info(
+                f"时序数据增强已启用: "
+                f"noise_std={self._aug_noise_std}, "
+                f"scale_range=[{self._aug_scale_min}, {self._aug_scale_max}]"
+            )
         
         # Verify CUDA availability
         if device.startswith('cuda') and not torch.cuda.is_available():
@@ -1005,6 +1027,25 @@ class GraphNativeTrainer:
         
         # Move data to device
         data = data.to(self.device)
+
+        # ── 时序数据增强（仅训练模式）────────────────────────────────────
+        # 在每个训练步随机向节点特征添加小量高斯噪声和/或随机幅度缩放，
+        # 提升模型对信号噪声和个体差异的鲁棒性（类似神经影像信号增强文献中
+        # 的 jitter 和 scaling 方法）。验证时不增强，保证评估一致性。
+        # 实现为纯 in-place-free 加法/乘法，不影响 autograd 图。
+        if self._aug_enabled:
+            for _nt in data.node_types:
+                if hasattr(data[_nt], 'x') and data[_nt].x is not None:
+                    _x = data[_nt].x
+                    if self._aug_noise_std > 0:
+                        _x = _x + torch.randn_like(_x) * self._aug_noise_std
+                    if self._aug_scale_min != 1.0 or self._aug_scale_max != 1.0:
+                        _scale = (
+                            torch.empty(1, device=_x.device, dtype=_x.dtype)
+                            .uniform_(self._aug_scale_min, self._aug_scale_max)
+                        )
+                        _x = _x * _scale
+                    data[_nt].x = _x
         
         # Apply EEG enhancement if enabled.
         # Graph data shape: [N_eeg, T, 1] (N_eeg nodes, each with a 1-dim feature).
