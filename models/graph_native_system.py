@@ -14,6 +14,7 @@ This is a COMPLETE standalone system, not just optimization modules.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -695,6 +696,7 @@ class GraphNativeTrainer:
         # we use lazy initialisation: the handler is created on the first training step.
         self.use_eeg_enhancement = use_eeg_enhancement and 'eeg' in node_types
         self.eeg_handler = None          # created lazily in train_step()
+        self._eeg_n_channels: Optional[int] = None   # recorded in _ensure_eeg_handler; used to detect channel-count mismatch across subjects
         self._eeg_handler_cfg = self._optimization_config.get('eeg_enhancement', {})
         
         # Training history
@@ -726,6 +728,7 @@ class GraphNativeTrainer:
                 diversity_weight=cfg.get('diversity_weight', 0.01),
                 activity_weight=cfg.get('activity_weight', 0.01),
             ).to(self.device)
+            self._eeg_n_channels = n_eeg_channels
             logger.info(f"EEG handler initialised for {n_eeg_channels} channels.")
         except Exception as e:
             logger.warning(f"Failed to initialise EEG handler: {e}. Disabling EEG enhancement.")
@@ -783,18 +786,33 @@ class GraphNativeTrainer:
         eeg_info: dict = {}  # 初始为空；仅当 EEG handler 激活时（下方 if 块）被填充
         original_eeg_x = None
         if self.use_eeg_enhancement and 'eeg' in data.node_types:
-            original_eeg_x = data['eeg'].x  # [N_eeg, T, 1]
-            N_eeg = original_eeg_x.shape[0]
-            # Lazy-initialise handler with true electrode count (N_eeg).
-            # Previous approach used in_features=1 (graph feature dim), which
-            # made all channel-specific processing trivially useless.
-            self._ensure_eeg_handler(N_eeg)
-            if self.use_eeg_enhancement and self.eeg_handler is not None:
-                eeg_x_t, eeg_info = self.eeg_handler(
-                    self._graph_to_handler_format(original_eeg_x), training=True
+            N_eeg = data['eeg'].x.shape[0]
+            # Guard: if the handler was already initialised for a different channel
+            # count (e.g. this subject has 64 channels but another had 63), skip
+            # enhancement rather than feeding a wrong-shape tensor.  This silently
+            # fails in the original code and produces garbage gradients or shape
+            # errors that are hard to diagnose.
+            # original_eeg_x is only set here (when we're about to modify), keeping
+            # the finally-block restoration logic clean: non-None ↔ modified.
+            if self.eeg_handler is not None and self._eeg_n_channels != N_eeg:
+                logger.debug(
+                    f"EEG channel count mismatch: handler built for "
+                    f"{self._eeg_n_channels} channels, this sample has {N_eeg}. "
+                    f"Skipping EEG enhancement for this sample."
                 )
-                eeg_x_enhanced = self._handler_to_graph_format(eeg_x_t)
-                data['eeg'].x = eeg_x_enhanced
+                # No modification made — original_eeg_x stays None, nothing to restore
+            else:
+                # Lazy-initialise handler with true electrode count (N_eeg).
+                # Previous approach used in_features=1 (graph feature dim), which
+                # made all channel-specific processing trivially useless.
+                self._ensure_eeg_handler(N_eeg)
+                if self.use_eeg_enhancement and self.eeg_handler is not None:
+                    original_eeg_x = data['eeg'].x  # save before modifying
+                    eeg_x_t, eeg_info = self.eeg_handler(
+                        self._graph_to_handler_format(original_eeg_x), training=True
+                    )
+                    eeg_x_enhanced = self._handler_to_graph_format(eeg_x_t)
+                    data['eeg'].x = eeg_x_enhanced
         
         try:
             # Forward and backward pass with optional mixed precision
@@ -911,8 +929,20 @@ class GraphNativeTrainer:
         if len(data_list) == 0:
             raise ValueError("Cannot train on empty data_list")
         
+        # ── 逐 epoch 打乱训练样本 ────────────────────────────────────────────
+        # 使用 epoch 作为随机种子：每个 epoch 的顺序不同（保证 SGD 随机性），
+        # 但相同 epoch 编号时顺序可复现（方便调试）。
+        #
+        # 为什么必须打乱：
+        # 1. `train_model` 在训练开始时只打乱一次；之后每个 epoch 都使用相同顺序。
+        # 2. 不打乱时，排在列表末尾的被试/任务每个 epoch 总是得到最后一次权重更新，
+        #    模型会对它们产生隐式偏好（optimizer 的动量使最后几步梯度影响最大）。
+        # 3. 窗口模式下，同一 run 的 11 个窗口若连续处理，局部 loss 景观过于平滑，
+        #    学习曲线呈"锯齿"型而非平稳下降。
+        epoch_data = data_list.copy()   # 浅拷贝：不修改原始列表，仅改变本 epoch 的遍历顺序
+        random.Random(epoch or 0).shuffle(epoch_data)
         total_loss = 0.0
-        num_batches = len(data_list)
+        num_batches = len(epoch_data)
         
         # Advance epoch counter in the adaptive loss balancer so that the warmup
         # period expires correctly and weight adaptation becomes active.
@@ -926,7 +956,7 @@ class GraphNativeTrainer:
             elif epoch <= 3:
                 logger.info(f"📊 Epoch {epoch}/{total_epochs or '?'} 训练中...")
         
-        for i, data in enumerate(data_list):
+        for i, data in enumerate(epoch_data):
             loss_dict = self.train_step(data)
             total_loss += loss_dict['total']
             

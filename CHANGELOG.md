@@ -1,8 +1,63 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-27  
-**版本**：V5.23  
+**版本**：V5.24  
 **状态**：生产就绪
+
+---
+
+## [V5.24] 2026-02-27 — 多被试多任务联合训练正确性审查
+
+### 问题背景
+
+用户指出"合成图是多个任务多被试合成的，需要确保训练中能合理训练"，触发对训练完整流程的系统审查。
+
+### 误解澄清
+
+`graphs` 列表中每个 `HeteroData` 均为独立的 (被试, 任务) 图，不存在跨被试/跨任务的节点或特征混合。`train_epoch` 对每个样本独立调用 `train_step`（batch_size=1），每次完整的前向/反向/参数更新周期均基于单个样本。
+
+### 修复的三项缺陷
+
+#### Bug 1 — `train_epoch` 缺少逐 epoch 打乱（SGD 偏差）
+
+- **症状**：`train_model` 启动时只打乱一次，之后 epoch 1,2,3,... 看到完全相同的顺序
+- **影响**：optimizer 动量使列表末尾被试每轮获得最新梯度，模型系统性偏向字母序靠后的被试
+- **修复**：`train_epoch` 用 `random.Random(epoch).shuffle(copy)` 每轮独立打乱（以 epoch 为种子，可复现）
+
+#### Bug 2 — EEG handler 通道数不匹配跨被试静默失败
+
+- **症状**：`_ensure_eeg_handler` 按第一个样本的 `N_eeg` 初始化，后续不同通道数的被试传入错误形状张量
+- **影响**：产生不可预期的形状错误或静默的错误梯度，且无任何警告
+- **修复**：记录 `_eeg_n_channels`；不匹配时跳过该样本的增强并记录 debug 日志；`original_eeg_x` 仅在实际修改前保存（non-None ↔ 已修改，语义清晰）
+
+#### Bug 3 — `task_id` / `subject_id_str` 未存储（数据不可见）
+
+- **症状**：图构建后任务名和被试字符串被丢弃，无法追踪每个训练样本的来源
+- **影响**：`log_training_summary` 无法验证数据分布，调试困难
+- **修复**：在 `build_graphs`、缓存加载路径均写入这两个属性；`extract_windowed_samples` 传播到所有窗口；`log_training_summary` 展示每任务/被试的样本数及数据独立性说明
+
+### 样例训练摘要输出（V5.24 新增）
+
+```
+【训练数据组成】
+  总样本数: 330
+  按任务分布 (3 个任务):
+    GRADON: 110 个样本 (33.3%)
+    GRADOFF: 110 个样本 (33.3%)
+    rest: 110 个样本 (33.3%)
+  按被试分布 (10 个被试):
+    sub-01: 33 个样本 (10.0%)
+    ...
+  ✅ 数据独立性确认: 每个样本均来自独立的 (被试, 任务) 组合 ...
+  ✅ 逐 Epoch 打乱: train_epoch 每轮以 epoch 编号为种子打乱样本顺序 ...
+```
+
+### 修改文件
+
+- `models/graph_native_system.py`：`import random` 移到文件顶部；`_eeg_n_channels` 字段；`train_step` 通道守卫；`train_epoch` 逐 epoch 打乱
+- `main.py`：`build_graphs` / 缓存路径写入 `task_id` + `subject_id_str`；`extract_windowed_samples` 传播新属性；`log_training_summary` 数据组成摘要；`Counter` 顶层导入
+- `AGENTS.md`：记录三项缺陷
+- `CHANGELOG.md`：本版本更新日志
 
 ---
 

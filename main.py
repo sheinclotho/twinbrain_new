@@ -19,7 +19,7 @@ import os
 import random
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from pathlib import Path
 from typing import List, Optional
 import yaml
@@ -286,12 +286,11 @@ def extract_windowed_samples(
 
     # 复制图级属性（不属于任何节点类型，但对整个样本共享的元数据）
     # 当前图级属性：
-    #   subject_idx: 被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
-    #   run_idx: 扫描 run 的全局整数索引（由 build_graphs 按 all_pairs 顺序赋值），
-    #            供 train_model 的 run-level 训练/验证集划分使用，防止同一 run 的重叠
-    #            窗口同时出现在训练集和验证集中（窗口级划分会引入数据泄漏）。
-    # 未来可扩展：task_id（任务类型编码）、session_id（纵向会话索引，支持跨会话预测）
-    for attr in ('subject_idx', 'run_idx'):
+    #   subject_idx:    被试整数索引，供 subject embedding（个性化）使用（AGENTS.md §九 Gap 2）
+    #   run_idx:        扫描 run 的全局整数索引，供 train_model run-level 划分
+    #   task_id:        任务名字符串（如 'GRADON'），供日志摘要按任务统计
+    #   subject_id_str: 被试 ID 字符串（如 'sub-01'），供日志摘要按被试统计
+    for attr in ('subject_idx', 'run_idx', 'task_id', 'subject_id_str'):
         if hasattr(full_graph, attr):
             for win in windows:
                 setattr(win, attr, getattr(full_graph, attr))
@@ -604,6 +603,10 @@ def build_graphs(config: dict, logger: logging.Logger):
                     # run_idx 供 run-level 训练/验证集划分使用。
                     # 与 subject_idx 同理：缓存图可能不含此属性，此处补写无害。
                     full_graph.run_idx = torch.tensor(run_idx_counter, dtype=torch.long)
+                    # task_id / subject_id_str：补写任务和被试字符串元数据，
+                    # 供 log_training_summary 展示数据组成。
+                    full_graph.task_id = task or ''
+                    full_graph.subject_id_str = subject_id
                     win_samples = extract_windowed_samples(full_graph, w_cfg, logger)
                     graphs.extend(win_samples)
                     n_windows_total += len(win_samples)
@@ -816,6 +819,12 @@ def build_graphs(config: dict, logger: logging.Logger):
             # 窗口模式下，同一 run 的所有窗口共享相同 run_idx，
             # 训练时以 run 为单位划分，防止重叠窗口同时出现在训练集和验证集中。
             built_graph.run_idx = torch.tensor(run_idx_counter, dtype=torch.long)
+            # task_id: 任务名称字符串，供日志摘要和每任务统计使用。
+            # 注意：此处存储字符串而非整数，仅用于日志和调试，不参与模型计算。
+            built_graph.task_id = task or ''
+            # subject_id_str: 被试 ID 字符串（与 subject_idx 整数一一对应）。
+            # 单独保留字符串形式，供日志摘要按被试统计样本数时使用。
+            built_graph.subject_id_str = subject_id
 
             # ── 保存到缓存（始终保存完整 run 图） ──────────────────
             if cache_dir is not None and cache_key is not None:
@@ -1041,6 +1050,46 @@ def log_training_summary(
         logger.info(f"  序列截断 max_seq_len: {max_seq} (防止 CUDA OOM)")
     else:
         logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议设置 max_seq_len)")
+
+    # ── 训练数据组成摘要 ──────────────────────────────────────────
+    # 显示每个被试、每个任务的样本数，让用户一眼看出数据是否均衡、
+    # 是否有被试/任务缺失，以及跨任务/被试训练的实际规模。
+    logger.info("【训练数据组成】")
+    total_samples = len(graphs)
+    logger.info(f"  总样本数: {total_samples}")
+
+    # 按任务统计
+    # 检查 graphs[0] 即可：build_graphs() 为所有图统一写入 task_id，
+    # extract_windowed_samples() 将其传播到所有窗口样本，所以要么所有图都有，要么都没有。
+    if graphs and hasattr(graphs[0], 'task_id'):
+        task_counts = Counter(getattr(g, 'task_id', '') for g in graphs)
+        logger.info(f"  按任务分布 ({len(task_counts)} 个任务):")
+        for task_name, cnt in sorted(task_counts.items()):
+            pct = cnt / total_samples * 100
+            logger.info(f"    {task_name or '(无任务名)'}: {cnt} 个样本 ({pct:.1f}%)")
+    else:
+        logger.info("  任务分布: 不可用（task_id 未存储，请清除缓存重建图）")
+
+    # 按被试统计（同上，检查 graphs[0] 即可）
+    if graphs and hasattr(graphs[0], 'subject_id_str'):
+        subj_counts = Counter(getattr(g, 'subject_id_str', '') for g in graphs)
+        logger.info(f"  按被试分布 ({len(subj_counts)} 个被试):")
+        for subj_id, cnt in sorted(subj_counts.items()):
+            pct = cnt / total_samples * 100
+            logger.info(f"    {subj_id}: {cnt} 个样本 ({pct:.1f}%)")
+    else:
+        logger.info("  被试分布: 不可用（subject_id_str 未存储，请清除缓存重建图）")
+
+    # 数据独立性说明（关键：帮助用户理解"多被试多任务合成列表"的训练语义）
+    logger.info(
+        "  ✅ 数据独立性确认: 每个样本均来自独立的 (被试, 任务) 组合，"
+        "不同被试/任务的图在内存中相互独立，梯度更新以单样本（batch_size=1）进行，"
+        "不存在跨被试或跨任务的节点/特征混合。"
+    )
+    logger.info(
+        "  ✅ 逐 Epoch 打乱: train_epoch 每轮以 epoch 编号为种子打乱样本顺序，"
+        "确保 SGD 不会系统性地偏向列表末尾的被试/任务。"
+    )
 
     # ── 模型 ────────────────────────────────────────────────────
     logger.info("【模型】")

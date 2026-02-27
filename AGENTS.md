@@ -813,3 +813,34 @@ fmri_condition_bounds:
 
 **影响文件**：`main.py`、`configs/default.yaml`、`AGENTS.md`、`CHANGELOG.md`
 
+
+---
+
+### [2026-02-27] 多被试多任务联合训练的三项静默缺陷
+
+**背景**：用户指出"合成图是多个任务多被试合成的"，要求审查训练流程是否合理。
+
+**误解澄清（先）**：`graphs` 列表中每个 `HeteroData` 对象都是独立的 (被试, 任务) 图，**不存在跨被试/跨任务的节点或特征混合**。训练时 `train_epoch` 逐一处理每个样本，每次调用 `train_step` = 独立的前向/反向/参数更新。
+
+**真正的三项缺陷**：
+
+#### Bug 1：`train_epoch` 缺少逐 epoch 打乱（SGD 偏差）
+
+`train_model` 在训练开始时只打乱一次；之后每个 epoch 使用相同顺序。由于 optimizer 的动量，列表末尾的被试/任务每轮总是得到"最新鲜"的权重更新，模型产生系统性偏差（偏向字母序靠后的被试）。
+
+**修复**：`train_epoch` 用 `random.Random(epoch).shuffle(copy)` 每轮独立打乱，使用 epoch 编号作为种子保证可复现。
+
+#### Bug 2：EEG handler 通道数不匹配（跨被试静默失败）
+
+`_ensure_eeg_handler` 按第一个样本的 `N_eeg` 初始化，之后若遇到通道数不同的被试（如 63 vs 64 个电极），向 handler 传入错误形状的张量，产生形状错误或静默的错误梯度。
+
+**修复**：记录 `self._eeg_n_channels`，在 `train_step` 检测不匹配时跳过该样本的增强并记录 debug 日志。`original_eeg_x` 仅在实际修改之前才保存，保持 finally 块语义清晰（non-None ↔ 已修改）。
+
+#### Bug 3：`task_id` / `subject_id_str` 未存储（数据不可见）
+
+图构建后任务名和被试字符串被丢弃，`log_training_summary` 无法展示数据组成，用户无法验证训练数据分布是否符合预期。
+
+**修复**：在 `build_graphs` 和缓存加载路径均写入 `task_id`（字符串）和 `subject_id_str`（字符串）；`extract_windowed_samples` 将其传播到每个窗口；`log_training_summary` 展示每任务/每被试的样本数及数据独立性说明。
+
+**影响文件**：`models/graph_native_system.py`、`main.py`、`AGENTS.md`、`CHANGELOG.md`
+
