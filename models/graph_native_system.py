@@ -151,17 +151,189 @@ class GraphNativeDecoder(nn.Module):
         return reconstructed
 
 
+class GraphPredictionPropagator(nn.Module):
+    """
+    System-level graph propagation for predictions.
+
+    After the per-node temporal predictor generates initial predictions
+    ``{node_type: [N, pred_steps, H]}``, this module propagates them
+    through the brain's connectivity graph so that a change in one brain
+    region's predicted activity influences all its connected neighbours.
+
+    Neuroscientific motivation
+    --------------------------
+    The brain operates as a **coupled dynamical system**.  Stimulating
+    region A (or altering its activity) does not affect A in isolation —
+    the perturbation propagates via white-matter tracts (structural
+    connectivity) and correlated activity (functional connectivity) to
+    regions B, C, D, …  Without this module the predictor treats every
+    node independently, so stimulating a single ROI only alters that
+    ROI's trajectory.  With this module the prediction becomes a
+    system-level forecast: changed activity at A ripples through the
+    graph to its neighbours in proportion to their edge weights.
+
+    Architecture
+    ------------
+    ``num_prop_layers`` rounds of ST-GCN message passing applied to the
+    prediction tensor ``[N, pred_steps, H]``, treating ``pred_steps`` as
+    the temporal dimension (analogous to ``T`` in the encoder).  The
+    same edge connectivity used during encoding is reused here, so the
+    propagator is consistent with the learned representations.
+    Residual connections + LayerNorm keep gradients healthy.
+    """
+
+    def __init__(
+        self,
+        node_types: List[str],
+        edge_types: List[Tuple[str, str, str]],
+        hidden_channels: int,
+        num_prop_layers: int = 2,
+        dropout: float = 0.1,
+    ):
+        """
+        Args:
+            node_types: Node types present in the graph.
+            edge_types: Edge types (same list as the encoder).
+            hidden_channels: Feature dimension H (must match predictor output).
+            num_prop_layers: Number of graph-propagation rounds.  2 is
+                sufficient to reach 2-hop neighbours (e.g. A→B→C), which
+                covers the typical cortical relay distance.
+            dropout: Dropout rate.
+        """
+        super().__init__()
+        self.node_types = node_types
+        self.edge_types = edge_types
+
+        # Stack of ST-GCN layers (temporal_kernel_size=1 ≡ 1×1-conv so
+        # consecutive prediction steps are NOT mixed — each step is
+        # propagated independently, preserving temporal structure).
+        self.prop_layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        for _ in range(num_prop_layers):
+            conv_dict = {}
+            for edge_type in edge_types:
+                conv_dict['__'.join(edge_type)] = SpatialTemporalGraphConv(
+                    in_channels=hidden_channels,
+                    out_channels=hidden_channels,
+                    temporal_kernel_size=1,
+                    use_attention=True,
+                    use_spectral_norm=True,
+                    dropout=dropout,
+                )
+            self.prop_layers.append(nn.ModuleDict(conv_dict))
+            self.layer_norms.append(nn.ModuleDict({
+                nt: nn.LayerNorm(hidden_channels)
+                for nt in node_types
+            }))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        pred_dict: Dict[str, torch.Tensor],
+        data: HeteroData,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Propagate predictions through graph connectivity.
+
+        Args:
+            pred_dict: Initial per-node predictions
+                ``{node_type: Tensor[N, pred_steps, H]}``.
+            data: HeteroData providing ``edge_index`` (and optionally
+                ``edge_attr``) for each edge type.  The node features are
+                NOT read from here — only the topology is used.
+
+        Returns:
+            Propagated predictions ``{node_type: Tensor[N, pred_steps, H]}``.
+            Nodes with no inbound edges in a given layer pass through
+            unchanged (same as the encoder residual convention).
+        """
+        x_dict = {k: v for k, v in pred_dict.items()}
+
+        # Build edge index / attr dicts once (same across layers)
+        edge_index_dict: Dict[Tuple, torch.Tensor] = {}
+        edge_attr_dict: Dict[Tuple, torch.Tensor] = {}
+        for edge_type in self.edge_types:
+            if edge_type in data.edge_types:
+                edge_index_dict[edge_type] = data[edge_type].edge_index
+                if hasattr(data[edge_type], 'edge_attr'):
+                    edge_attr_dict[edge_type] = data[edge_type].edge_attr
+
+        for conv_dict, layer_norm_dict in zip(self.prop_layers, self.layer_norms):
+            x_dict_new: Dict[str, torch.Tensor] = {}
+
+            for node_type, x in x_dict.items():
+                messages = []
+
+                for edge_type in self.edge_types:
+                    src, _, dst = edge_type
+                    if dst != node_type:
+                        continue
+                    if edge_type not in edge_index_dict:
+                        continue
+                    if src not in x_dict:
+                        continue
+
+                    x_src = x_dict[src]
+                    edge_index = edge_index_dict[edge_type]
+                    edge_attr = edge_attr_dict.get(edge_type, None)
+
+                    conv = conv_dict['__'.join(edge_type)]
+                    N_src, N_dst = x_src.shape[0], x.shape[0]
+                    msg = conv(x_src, edge_index, edge_attr, size=(N_src, N_dst))
+
+                    # Align pred_steps dimension if source and destination
+                    # modalities have different prediction lengths.
+                    T_dst = x.shape[1]
+                    if msg.shape[1] != T_dst:
+                        msg = F.interpolate(
+                            msg.permute(0, 2, 1),   # [N, H, T_src]
+                            size=T_dst,
+                            mode='linear',
+                            align_corners=False,
+                        ).permute(0, 2, 1)           # [N, T_dst, H]
+
+                    messages.append(msg)
+
+                # Residual aggregation — same convention as the encoder:
+                # average incoming messages and add as a residual.
+                if messages:
+                    x_new = x + self.dropout(sum(messages) / len(messages))
+                else:
+                    x_new = x  # passthrough when no inbound edges
+
+                # Per-timestep LayerNorm
+                N, T, H = x_new.shape
+                x_new = layer_norm_dict[node_type](x_new.view(N * T, H)).view(N, T, H)
+                x_dict_new[node_type] = x_new
+
+            x_dict = x_dict_new
+
+        return x_dict
+
+
 class GraphNativeBrainModel(nn.Module):
     """
     Complete graph-native brain model.
-    
+
     End-to-end architecture:
     1. Mapper: Build graph from brain data
     2. Encoder: Spatial-temporal encoding on graph
-    3. Predictor: Future prediction on graph
-    4. Decoder: Reconstruct signals
-    
+    3. Predictor: Per-node future prediction (temporal)
+    4. Propagator: System-level graph propagation of predictions
+    5. Decoder: Reconstruct signals
+
     NO sequence conversions - pure graph operations throughout.
+
+    System-level prediction
+    -----------------------
+    Step 3 runs ``EnhancedMultiStepPredictor`` independently on each
+    node's latent time series.  Step 4 (``GraphPredictionPropagator``)
+    then propagates those predictions through the brain's connectivity
+    graph.  This means stimulating a single brain region affects all
+    its neighbours in proportion to their edge weights, producing a
+    scientifically meaningful whole-brain forecast rather than an
+    isolated single-region forecast.
     """
     
     # 潜空间预测切分比例：前 CONTEXT_RATIO 作为 context，余下部分为 future target。
@@ -258,7 +430,7 @@ class GraphNativeBrainModel(nn.Module):
             num_layers=num_decoder_layers,
         )
         
-        # Predictor: Future prediction (optional)
+        # Predictor: per-node temporal future prediction (optional)
         if use_prediction:
             pred_cfg = predictor_config or {}
             self.predictor = EnhancedMultiStepPredictor(
@@ -271,6 +443,21 @@ class GraphNativeBrainModel(nn.Module):
                 num_scales=pred_cfg.get('num_scales', 3),
                 num_windows=pred_cfg.get('num_windows', 3),
                 sampling_strategy=pred_cfg.get('sampling_strategy', 'uniform'),
+            )
+
+            # Prediction propagator: system-level graph diffusion of predictions.
+            # After EnhancedMultiStepPredictor generates independent per-node
+            # trajectories, GraphPredictionPropagator runs num_prop_layers rounds
+            # of graph message-passing so that stimulating one brain region
+            # propagates its predicted activity to connected regions.
+            # num_prop_layers=2 lets signals travel ≥2 hops (A→B→C), covering
+            # the typical cortical relay distance.
+            self.prediction_propagator = GraphPredictionPropagator(
+                node_types=node_types,
+                edge_types=edge_types,
+                hidden_channels=hidden_channels,
+                num_prop_layers=pred_cfg.get('num_prop_layers', 2),
+                dropout=dropout,
             )
     
     def forward(
@@ -340,22 +527,28 @@ class GraphNativeBrainModel(nn.Module):
         # 3. Predict: Future steps (optional)
         predictions = None
         if return_prediction and self.use_prediction:
+            # Step 3a — Per-node temporal prediction.
+            # EnhancedMultiStepPredictor treats N nodes as the batch dimension
+            # (h: [N, T, H]).  Each node's future trajectory is predicted
+            # independently from its own latent history.
             predictions = {}
             for node_type in self.node_types:
                 if node_type in encoded_data.node_types:
                     h = encoded_data[node_type].x  # [N, T, H]
-
-                    # Treat N nodes as the batch dimension.
-                    # EnhancedMultiStepPredictor.forward expects [batch, seq_len, dim].
-                    # h.unsqueeze(0) would produce [1, N, T, H] (4-D) → window sampler
-                    # would fail to unpack 3 dims.  Use h directly so nodes = batch.
-                    # Returns (predictions, targets, uncertainties):
-                    #   predictions: [num_windows, N, prediction_steps, H]
+                    # Returns (pred_windows, targets, uncertainties):
+                    #   pred_windows: [num_windows, N, prediction_steps, H]
                     pred_windows, _, _ = self.predictor(h, return_uncertainty=False)
-
                     # Average across sampled windows → [N, prediction_steps, H]
                     predictions[node_type] = pred_windows.mean(dim=0)
-        
+
+            # Step 3b — System-level graph propagation.
+            # The per-node predictions above are independent.  The propagator
+            # runs graph message-passing on {node_type: [N, pred_steps, H]} so
+            # that stimulating one brain region influences its connected
+            # neighbours — the brain as a coupled dynamical system.
+            if predictions:
+                predictions = self.prediction_propagator(predictions, data)
+
         # 4. Optionally return latent encoded dict for compute_loss prediction loss
         if return_encoded:
             encoded_dict = {
@@ -431,33 +624,53 @@ class GraphNativeBrainModel(nn.Module):
                 
                 losses[f'recon_{node_type}'] = recon_loss
         
-        # ── 潜空间自监督预测损失 ─────────────────────────────────────────
-        # 将编码器潜空间序列切分为 context（前 2/3）→ 预测 future（后 1/3）。
-        # 与旧代码（仅推理时运行预测头）的关键区别：
-        #   旧：预测头参数从不接收梯度信号 → 实为死代码
-        #   新：context/future 均在潜空间 H，可直接 MSE/Huber 比较，预测头真正被训练
-        # 注：该 loss 隐式包含跨模态信息——编码器的 ST-GCN 跨模态边使 fMRI 潜向量中
-        #     已包含 EEG 信息（反之亦然），故"预测 fMRI 潜向量未来"等价于用混合了
-        #     EEG 信息的表征预测混合了 EEG 信息的未来表征。
+        # ── 潜空间自监督预测损失（系统级）──────────────────────────────────
+        # 流程：
+        #   1. 对每个模态，将编码器潜空间序列切分为
+        #      context（前 2/3）→ per-node 预测 future（后 1/3）
+        #   2. 对所有模态的初步预测应用 GraphPredictionPropagator，
+        #      让预测在连通脑区间传播（系统级预测）
+        #   3. 计算传播后的预测 vs. future_target 的损失
+        #
+        # 关键区别（与节点独立预测）：
+        #   旧：每节点独立预测，刺激脑区 A 仅影响 A 的预测轨迹
+        #   新：传播后，A 的预测变化通过图拓扑扩散至相邻脑区 B、C…
+        #       等同于"大脑作为耦合动力学系统"的建模原则
+        #
+        # 注：编码器的 ST-GCN 跨模态边已使 fMRI 潜向量包含 EEG 信息，
+        #     故系统级预测损失隐式覆盖了跨模态预测目标。
         if encoded is not None and self.use_prediction:
+            # Step 1: Per-node temporal predictions for all modalities
+            pred_means: Dict[str, torch.Tensor] = {}
+            future_targets: Dict[str, torch.Tensor] = {}
+
             for node_type in self.node_types:
                 if node_type not in encoded:
                     continue
                 h = encoded[node_type]  # [N, T, H]
                 T = h.shape[1]
                 if T < self._PRED_MIN_SEQ_LEN:
-                    # 序列过短，无法切分 (需 ≥ _PRED_MIN_SEQ_LEN 才能得到非空 context 和 future)
+                    # 序列过短，跳过（需 ≥ _PRED_MIN_SEQ_LEN 才能切分 context/future）
                     continue
                 T_ctx = int(T * self._PRED_CONTEXT_RATIO)
-                context = h[:, :T_ctx, :]           # [N, T_ctx, H]
-                future_target = h[:, T_ctx:, :]     # [N, T_fut, H]
+                context = h[:, :T_ctx, :]       # [N, T_ctx, H]
+                future_target = h[:, T_ctx:, :] # [N, T_fut, H]
 
-                # EnhancedMultiStepPredictor 期望输入 [batch, seq_len, H]；
-                # 以 N 节点为 batch 维度（与 forward() 一致）
-                # 返回 (pred_windows[num_windows, N, pred_steps, H], targets, unc)
+                # EnhancedMultiStepPredictor: nodes treated as batch dim
+                # Returns (pred_windows[W, N, pred_steps, H], targets, unc)
                 pred_windows, _, _ = self.predictor(context, return_uncertainty=False)
-                pred_mean = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+                pred_means[node_type] = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+                future_targets[node_type] = future_target
 
+            # Step 2: System-level graph propagation of predictions.
+            # Allows the predicted activity change at one brain region to
+            # propagate to its neighbours, producing a whole-brain forecast.
+            if pred_means:
+                pred_means = self.prediction_propagator(pred_means, data)
+
+            # Step 3: Prediction loss per modality
+            for node_type, pred_mean in pred_means.items():
+                future_target = future_targets[node_type]
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
                 if aligned_steps > 0:
                     if self.loss_type == 'huber':
@@ -472,6 +685,7 @@ class GraphNativeBrainModel(nn.Module):
                             future_target[:, :aligned_steps, :],
                         )
                     losses[f'pred_{node_type}'] = pred_loss
+
         
         return losses
 

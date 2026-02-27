@@ -224,6 +224,22 @@ fmri_condition_bounds:
 
 ---
 
+### [2026-02-27] 预测器以节点为 batch 维度 → 节点间完全独立，刺激单脑区无法传播
+
+**思维误区**：以为"图模型 + 时间序列预测"就等于"系统级预测"。实际上 `EnhancedMultiStepPredictor(h)` 把 `h[N, T, H]` 的 N 视为 batch 维度，对 N 个节点完全独立预测——图拓扑在预测阶段完全缺失。
+
+**根因**：编码器（ST-GCN）在编码阶段通过图边传递了跨区域信息，但预测头对每个节点单独运行 Transformer，图结构在预测时被丢弃。刺激节点 A 只改变 A 的历史表征 → 只影响 A 的预测 → 其他节点预测轨迹完全不变。
+
+**正确思路**：预测分两步：
+1. **Per-node 时间预测**（`EnhancedMultiStepPredictor`）：各节点独立预测初始轨迹
+2. **系统级图传播**（`GraphPredictionPropagator`）：在预测空间 `{node_type: [N, pred_steps, H]}` 上运行 N 轮 ST-GCN 消息传递，让预测变化通过图拓扑传播
+
+**规则**：任何"对节点集合的预测"，都必须追问：*预测之后，图连通性如何影响相邻节点？* 如果没有图传播步骤，预测就不是系统级的。
+
+**修复版本**：V5.25。`GraphPredictionPropagator`（`num_prop_layers=2`，覆盖 ≥2 跳邻居）注册为 `model.prediction_propagator`，在 `forward()` 和 `compute_loss()` 的预测步骤后均调用。
+
+---
+
 ## 四、文档格式规范（必须遵守）
 
 **项目永远只保留以下四个 MD 文件：**

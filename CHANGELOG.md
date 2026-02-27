@@ -1,10 +1,79 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-27  
-**版本**：V5.24  
+**版本**：V5.25  
 **状态**：生产就绪
 
 ---
+
+## [V5.25] 2026-02-27 — 系统级预测：GraphPredictionPropagator
+
+### 问题背景
+
+用户实验发现：对单脑区施加刺激并运行预测，只有该脑区的后续活动轨迹改变，其他脑区不受影响。这违反了大脑作为耦合动力学系统的基本原则——任何脑区的活动变化必须通过结构/功能连接影响相邻脑区。
+
+### 根因
+
+`GraphNativeBrainModel.forward()` 中的预测逻辑：
+
+```python
+# 旧实现（错误）
+for node_type in self.node_types:
+    h = encoded_data[node_type].x  # [N, T, H]
+    pred_windows, _, _ = self.predictor(h, ...)  # N 个节点被当作独立 batch
+    predictions[node_type] = pred_windows.mean(dim=0)
+```
+
+`EnhancedMultiStepPredictor` 将 `[N, T, H]` 中的 N 作为 batch 维度，对每个节点独立运行 Transformer/GRU。图拓扑在预测阶段**完全缺失**。编码器的 ST-GCN 跨区域信息传递只在编码时发生，预测时没有任何机制让一个脑区的预测变化传播至相邻脑区。
+
+### 修复：GraphPredictionPropagator
+
+新增 `GraphPredictionPropagator` 模块（`graph_native_system.py`），在每节点时间预测之后运行图消息传递：
+
+```
+Step 3a: EnhancedMultiStepPredictor
+         h[N, T, H] → pred_mean[N, pred_steps, H]（per-node，独立）
+
+Step 3b: GraphPredictionPropagator
+         {node_type: pred_mean} + graph edges
+         → num_prop_layers 轮 ST-GCN 消息传递
+         → 刺激节点 A 的预测变化传播至连接的 B, C, D...
+```
+
+**架构细节**：
+- `temporal_kernel_size=1`：每个预测步骤独立传播，保持时间结构
+- `num_prop_layers=2`（可配置）：覆盖 ≥2 跳邻居（A→B→C）
+- 复用 `SpatialTemporalGraphConv` + spectral norm + per-node softmax attention
+- 残差连接 + LayerNorm：与编码器保持一致的归一化惯例
+- 跨模态边（EEG→fMRI）同样参与传播：预测的 EEG 活动变化影响 fMRI 预测
+
+**训练一致性**：`compute_loss()` 的预测损失计算路径同步更新：
+1. 先对所有模态计算初步 `pred_mean`
+2. 用 `prediction_propagator` 传播
+3. 计算传播后预测 vs. `future_target` 的损失
+
+这确保训练信号与推理行为一致——模型学到的是"系统级预测"而非"孤立节点预测"。
+
+### 科学意义
+
+| 特性 | 修复前 | 修复后 |
+|------|--------|--------|
+| 单脑区刺激 | 只影响该区预测 | 传播至所有连接脑区 |
+| 预测语义 | N 个独立时间序列 | 耦合动力学系统预测 |
+| 跨模态影响 | 仅编码阶段 | 编码 + 预测两阶段 |
+| 训练目标 | per-node MSE | system-level MSE（传播后） |
+
+### 配置新增
+
+`configs/default.yaml` 的 `v5_optimization.advanced_prediction` 支持新键：
+
+```yaml
+v5_optimization:
+  advanced_prediction:
+    num_prop_layers: 2   # 预测传播层数（默认 2，覆盖 ≥2 跳邻居）
+```
+
+
 
 ## [V5.24] 2026-02-27 — 多被试多任务联合训练正确性审查
 
