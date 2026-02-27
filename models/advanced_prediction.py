@@ -224,6 +224,20 @@ class HierarchicalPredictor(nn.Module):
             
             self.predictors.append(predictor)
         
+        # Output projection for GRU predictors: maps hidden_dim → input_dim for
+        # autoregressive feedback.  Without this projection, the GRU output
+        # (shape [batch, 1, hidden_dim]) would be fed back as the next input
+        # (which expects shape [batch, 1, input_dim]).  When hidden_dim ≠ input_dim
+        # (the default — hidden_channels × 2 vs hidden_channels) this crashes on
+        # the second autoregressive step.  A Linear projection makes the GRU
+        # design consistent with the standard seq2seq decoder pattern.
+        if predictor_type == 'gru':
+            self.gru_output_projs = nn.ModuleList([
+                nn.Linear(hidden_dim, input_dim) for _ in range(num_scales)
+            ])
+        else:
+            self.gru_output_projs = None
+        
         # Upsampling layers to reconstruct fine scale
         self.upsamplers = nn.ModuleList()
         for i, scale_factor in enumerate(scale_factors[:-1]):  # Skip finest scale
@@ -335,9 +349,16 @@ class HierarchicalPredictor(nn.Module):
                 pred_full = predictor(x_extended, mask=causal_mask)
                 pred = pred_full[:, -future_steps_scaled:, :]
             else:
-                # For GRU, predict autoregressively
+                # For GRU, predict autoregressively.
+                # Pass the per-scale output projection so the GRU hidden output
+                # (hidden_dim) is projected back to input_dim before being fed
+                # as the next-step input (standard seq2seq decoder pattern).
+                output_proj = (
+                    self.gru_output_projs[i]
+                    if self.gru_output_projs is not None else None
+                )
                 pred = self._autoregressive_predict(
-                    predictor, x_down, future_steps_scaled
+                    predictor, x_down, future_steps_scaled, output_proj=output_proj
                 )
             
             # Upsample to finest resolution if needed
@@ -382,10 +403,20 @@ class HierarchicalPredictor(nn.Module):
         predictor: nn.GRU,
         context: torch.Tensor,
         num_steps: int,
+        output_proj: Optional[nn.Linear] = None,
     ) -> torch.Tensor:
-        """Autoregressive prediction with GRU."""
-        batch_size = context.shape[0]
-        
+        """Autoregressive prediction with GRU.
+
+        Args:
+            predictor: GRU module (input_size=input_dim, hidden_size=hidden_dim).
+            context: Context sequence [batch, T, input_dim].
+            num_steps: Number of autoregressive steps to generate.
+            output_proj: Optional Linear(hidden_dim → input_dim) projection.
+                When hidden_dim ≠ input_dim this projection is *required*:
+                without it, the GRU output (shape [B, 1, hidden_dim]) is fed
+                back as the next input (which expects [B, 1, input_dim]),
+                causing a shape mismatch crash on step 2.
+        """
         # Get initial hidden state
         _, hidden = predictor(context)
         
@@ -398,8 +429,11 @@ class HierarchicalPredictor(nn.Module):
             output, hidden = predictor(current, hidden)
             predictions.append(output)
             
-            # Use prediction as next input
-            current = output
+            # Project output back to input_dim before using it as the next
+            # input.  This is the standard GRU decoder pattern: the hidden
+            # representation (hidden_dim) is separate from the input space
+            # (input_dim); a learned projection bridges the two.
+            current = output_proj(output) if output_proj is not None else output
         
         # Concatenate predictions
         return torch.cat(predictions, dim=1)
@@ -755,6 +789,17 @@ class EnhancedMultiStepPredictor(nn.Module):
         else:
             self.predictor = base_predictor
         
+        # Output projection for the simple-GRU (not use_hierarchical) case.
+        # HierarchicalPredictor has its own per-scale projections (gru_output_projs).
+        # Here we need a single projection for the top-level autoregressive loop
+        # in predict_next() / forward() when the predictor IS the raw nn.GRU.
+        # Condition: self.predictor == nn.GRU iff not hierarchical, not transformer,
+        # and not wrapped in UncertaintyAwarePredictor.
+        if not use_hierarchical and not use_transformer and not use_uncertainty:
+            self.gru_output_proj = nn.Linear(hidden_dim, input_dim)
+        else:
+            self.gru_output_proj = None
+        
         # Window sampler
         self.window_sampler = StratifiedWindowSampler(
             context_length=context_length,
@@ -802,7 +847,11 @@ class EnhancedMultiStepPredictor(nn.Module):
                 pred_mean, _ = self.predictor(context, self.prediction_steps)
                 pred_std = None
             else:
-                # Simple GRU
+                # Simple GRU autoregressive rollout.
+                # Use self.gru_output_proj to project GRU output (hidden_dim)
+                # back to input_dim before using it as the next-step input.
+                # Without this projection, step 2+ would receive hidden_dim
+                # features when the GRU expects input_dim → crash.
                 _, hidden = self.predictor(context)
                 
                 # Autoregressive prediction
@@ -811,7 +860,10 @@ class EnhancedMultiStepPredictor(nn.Module):
                 for _ in range(self.prediction_steps):
                     output, hidden = self.predictor(current, hidden)
                     predictions.append(output)
-                    current = output
+                    current = (
+                        self.gru_output_proj(output)
+                        if self.gru_output_proj is not None else output
+                    )
                 pred_mean = torch.cat(predictions, dim=1)
                 pred_std = None
             
@@ -869,14 +921,21 @@ class EnhancedMultiStepPredictor(nn.Module):
         elif self.use_hierarchical:
             pred, _ = self.predictor(context, self.prediction_steps)
         else:
-            # GRU: autoregressive rollout from last context step
+            # GRU: autoregressive rollout from last context step.
+            # Use self.gru_output_proj to project GRU hidden output (hidden_dim)
+            # back to input_dim before using it as the next-step input.
+            # Without this projection, step 2+ would receive hidden_dim features
+            # when the GRU expects input_dim → RuntimeError on the second step.
             _, hidden = self.predictor(context)
             current = context[:, -1:, :]
             preds = []
             for _ in range(self.prediction_steps):
                 output, hidden = self.predictor(current, hidden)
                 preds.append(output)
-                current = output
+                current = (
+                    self.gru_output_proj(output)
+                    if self.gru_output_proj is not None else output
+                )
             pred = torch.cat(preds, dim=1)  # [batch, prediction_steps, H]
 
         return pred

@@ -577,6 +577,61 @@ GroupNorm(num_groups=1, num_channels=C) 将所有 C 个通道作为一个组归�
 
 ---
 
+### [2026-02-27] 预测功能第三轮审查：YAML 与代码默认值不同步 + GRU 自回归维度崩溃
+
+**背景**：第三轮以全新视角独立审查，验证前两轮已修复项的正确性，并寻找新盲区。
+
+---
+
+**盲区 1 — use_uncertainty Python 默认值未与 YAML 同步（P1 逻辑不一致）**
+
+**思维误区**：以为"上一轮改了 YAML 就完成了"，没有检查 Python 代码层的 fallback 默认值。
+
+**根因**：Round 2 已将 `default.yaml` 中 `use_uncertainty` 改为 `false`，并在 AGENTS.md 中记录了意图。但 `graph_native_system.py:446` 中的 Python fallback 默认值仍为 `True`：
+
+```python
+use_uncertainty=pred_cfg.get('use_uncertainty', True),  # ← 仍为 True！
+```
+
+任何不通过 YAML 创建模型的代码（单元测试、API用户、`predictor_config` 缺少该键时）会得到 `True`，创建从未训练的 `uncertainty_head` 参数，浪费显存且误导用户。
+
+**修复**：`True` → `False`（1行改动）。
+
+**规则**：**配置项的 Python fallback 默认值必须与 YAML 默认值保持一致。每次修改 YAML 默认值时，必须同时检索代码中所有对应的 `.get(key, python_default)` 调用并同步修改。**
+
+---
+
+**盲区 2 — GRU 自回归滚动在第2步后崩溃（P0 运行时崩溃）**
+
+**思维误区**：以为"GRU 是简单替代品，没有复杂的维度问题"，没有追问反馈维度是否和输入维度匹配。
+
+**根因**：`EnhancedMultiStepPredictor` 创建时 `hidden_dim = input_dim × 2`（例如 128 → 256）。GRU 的 `input_size=input_dim=128`，`hidden_size=hidden_dim=256`。自回归滚动代码（3处）：
+
+```python
+current = context[:, -1:, :]          # [batch, 1, 128] ✓
+output, hidden = predictor(current)    # output: [batch, 1, 256]
+current = output                       # BUG: 256 ≠ 128 → 第2步崩溃
+```
+
+第2步开始 GRU 收到 256 维输入但只接受 128 维 → `RuntimeError`。
+
+**影响的3处位置**：
+1. `HierarchicalPredictor._autoregressive_predict()` — 触发条件: `use_transformer=False`
+2. `EnhancedMultiStepPredictor.predict_next()` GRU分支 — `use_hierarchical=False, use_transformer=False`
+3. `EnhancedMultiStepPredictor.forward()` GRU分支 — 同上
+
+**修复**：为 GRU 添加输出投影层 `nn.Linear(hidden_dim, input_dim)`，在反馈前将 GRU 输出投影回 input_dim。这是标准 seq2seq 解码器设计模式（隐藏空间 ≠ 输入空间，学习投影桥接两者）。
+
+- `HierarchicalPredictor.__init__`: 添加 `self.gru_output_projs = nn.ModuleList([nn.Linear(hidden_dim, input_dim) × num_scales])`（仅 predictor_type='gru' 时）
+- `_autoregressive_predict()`: 接受 `output_proj` 参数，使用 `current = proj(output) if proj else output`
+- `HierarchicalPredictor.forward()`: 传入 `self.gru_output_projs[i]`
+- `EnhancedMultiStepPredictor.__init__`: 添加 `self.gru_output_proj = nn.Linear(hidden_dim, input_dim)`（仅简单GRU模式）
+- `predict_next()` / `forward()` GRU分支: 使用 `self.gru_output_proj`
+
+**规则**：**任何 GRU/RNN 自回归滚动，第一步的输入维度和输出维度可能不同。反馈前必须确认 output.shape[-1] == input_size。若不同，必须添加投影层。**
+
+---
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -597,8 +652,8 @@ GroupNorm(num_groups=1, num_channels=C) 将所有 C 个通道作为一个组归�
 | validate() 真因果 pred_R²（因果编码） | ✅ 已修复 | V5.31 |
 | HierarchicalPredictor 上采样器 BatchNorm1d→GroupNorm（静默归零修复） | ✅ 已修复 | V5.32 |
 | use_uncertainty 配置文档准确化（默认关闭） | ✅ 已修复 | V5.32 |
-| 跨会话预测 | ⚡ 部分（within-run） | — |
-| 干预响应、自我演化 | ❌ Future work | — |
+| use_uncertainty Python 默认值同步 YAML（True→False） | ✅ 已修复 | V5.33 |
+| GRU 自回归滚动输出投影（维度崩溃修复） | ✅ 已修复 | V5.33 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

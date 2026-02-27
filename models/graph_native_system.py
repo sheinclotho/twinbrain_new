@@ -443,7 +443,7 @@ class GraphNativeBrainModel(nn.Module):
                 prediction_steps=prediction_steps,
                 use_hierarchical=pred_cfg.get('use_hierarchical', True),
                 use_transformer=pred_cfg.get('use_transformer', True),
-                use_uncertainty=pred_cfg.get('use_uncertainty', True),
+                use_uncertainty=pred_cfg.get('use_uncertainty', False),
                 num_scales=pred_cfg.get('num_scales', 3),
                 num_windows=pred_cfg.get('num_windows', 3),
                 sampling_strategy=pred_cfg.get('sampling_strategy', 'uniform'),
