@@ -1047,10 +1047,30 @@ def log_training_summary(
         logger.info("  (无图数据可供分析)")
 
     max_seq = config['training'].get('max_seq_len')
-    if max_seq:
+    w_cfg = config.get('windowed_sampling', {})
+    w_enabled = w_cfg.get('enabled', False)
+    if w_enabled:
+        logger.info(
+            f"  时间窗口采样: ✅ 已启用 (dFC 模式) "
+            f"fMRI窗口={w_cfg.get('fmri_window_size', 50)}TRs, "
+            f"EEG窗口={w_cfg.get('eeg_window_size', 500)}pts, "
+            f"步长={w_cfg.get('stride_fraction', 0.5)}×窗口 → 每被试/run 产生多个训练样本"
+        )
+        if max_seq is not None:
+            logger.warning(
+                f"  ⚠️ windowed_sampling 已启用但 max_seq_len={max_seq} 非 null："
+                f" max_seq_len 在窗口模式下被忽略（全序列用于连通性估计）。"
+                f" 建议将 max_seq_len 设为 null 以明确配置语义。"
+            )
+        else:
+            logger.info(
+                f"  序列截断 max_seq_len: 已忽略（窗口模式下内存由窗口大小控制，"
+                f"全序列用于连通性估计）"
+            )
+    elif max_seq:
         logger.info(f"  序列截断 max_seq_len: {max_seq} (防止 CUDA OOM)")
     else:
-        logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议设置 max_seq_len)")
+        logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议启用 windowed_sampling 或设置 max_seq_len)")
 
     # ── 训练数据组成摘要 ──────────────────────────────────────────
     # 显示每个被试、每个任务的样本数，让用户一眼看出数据是否均衡、
@@ -1240,6 +1260,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         max_grad_norm=config['training'].get('max_grad_norm', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
         augmentation_config=config['training'].get('augmentation'),
+        cuda_clear_interval=config['training'].get('cuda_clear_interval', 50),
     )
     logger.info("✅ 训练器初始化完成")
 

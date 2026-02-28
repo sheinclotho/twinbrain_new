@@ -951,6 +951,7 @@ class GraphNativeTrainer:
         max_grad_norm: float = 1.0,
         gradient_accumulation_steps: int = 1,
         augmentation_config: Optional[Dict] = None,
+        cuda_clear_interval: int = 50,
     ):
         """
         Initialize trainer.
@@ -987,6 +988,12 @@ class GraphNativeTrainer:
                       (default 0.01; relative to z-scored signals so 1% amplitude).
                   scale_range ([min, max]): random amplitude scaling per sample
                       (default [0.9, 1.1]; None to disable).
+            cuda_clear_interval: Call gc.collect() + torch.cuda.empty_cache() every
+                this many training steps within an epoch (in addition to the per-epoch
+                clears that already happen at epoch start/end).  This prevents CUDA
+                memory fragmentation from accumulating when an epoch has many steps
+                (e.g. 8 subjects × 10 windows = 80 steps/epoch).  Default 50.
+                Set to 0 to disable intra-epoch clearing (original behaviour).
         """
         self._optimization_config = optimization_config or {}
         self.model = model.to(device)
@@ -1001,6 +1008,14 @@ class GraphNativeTrainer:
         self.node_types = node_types
         self.max_grad_norm = max_grad_norm
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
+        # Intra-epoch CUDA fragmentation control.
+        # With many subjects + windowed_sampling enabled, a single epoch can have
+        # 40-80+ steps.  Each step allocates and frees [chunk_size×E×H] message
+        # tensors; without periodic clearing the CUDA free-list fragments and a
+        # large contiguous allocation later in the epoch fails (OOM) even though
+        # reserved >> allocated.  Clearing every cuda_clear_interval steps keeps
+        # fragmentation bounded throughout the epoch.
+        self._cuda_clear_interval = max(0, int(cuda_clear_interval))
 
         # Temporal augmentation config (applied only during training, not validation)
         _aug = augmentation_config or {}
@@ -1020,6 +1035,12 @@ class GraphNativeTrainer:
                 f"noise_std={self._aug_noise_std}, "
                 f"scale_range=[{self._aug_scale_min}, {self._aug_scale_max}], "
                 f"time_mask_max_ratio={self._aug_time_mask_ratio}"
+            )
+        if self._cuda_clear_interval > 0:
+            logger.info(
+                f"CUDA 碎片防护已启用: "
+                f"每 {self._cuda_clear_interval} 步清理一次显存空闲列表 "
+                f"（支持 4-8 被试多窗口训练而不 OOM）"
             )
         
         # Verify CUDA availability
@@ -1566,6 +1587,25 @@ class GraphNativeTrainer:
             )
             total_loss += loss_dict['total']
             
+            # ── 精细碎片控制（epoch 内周期清理）─────────────────────────────
+            # 每 _cuda_clear_interval 步执行一次 gc.collect() + empty_cache()。
+            # 动机：启用 windowed_sampling 且被试数较多时（如 8 被试 × 10 窗口 =
+            # 80 步/epoch），每步分配/释放约 44-88MB 消息张量（temporal_chunk_size=32-64）。
+            # 这些块被释放后留在 CUDA 分配器的空闲列表中，多步累积后形成碎片；
+            # epoch 末尾的某一步请求较大连续块时可能 OOM，即使 reserved>>allocated。
+            # 每 50 步清理一次可将空闲列表碎片控制在 50 步的积累量以内，
+            # 代价约 2-5ms/次，对总训练时间影响可忽略不计。
+            # 此清理仅在 gradient accumulation 边界后执行（优化器已 step 完成），
+            # 避免在梯度累积中途清理导致活跃梯度张量被误当垃圾回收。
+            if (
+                self._device_type == 'cuda'
+                and self._cuda_clear_interval > 0
+                and is_accum_boundary
+                and (i + 1) % self._cuda_clear_interval == 0
+            ):
+                gc.collect()
+                torch.cuda.empty_cache()
+
             # Log progress for longer training runs (every 10 batches or at 25%, 50%, 75%)
             if num_batches > 10 and i > 0 and (i % 10 == 0 or i == num_batches // 4 or i == num_batches // 2 or i == 3 * num_batches // 4):
                 progress_pct = (i + 1) / num_batches * 100

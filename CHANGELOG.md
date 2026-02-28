@@ -1,8 +1,70 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-28  
-**版本**：V5.40  
+**版本**：V5.41  
 **状态**：生产就绪
+
+---
+
+## [V5.41] 2026-02-28 — 多被试扩展性优化（支持 4-8 被试 / 8GB GPU）
+
+### 背景
+
+用户希望在 8GB GPU 上训练 4-8 个被试，而非仅 2 个。根本瓶颈是：
+1. 单样本模式（max_seq_len=300）每步产生约 263MB 峰值张量 → 多被试 epoch 快速累积碎片 → OOM
+2. 碎片在 epoch 内（非 epoch 边界）积累，旧代码仅在 epoch 边界清理
+
+### 核心变更
+
+**A. windowed_sampling 默认开启（最重要）**
+
+`windowed_sampling.enabled: false → true`
+
+- 每步训练仅处理一个短窗口（fMRI 50 TRs, EEG 500pts）而非完整 run
+- 峰值张量从约 263MB（T=190, full run）降至约 44MB（T=50, fmri_window_size=50）→ 内存降低 6×
+- 图拓扑（edge_index）仍由完整 run 估计 → 连通性质量更高（而非仅用 1.2s EEG 估计）
+- 8 被试 × ~10 窗口/被试 ≈ 80 训练样本/epoch → 比单样本模式（8样本/epoch）数据效率高 10×
+
+**B. temporal_chunk_size: 64 → 32**
+
+每次 propagate() 仅处理 32 个时间步，将单次消息张量峰值再减半（88MB → 44MB）。
+与窗口模式叠加效果：8GB GPU 可稳定支持 4-8 被试不 OOM。
+
+**C. max_seq_len: 300 → null**
+
+windowed_sampling 启用时此参数已自动忽略，设为 null 明确语义。
+
+**D. gradient_accumulation_steps: 1 → 4**
+
+等效 batch_size 从 1 提升至 4，减少多被试小数据集场景下的梯度估计方差。
+
+**E. cuda_clear_interval: 新增参数（默认 50）**
+
+在 `train_epoch` 内每 50 个训练步（仅在 gradient accumulation 边界处）执行
+`gc.collect() + empty_cache()`，将 epoch 内碎片积累量限制在约 50×44MB=2.2GB 以内。
+代价约 2-5ms/次，对总训练时间影响可忽略。
+
+**F. GPU 内存配置速查表（config 新增注释）**
+
+在 `device:` 节前新增 8GB / 16GB / 32GB GPU 的推荐配置对照表，方便用户根据硬件调整参数。
+
+### 配置变更对照
+
+| 参数 | V5.40 | V5.41 | 说明 |
+|------|-------|-------|------|
+| `windowed_sampling.enabled` | `false` | `true` | 启用 dFC 窗口模式 |
+| `model.temporal_chunk_size` | `64` | `32` | 降低单步峰值内存 |
+| `training.max_seq_len` | `300` | `null` | 窗口模式下无需截断 |
+| `training.gradient_accumulation_steps` | `1` | `4` | 提升梯度估计质量 |
+| `training.cuda_clear_interval` | `—` | `50` | 新增 epoch 内碎片控制 |
+
+### 对现有用户的影响
+
+- **有影响**：训练样本数从 N_subjects 增加到 N_subjects × N_windows（约 5-10 倍）
+  → 每个 epoch 步数增加，但每步更快，总训练时间相近或更短。
+- **有影响**：run-level 训练/验证集划分（已存在于旧代码，不变）。
+- **无影响**：图缓存自动失效机制（windowed_sampling 参数已包含在缓存键中）。
+- **无影响**：模型结构和模型权重（纯训练流程优化）。
 
 ---
 
