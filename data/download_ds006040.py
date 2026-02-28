@@ -19,12 +19,16 @@ openneuro-py 的 ``download()`` 函数在遍历数据集根目录时，无论是
 - 每个文件直接通过 HTTPS 下载，无需 openneuro-py 介入。
 - 若 S3 方式失败（非公共数据集等情况），自动回退到 openneuro-py。
 
-**性能优化（多线程 + 断点续传）**
+**性能优化（多线程 + 文件内并行 + 断点续传）**
 
 - 多线程：``max_concurrent_downloads`` 控制同时下载的文件数（默认 8），
   内部使用 ``ThreadPoolExecutor`` 并行拉取多个文件，充分利用带宽。
-- 断点续传：每个文件先写到 ``.part`` 临时文件；若中断重启，自动检测
-  已有的字节数并发送 ``Range: bytes=<offset>-`` 请求，从断点续传。
+- **文件内并行（intra-file parallelism）**：超过 ``_LARGE_FILE_THRESHOLD``
+  （默认 32 MiB）的大文件会被切分为 ``per_file_connections``（默认 4）段，
+  每段使用独立的 HTTP Range 请求并发下载。在 S3 存在单连接限速（
+  约 15 kB/s）的场景下，4 段并行可将单文件速度提升至 ~4×。
+- 断点续传：每个文件分片先写到 ``.p<N>`` 临时文件；若中断重启，自动检测
+  已有字节数并从断点续传；小文件或单连接模式则沿用 ``.part`` 临时文件。
 - 大分块：``_CHUNK_SIZE`` 提升至 4 MiB，减少系统调用开销，提高吞吐量。
 - 连接复用：每线程内使用长连接 ``httpx.Client``，避免重复 TCP 握手。
 
@@ -49,6 +53,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import shutil
 import sys
 import threading
 import time
@@ -72,6 +77,10 @@ _S3_BASE_URL = f"https://s3.amazonaws.com/{_S3_BUCKET}"
 _S3_XML_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 _CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB per read chunk (up from 64 KiB)
 _MAX_BACKOFF_SECONDS = 60  # cap for exponential retry delay
+# Files larger than this threshold are split into parallel Range-request parts.
+_LARGE_FILE_THRESHOLD = 32 * 1024 * 1024  # 32 MiB
+# Default number of parallel Range connections per large file.
+_DEFAULT_PER_FILE_CONNECTIONS = 4
 
 _TAG_QUERY = """
 query GetLatestTag($datasetId: ID!) {
@@ -157,15 +166,152 @@ def _s3_list_files(prefix: str, timeout: float = 60.0) -> Iterator[Tuple[str, in
             break
 
 
-def _s3_download_file(
+def _assemble_parts(dest: Path, part_paths: List[Path]) -> None:
+    """Concatenate byte-range part files in order into *dest*, then delete them.
+
+    Writes to a ``.part`` staging file first, then atomically renames to *dest*,
+    so the final file is never visible in a partially-written state.
+    """
+    staging = dest.with_suffix(dest.suffix + ".part")
+    with open(staging, "wb") as out:
+        for p in part_paths:
+            with open(p, "rb") as src:
+                shutil.copyfileobj(src, out)
+    staging.replace(dest)
+    for p in part_paths:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _s3_download_file_multipart(
     key: str,
     dest: Path,
+    file_size: int,
+    n_parts: int = _DEFAULT_PER_FILE_CONNECTIONS,
     timeout: float = 600.0,
     max_retries: int = 10,
     file_label: str = "",
     client: Optional[httpx.Client] = None,
 ) -> None:
+    """Download a large file by splitting it into *n_parts* parallel Range requests.
+
+    Each part is written to ``<dest>.p<N>`` while in progress.  If a previous
+    run was interrupted, any already-complete part files are detected by their
+    exact size and skipped, providing per-part resume support.
+
+    After all parts finish, :func:`_assemble_parts` concatenates them into
+    *dest* and removes the temporary ``.p<N>`` files.
+
+    Parameters
+    ----------
+    client:
+        Optional shared ``httpx.Client`` instance.  httpx clients are
+        thread-safe, so passing a single client lets all parts share its
+        connection pool.  If ``None``, each part uses the module-level
+        ``httpx.stream`` function.
+    """
+    url = f"{_S3_BASE_URL}/{key}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    label = file_label or dest.name
+
+    # Divide the file into equal byte ranges.
+    part_size = file_size // n_parts
+    ranges: List[Tuple[int, int]] = []
+    for i in range(n_parts):
+        start = i * part_size
+        end = (start + part_size - 1) if i < n_parts - 1 else (file_size - 1)
+        ranges.append((start, end))
+
+    part_paths = [dest.with_suffix(dest.suffix + f".p{i}") for i in range(n_parts)]
+
+    # Compute already-downloaded bytes so the progress bar starts at the right offset.
+    initial_bytes = sum(
+        min(p.stat().st_size, end - start + 1)
+        for p, (start, end) in zip(part_paths, ranges)
+        if p.exists()
+    )
+
+    pbar_lock = threading.Lock()
+
+    with tqdm(
+        total=file_size,
+        initial=initial_bytes,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        desc=label,
+        leave=False,
+        dynamic_ncols=True,
+    ) as pbar:
+
+        def _download_part(part_idx: int) -> None:
+            start, end = ranges[part_idx]
+            part_path = part_paths[part_idx]
+            expected = end - start + 1
+
+            for attempt in range(1, max_retries + 1):
+                existing = part_path.stat().st_size if part_path.exists() else 0
+                if existing >= expected:
+                    return  # already complete; bytes counted in initial_bytes
+
+                resume_start = start + existing
+                headers: Dict[str, str] = {"Range": f"bytes={resume_start}-{end}"}
+
+                try:
+                    _stream = client.stream if client is not None else httpx.stream
+                    with _stream(  # type: ignore[operator]
+                        "GET", url, headers=headers,
+                        timeout=timeout, follow_redirects=True,
+                    ) as resp:
+                        if resp.status_code == 200 and existing > 0:
+                            # Server ignored Range → restart this part from scratch.
+                            logger.debug("服务端不支持 Range，重新下载分片 %d", part_idx)
+                            existing = 0
+                        resp.raise_for_status()
+
+                        open_mode = "ab" if existing > 0 else "wb"
+                        with open(part_path, open_mode) as fh:
+                            for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
+                                fh.write(chunk)
+                                with pbar_lock:
+                                    pbar.update(len(chunk))
+                    return  # success
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == max_retries:
+                        raise
+                    wait = min(2 ** attempt, _MAX_BACKOFF_SECONDS)
+                    logger.warning(
+                        "文件分片 %s [part %d/%d, bytes %d-%d] 失败"
+                        "（第 %d/%d 次），%d 秒后重试: %s",
+                        label, part_idx + 1, n_parts, start, end,
+                        attempt, max_retries, wait, exc,
+                    )
+                    time.sleep(wait)
+
+        with ThreadPoolExecutor(max_workers=n_parts) as pool:
+            futs = {pool.submit(_download_part, i): i for i in range(n_parts)}
+            for fut in as_completed(futs):
+                fut.result()  # re-raise any unrecoverable part failure
+
+    _assemble_parts(dest, part_paths)
+
+
+def _s3_download_file(
+    key: str,
+    dest: Path,
+    file_size: int = 0,
+    timeout: float = 600.0,
+    max_retries: int = 10,
+    file_label: str = "",
+    client: Optional[httpx.Client] = None,
+    per_file_connections: int = 1,
+) -> None:
     """从 S3 下载单个文件（流式传输，断点续传，含字节级进度条）。
+
+    当 ``per_file_connections > 1`` 且文件大小超过 ``_LARGE_FILE_THRESHOLD``
+    时，自动调用 :func:`_s3_download_file_multipart` 以并行 Range 请求加速。
 
     断点续传逻辑：下载期间写入 ``<dest>.part`` 临时文件，完成后原子重命名。
     若 ``.part`` 文件已存在（上次中断残留），自动发送
@@ -173,10 +319,35 @@ def _s3_download_file(
 
     Parameters
     ----------
+    file_size:
+        Known file size in bytes from the S3 listing (0 = unknown).
+        Required for multipart splitting; if 0, falls back to single-stream.
+    per_file_connections:
+        Number of parallel Range connections to use for this file.
+        Values > 1 trigger multipart mode for files larger than
+        ``_LARGE_FILE_THRESHOLD``.
     client:
         可选的复用 ``httpx.Client`` 实例（多线程场景下每线程传入独立实例）。
         若为 ``None``，则为每次请求临时创建连接。
     """
+    # ── 大文件走并行分片路径 ────────────────────────────────────────────────
+    if per_file_connections > 1 and file_size > _LARGE_FILE_THRESHOLD:
+        _s3_download_file_multipart(
+            key=key,
+            dest=dest,
+            file_size=file_size,
+            n_parts=per_file_connections,
+            timeout=timeout,
+            max_retries=max_retries,
+            file_label=file_label,
+            client=client,
+        )
+        return
+    if per_file_connections > 1 and file_size == 0:
+        logger.debug(
+            "文件大小未知（file_size=0），跳过分片模式，改用单连接下载: %s", key
+        )
+
     url = f"{_S3_BASE_URL}/{key}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_suffix(dest.suffix + ".part")
@@ -250,11 +421,13 @@ def _download_subject_via_s3(
     max_retries: int = 10,
     timeout: float = 60.0,
     max_concurrent_downloads: int = 8,
+    per_file_connections: int = _DEFAULT_PER_FILE_CONNECTIONS,
 ) -> int:
     """通过 S3 公共存储桶下载指定被试的全部文件。
 
     多线程并发下载（由 ``max_concurrent_downloads`` 控制），每线程独立维护
-    ``httpx.Client`` 连接池，支持断点续传。
+    ``httpx.Client`` 连接池，支持断点续传。超过 ``_LARGE_FILE_THRESHOLD``
+    的大文件使用 ``per_file_connections`` 个并行 Range 请求加速。
 
     Returns
     -------
@@ -297,8 +470,8 @@ def _download_subject_via_s3(
         return len(files)
 
     logger.info(
-        "待下载 %d 个文件，跳过 %d 个已完成文件，并发数: %d",
-        len(to_download), skipped, max_concurrent_downloads,
+        "待下载 %d 个文件，跳过 %d 个已完成文件，并发数: %d，每大文件连接数: %d",
+        len(to_download), skipped, max_concurrent_downloads, per_file_connections,
     )
 
     # ── 多线程下载 ──────────────────────────────────────────────────────────
@@ -316,10 +489,12 @@ def _download_subject_via_s3(
             _s3_download_file(
                 key=key,
                 dest=dest,
+                file_size=_size,
                 timeout=600.0,
                 max_retries=max_retries,
                 file_label=rel,
                 client=cli,
+                per_file_connections=per_file_connections,
             )
         return rel
 
@@ -393,6 +568,7 @@ def download_subject(
     max_retries: int = 10,
     metadata_timeout: float = 30.0,
     max_concurrent_downloads: int = 8,
+    per_file_connections: int = _DEFAULT_PER_FILE_CONNECTIONS,
 ) -> None:
     """Download all data files for *subject* from OpenNeuro.
 
@@ -416,6 +592,13 @@ def download_subject(
         Number of files to download in parallel. Defaults to 8.
         Increase for faster downloads on high-bandwidth connections;
         decrease if the server throttles connections.
+    per_file_connections:
+        Number of parallel Range-request connections per large file
+        (files > ``_LARGE_FILE_THRESHOLD`` = 32 MiB). Defaults to 4.
+        When S3 throttles each TCP connection, raising this value
+        multiplies the effective per-file throughput (e.g. 4 connections
+        × 15 kB/s ≈ 60 kB/s per file).  Total connections ≈
+        ``max_concurrent_downloads × per_file_connections``.
     """
     target_dir = Path(target_dir)
     subject_prefix = f"sub-{subject.zfill(3)}"
@@ -436,6 +619,7 @@ def download_subject(
             max_retries=max_retries,
             timeout=metadata_timeout,
             max_concurrent_downloads=max_concurrent_downloads,
+            per_file_connections=per_file_connections,
         )
         if count > 0:
             logger.info("下载完成（S3）: %s / %s，共 %d 个文件", dataset_id, subject_prefix, count)
@@ -475,6 +659,7 @@ def download_subjects(
     dataset_id: str = DATASET_ID,
     max_retries: int = 10,
     metadata_timeout: float = 30.0,
+    per_file_connections: int = _DEFAULT_PER_FILE_CONNECTIONS,
 ) -> None:
     """Download data for multiple subjects sequentially.
 
@@ -492,6 +677,9 @@ def download_subjects(
         Maximum retry attempts per file.
     metadata_timeout:
         Timeout in seconds for GraphQL metadata requests.
+    per_file_connections:
+        Number of parallel Range-request connections per large file.
+        See :func:`download_subject` for details.
     """
     failed: List[str] = []
     with logging_redirect_tqdm():
@@ -510,6 +698,7 @@ def download_subjects(
                         dataset_id=dataset_id,
                         max_retries=max_retries,
                         metadata_timeout=metadata_timeout,
+                        per_file_connections=per_file_connections,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error("下载 sub-%s 失败 (%s): %s", subject, type(exc).__name__, exc)
