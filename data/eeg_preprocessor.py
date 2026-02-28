@@ -16,12 +16,24 @@ class EEGPreprocessor:
         resample_sfreq: float = 250.0,
         use_ica: bool = True,
         drop_non_eeg: bool = False,
+        n_components: float = 0.999999,
     ):
         self.l_freq = l_freq
         self.h_freq = h_freq
         self.resample_sfreq = resample_sfreq
         self.use_ica = use_ica
         self.drop_non_eeg = drop_non_eeg
+        # ICA component count / explained-variance threshold.
+        # A float in (0, 1) is interpreted by MNE as an explained-variance ratio:
+        # it selects however many PCA components are needed to explain that
+        # fraction of variance, automatically skipping near-zero-variance
+        # (numerically unstable) components.
+        # Default 0.999999 follows MNE's own recommendation when the
+        # largest/smallest variance ratio exceeds 1e6 (common after average
+        # referencing, which reduces rank by 1 and can create near-zero
+        # eigenvalues that inflate the condition number).
+        # An integer value (e.g. 20) can also be passed for explicit control.
+        self.n_components = n_components
 
     # ==========================================================
     # 主预处理流程
@@ -69,10 +81,13 @@ class EEGPreprocessor:
         # ----------------------------------------
         if self.use_ica:
             print("[EEG] 运行 ICA...")
-            n_comp = min(20, len(raw.ch_names) - 1)
-
+            # Use self.n_components (default 0.999999, explained-variance ratio).
+            # Passing a float avoids the MNE RuntimeWarning that fires when
+            # an integer n_components causes the selected PCA components to
+            # include near-zero-variance dimensions (variance ratio > 1e6),
+            # which destabilises the mixing-matrix estimation.
             ica = mne.preprocessing.ICA(
-                n_components=n_comp,
+                n_components=self.n_components,
                 random_state=97,
                 max_iter="auto",
             )

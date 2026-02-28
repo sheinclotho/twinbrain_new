@@ -821,6 +821,14 @@ class GraphNativeBrainModel(nn.Module):
                     )
                     continue
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
+                if aligned_steps < pred_mean.shape[1]:
+                    logger.debug(
+                        f"pred_{node_type}: prediction_steps={pred_mean.shape[1]} > "
+                        f"T_fut={future_target.shape[1]}; supervising only "
+                        f"{aligned_steps} steps. "
+                        f"Reduce prediction_steps to <= int(T_window * 1/3) "
+                        f"to eliminate unsupervised prediction steps."
+                    )
                 if aligned_steps > 0:
                     if self.loss_type == 'huber':
                         pred_loss = F.huber_loss(
@@ -951,6 +959,7 @@ class GraphNativeTrainer:
         max_grad_norm: float = 1.0,
         gradient_accumulation_steps: int = 1,
         augmentation_config: Optional[Dict] = None,
+        cuda_clear_interval: int = 50,
     ):
         """
         Initialize trainer.
@@ -987,6 +996,12 @@ class GraphNativeTrainer:
                       (default 0.01; relative to z-scored signals so 1% amplitude).
                   scale_range ([min, max]): random amplitude scaling per sample
                       (default [0.9, 1.1]; None to disable).
+            cuda_clear_interval: Call gc.collect() + torch.cuda.empty_cache() every
+                this many training steps within an epoch (in addition to the per-epoch
+                clears that already happen at epoch start/end).  This prevents CUDA
+                memory fragmentation from accumulating when an epoch has many steps
+                (e.g. 8 subjects × 10 windows = 80 steps/epoch).  Default 50.
+                Set to 0 to disable intra-epoch clearing (original behaviour).
         """
         self._optimization_config = optimization_config or {}
         self.model = model.to(device)
@@ -1001,6 +1016,14 @@ class GraphNativeTrainer:
         self.node_types = node_types
         self.max_grad_norm = max_grad_norm
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
+        # Intra-epoch CUDA fragmentation control.
+        # With many subjects + windowed_sampling enabled, a single epoch can have
+        # 40-80+ steps.  Each step allocates and frees [chunk_size×E×H] message
+        # tensors; without periodic clearing the CUDA free-list fragments and a
+        # large contiguous allocation later in the epoch fails (OOM) even though
+        # reserved >> allocated.  Clearing every cuda_clear_interval steps keeps
+        # fragmentation bounded throughout the epoch.
+        self._cuda_clear_interval = max(0, int(cuda_clear_interval))
 
         # Temporal augmentation config (applied only during training, not validation)
         _aug = augmentation_config or {}
@@ -1020,6 +1043,12 @@ class GraphNativeTrainer:
                 f"noise_std={self._aug_noise_std}, "
                 f"scale_range=[{self._aug_scale_min}, {self._aug_scale_max}], "
                 f"time_mask_max_ratio={self._aug_time_mask_ratio}"
+            )
+        if self._cuda_clear_interval > 0:
+            logger.info(
+                f"CUDA 碎片防护已启用: "
+                f"每 {self._cuda_clear_interval} 步清理一次显存空闲列表 "
+                f"（支持 4-8 被试多窗口训练而不 OOM）"
             )
         
         # Verify CUDA availability
@@ -1117,9 +1146,16 @@ class GraphNativeTrainer:
                     end_factor=1.0,
                     total_iters=warmup_epochs,
                 )
+                # T_0=20: first cosine restart at warmup_epochs+20 (epoch 25 with default warmup=5).
+                # The original T_0=10 caused a premature restart at epoch 15, which spiked LR and
+                # triggered the AdaptiveLossBalancer to misread the transient loss increase as
+                # "pred_eeg converging much slower" → inflated pred_eeg weight rapidly → train_loss
+                # appeared to rise and pred_r2_eeg collapsed (matching the epoch-11/15 divergence
+                # pattern observed in logs).  T_0=20 delays the restart well past the balancer's
+                # warmup stabilisation period.
                 cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     self.optimizer,
-                    T_0=10,    # restart every 10 epochs
+                    T_0=20,    # restart every 20 epochs (was 10)
                     T_mult=2,  # double period after each restart
                     eta_min=learning_rate * 0.01,
                 )
@@ -1130,7 +1166,7 @@ class GraphNativeTrainer:
                 )
                 logger.info(
                     f"LR scheduler: Linear warmup ({warmup_epochs} epochs) "
-                    f"→ CosineAnnealingWarmRestarts(T_0=10, T_mult=2)"
+                    f"→ CosineAnnealingWarmRestarts(T_0=20, T_mult=2)"
                 )
             elif scheduler_type == 'onecycle':
                 # OneCycle (will need total_steps, set in train_epoch)
@@ -1180,6 +1216,7 @@ class GraphNativeTrainer:
                 learning_rate=al_cfg.get('learning_rate', 0.025),
                 warmup_epochs=al_cfg.get('warmup_epochs', 5),
                 modality_energy_ratios=al_cfg.get('modality_energy_ratios', {'eeg': 0.02, 'fmri': 1.0}),
+                task_priorities=al_cfg.get('task_priorities'),
             )
         
         # EEG enhancement
@@ -1450,9 +1487,18 @@ class GraphNativeTrainer:
                 detached_losses = {k: v.detach() for k, v in losses.items()}
                 self.loss_balancer.update_weights(detached_losses)
             
-            # Return loss values
+            # Return loss values.
+            # IMPORTANT: total_raw must be computed BEFORE total is set, because
+            # loss_dict at this point contains only the individual per-task losses
+            # from compute_loss() (e.g. recon_eeg, pred_fmri, eeg_reg …).  The
+            # weighted aggregate 'total' is not yet in loss_dict, so the sum is
+            # the true unweighted task total — not inflated by adaptive weights.
+            # total_raw = unweighted sum → interpretable train_loss metric.
+            # total     = weighted sum  → used for backward; grows when balancer
+            #             increases task weights even if raw losses are stable.
             loss_dict = {k: v.item() for k, v in losses.items()}
-            loss_dict['total'] = total_loss.item()
+            loss_dict['total_raw'] = sum(loss_dict.values())   # unweighted; used as train_loss
+            loss_dict['total'] = total_loss.item()             # weighted; used for backward only
             
             return loss_dict
         
@@ -1564,8 +1610,31 @@ class GraphNativeTrainer:
                 do_optimizer_step=is_accum_boundary,
                 loss_scale=1.0 / ga,
             )
-            total_loss += loss_dict['total']
+            total_loss += loss_dict.get('total_raw', loss_dict['total'])
             
+            # ── 精细碎片控制（epoch 内周期清理）─────────────────────────────
+            # 每 _cuda_clear_interval 步执行一次 gc.collect() + empty_cache()。
+            # 动机：启用 windowed_sampling 且被试数较多时（如 8 被试 × 10 窗口 =
+            # 80 步/epoch），每步分配/释放约 44-88MB 消息张量（temporal_chunk_size=32-64）。
+            # 这些块被释放后留在 CUDA 分配器的空闲列表中，多步累积后形成碎片；
+            # epoch 末尾的某一步请求较大连续块时可能 OOM，即使 reserved>>allocated。
+            # 每 50 步清理一次可将空闲列表碎片控制在 50 步的积累量以内，
+            # 代价约 2-5ms/次，对总训练时间影响可忽略不计。
+            #
+            # ⚠ 注意：不要加 is_accum_boundary 条件。
+            # 原始设计曾用 `is_accum_boundary AND (i+1)%interval==0`，
+            # 但这使得实际触发步为 LCM(ga, interval) 而非 interval：
+            # ga=4, interval=50 → LCM=100，80步/epoch 从不触发（完全无效）。
+            # gc.collect() + empty_cache() 仅回收**已释放**的 CUDA 块，
+            # 不会影响仍在 autograd 图中的梯度张量，故在非边界步也安全。
+            if (
+                self._device_type == 'cuda'
+                and self._cuda_clear_interval > 0
+                and (i + 1) % self._cuda_clear_interval == 0
+            ):
+                gc.collect()
+                torch.cuda.empty_cache()
+
             # Log progress for longer training runs (every 10 batches or at 25%, 50%, 75%)
             if num_batches > 10 and i > 0 and (i % 10 == 0 or i == num_batches // 4 or i == num_batches // 2 or i == 3 * num_batches // 4):
                 progress_pct = (i + 1) / num_batches * 100

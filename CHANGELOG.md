@@ -1,8 +1,108 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-28  
-**版本**：V5.40  
+**版本**：V5.41.1  
 **状态**：生产就绪
+
+---
+
+## [V5.41.1] 2026-02-28 — V5.41 审查修复：cuda_clear_interval LCM 陷阱 + prediction_steps 窗口对齐
+
+### 背景
+
+对 V5.41 进行严格的"假设所有地方都有问题"审查，发现两个交互 bug。
+
+### Bug 1：cuda_clear_interval + gradient_accumulation_steps → LCM 陷阱（P1）
+
+**症状**：`cuda_clear_interval=50` 与 `gradient_accumulation_steps=4` 共存时，碎片防护**完全无效**。
+
+**根因**：旧条件 `is_accum_boundary AND (i+1)%50==0` 要求 (i+1) 是 LCM(4,50)=100 的倍数。
+在典型 80 步/epoch（8被试×10窗口）场景下，i 最大=79，从不满足 → 零次触发。
+
+**修复**：`graph_native_system.py` 移除 `is_accum_boundary` 门控，只保留 `(i+1)%interval==0`。
+- 安全性：`gc.collect()`/`empty_cache()` 仅回收**已释放**块，不影响 autograd 活跃梯度张量
+- 效果：80步epoch中，50步处触发一次，碎片积累量从 80×44MB=3.5GB → 50×44MB=2.2GB
+
+### Bug 2：prediction_steps=30 > fMRI T_fut=17（P1 算力浪费）
+
+**症状**：训练时 43% 的预测步（步骤 18-30）有前向计算但无监督梯度。
+
+**根因**：fMRI 窗口 T=50，`_PRED_CONTEXT_RATIO=2/3` → T_fut=17。`prediction_steps=30`
+导致 `aligned_steps = min(30,17) = 17`，多余的 13 步白白消耗算力和显存。
+
+**修复**：
+- `configs/default.yaml`: `prediction_steps: 30 → 15`（匹配 T_fut=17，零浪费）
+- `models/graph_native_system.py`: `compute_loss()` 新增 debug 日志，当 `prediction_steps > T_fut` 时提示调参方向
+- `configs/default.yaml`: GPU 速查表新增各窗口对应的最优 prediction_steps
+
+### 配置变更对照
+
+| 参数 | V5.41 | V5.41.1 | 说明 |
+|------|-------|---------|------|
+| `model.prediction_steps` | `30` | `15` | 匹配 fMRI 窗口 T_fut=17，0% 浪费 |
+| `cuda_clear_interval 触发条件` | `is_accum_boundary AND (i+1)%50==0` | `(i+1)%50==0` | 修复 LCM 陷阱 |
+
+---
+
+## [V5.41] 2026-02-28 — 多被试扩展性优化（支持 4-8 被试 / 8GB GPU）
+
+### 背景
+
+用户希望在 8GB GPU 上训练 4-8 个被试，而非仅 2 个。根本瓶颈是：
+1. 单样本模式（max_seq_len=300）每步产生约 263MB 峰值张量 → 多被试 epoch 快速累积碎片 → OOM
+2. 碎片在 epoch 内（非 epoch 边界）积累，旧代码仅在 epoch 边界清理
+
+### 核心变更
+
+**A. windowed_sampling 默认开启（最重要）**
+
+`windowed_sampling.enabled: false → true`
+
+- 每步训练仅处理一个短窗口（fMRI 50 TRs, EEG 500pts）而非完整 run
+- 峰值张量从约 263MB（T=190, full run）降至约 44MB（T=50, fmri_window_size=50）→ 内存降低 6×
+- 图拓扑（edge_index）仍由完整 run 估计 → 连通性质量更高（而非仅用 1.2s EEG 估计）
+- 8 被试 × ~10 窗口/被试 ≈ 80 训练样本/epoch → 比单样本模式（8样本/epoch）数据效率高 10×
+
+**B. temporal_chunk_size: 64 → 32**
+
+每次 propagate() 仅处理 32 个时间步，将单次消息张量峰值再减半（88MB → 44MB）。
+与窗口模式叠加效果：8GB GPU 可稳定支持 4-8 被试不 OOM。
+
+**C. max_seq_len: 300 → null**
+
+windowed_sampling 启用时此参数已自动忽略，设为 null 明确语义。
+
+**D. gradient_accumulation_steps: 1 → 4**
+
+等效 batch_size 从 1 提升至 4，减少多被试小数据集场景下的梯度估计方差。
+
+**E. cuda_clear_interval: 新增参数（默认 50）**
+
+在 `train_epoch` 内每 50 个训练步（仅在 gradient accumulation 边界处）执行
+`gc.collect() + empty_cache()`，将 epoch 内碎片积累量限制在约 50×44MB=2.2GB 以内。
+代价约 2-5ms/次，对总训练时间影响可忽略。
+
+**F. GPU 内存配置速查表（config 新增注释）**
+
+在 `device:` 节前新增 8GB / 16GB / 32GB GPU 的推荐配置对照表，方便用户根据硬件调整参数。
+
+### 配置变更对照
+
+| 参数 | V5.40 | V5.41 | 说明 |
+|------|-------|-------|------|
+| `windowed_sampling.enabled` | `false` | `true` | 启用 dFC 窗口模式 |
+| `model.temporal_chunk_size` | `64` | `32` | 降低单步峰值内存 |
+| `training.max_seq_len` | `300` | `null` | 窗口模式下无需截断 |
+| `training.gradient_accumulation_steps` | `1` | `4` | 提升梯度估计质量 |
+| `training.cuda_clear_interval` | `—` | `50` | 新增 epoch 内碎片控制 |
+
+### 对现有用户的影响
+
+- **有影响**：训练样本数从 N_subjects 增加到 N_subjects × N_windows（约 5-10 倍）
+  → 每个 epoch 步数增加，但每步更快，总训练时间相近或更短。
+- **有影响**：run-level 训练/验证集划分（已存在于旧代码，不变）。
+- **无影响**：图缓存自动失效机制（windowed_sampling 参数已包含在缓存键中）。
+- **无影响**：模型结构和模型权重（纯训练流程优化）。
 
 ---
 

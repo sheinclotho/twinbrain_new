@@ -1047,10 +1047,30 @@ def log_training_summary(
         logger.info("  (无图数据可供分析)")
 
     max_seq = config['training'].get('max_seq_len')
-    if max_seq:
+    w_cfg = config.get('windowed_sampling', {})
+    w_enabled = w_cfg.get('enabled', False)
+    if w_enabled:
+        logger.info(
+            f"  时间窗口采样: ✅ 已启用 (dFC 模式) "
+            f"fMRI窗口={w_cfg.get('fmri_window_size', 50)}TRs, "
+            f"EEG窗口={w_cfg.get('eeg_window_size', 500)}pts, "
+            f"步长={w_cfg.get('stride_fraction', 0.5)}×窗口 → 每被试/run 产生多个训练样本"
+        )
+        if max_seq is not None:
+            logger.warning(
+                f"  ⚠️ windowed_sampling 已启用但 max_seq_len={max_seq} 非 null："
+                f" max_seq_len 在窗口模式下被忽略（全序列用于连通性估计）。"
+                f" 建议将 max_seq_len 设为 null 以明确配置语义。"
+            )
+        else:
+            logger.info(
+                f"  序列截断 max_seq_len: 已忽略（窗口模式下内存由窗口大小控制，"
+                f"全序列用于连通性估计）"
+            )
+    elif max_seq:
         logger.info(f"  序列截断 max_seq_len: {max_seq} (防止 CUDA OOM)")
     else:
-        logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议设置 max_seq_len)")
+        logger.info("  序列截断: 未启用 (若序列过长可能 OOM，建议启用 windowed_sampling 或设置 max_seq_len)")
 
     # ── 训练数据组成摘要 ──────────────────────────────────────────
     # 显示每个被试、每个任务的样本数，让用户一眼看出数据是否均衡、
@@ -1240,6 +1260,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         max_grad_norm=config['training'].get('max_grad_norm', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
         augmentation_config=config['training'].get('augmentation'),
+        cuda_clear_interval=config['training'].get('cuda_clear_interval', 50),
     )
     logger.info("✅ 训练器初始化完成")
 
@@ -1275,9 +1296,10 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
     logger.info("=" * 60)
     
     # 训练循环
-    best_val_loss = float('inf')
+    best_val_loss = float('inf')       # always tracked for logging (val_loss value)
+    best_selection_score = float('inf')  # criterion-dependent; drives save + early-stop
     best_epoch = 0
-    best_r2_dict: dict = {}   # R² at best-val-loss epoch, used in credibility summary
+    best_r2_dict: dict = {}   # R² at best epoch, used in credibility summary
     patience_counter = 0
     no_improvement_warning_shown = False
     epoch_times = []
@@ -1290,11 +1312,31 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
     _val_freq = config['training']['val_frequency']
     _early_patience = config['training']['early_stopping_patience']
     _effective_epoch_patience = _val_freq * _early_patience
+
+    # ── 最佳模型选择标准 ─────────────────────────────────────────────────
+    # 'pred_r2'  → 最大化各模态预测 R² 均值（推荐，确保保存预测能力最强的模型）
+    # 'val_loss' → 最小化验证总损失（旧行为，但受 loss 权重影响可能选到重建优先模型）
+    _criterion = config['training'].get('best_model_criterion', 'val_loss')
+
+    def _get_selection_score(vl: float, r2: dict) -> float:
+        """Return a score where LOWER = BETTER model.
+        pred_r2 mode: returns −avg_pred_r2 (negated so lower = higher pred_r2).
+        val_loss mode: returns val_loss unchanged.
+        Falls back to float('inf') when the chosen criterion has no data
+        (e.g. pred_r2 requested but prediction disabled), preventing mixed
+        comparison between negated-R² scores and raw val_loss values."""
+        if _criterion == 'pred_r2':
+            _vals = [v for k, v in r2.items() if k.startswith('pred_r2_')]
+            return -sum(_vals) / len(_vals) if _vals else float('inf')
+        return vl  # 'val_loss'
+
     logger.info(
         f"早停设置: 每 {_val_freq} epoch 验证一次 | "
         f"连续 {_early_patience} 次验证无改善触发早停 | "
         f"等效 {_effective_epoch_patience} epoch 的实际耐心值"
     )
+    _crit_desc = "最大化预测 R²（pred_r2）" if _criterion == 'pred_r2' else "最小化验证损失（val_loss）"
+    logger.info(f"最佳模型选择标准: {_crit_desc}")
 
     for epoch in range(_start_epoch, config['training']['num_epochs'] + 1):
         epoch_start_time = time.time()
@@ -1409,14 +1451,25 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                     )
             
             # Warn if no improvement after many epochs
-            if epoch >= 50 and best_val_loss == float('inf') and not no_improvement_warning_shown:
+            if epoch >= 50 and best_selection_score == float('inf') and not no_improvement_warning_shown:
                 logger.warning("⚠️ No improvement in validation loss after 50 epochs. Check data quality and hyperparameters.")
                 no_improvement_warning_shown = True
             
-            # 保存最佳模型
-            if val_loss < best_val_loss:
-                improvement = (best_val_loss - val_loss) / best_val_loss * 100 if best_val_loss != float('inf') else 100
-                best_val_loss = val_loss
+            # 保存最佳模型（基于 best_model_criterion）
+            _score = _get_selection_score(val_loss, r2_dict)
+            if _score < best_selection_score:
+                # improvement = (old_score − new_score) / |old_score|.
+                # For pred_r2 criterion: score = −avg_pred_r2, so a LOWER score means
+                # HIGHER pred_r2.  The formula still gives a positive improvement % when
+                # pred_r2 increases (e.g. −0.242 → −0.300: improvement = 0.058/0.242 = 24%).
+                # abs() in denominator handles both positive (val_loss) and negative
+                # (−pred_r2) baselines correctly.
+                improvement = (
+                    (best_selection_score - _score) / abs(best_selection_score) * 100
+                    if abs(best_selection_score) > 1e-8 else 100
+                )
+                best_selection_score = _score
+                best_val_loss = val_loss   # always track actual val_loss for logging
                 best_epoch = epoch
                 best_r2_dict = r2_dict.copy()   # 同步记录该 epoch 的 R²
                 patience_counter = 0
@@ -1424,10 +1477,11 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 # 保存检查点
                 trainer.save_checkpoint(best_checkpoint_path, epoch)
                 _r2_at_best = "  ".join(f"{k}={v:.3f}" for k, v in sorted(best_r2_dict.items()))
+                _crit_tag = f"[{_criterion}] " if _criterion != 'val_loss' else ""
                 if improvement != 100:
-                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f}, {_r2_at_best} (提升 {improvement:.1f}%)")
+                    logger.info(f"  🎯 保存最佳模型 {_crit_tag}val_loss={val_loss:.4f}, {_r2_at_best} (提升 {improvement:.1f}%)")
                 else:
-                    logger.info(f"  🎯 保存最佳模型: val_loss={val_loss:.4f}, {_r2_at_best}")
+                    logger.info(f"  🎯 保存最佳模型 {_crit_tag}val_loss={val_loss:.4f}, {_r2_at_best}")
             else:
                 patience_counter += 1
             

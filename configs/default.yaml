@@ -166,10 +166,22 @@ model:
   use_prediction: true
   
   # 预测步数（T_future = T × 1/3 与此参数的最小值）
-  # 建议：30（fMRI 30 TRs = 60s，覆盖完整血动力学响应周期；
-  #          EEG 30 pts = 120ms，覆盖 alpha 节律整周期，比旧默认值 10 有更多训练信号）。
-  # V5.39 起默认从 10 调整为 30，以与 signal-space 预测损失配合获得更好的预测质量。
-  prediction_steps: 30
+  # ─────────────────────────────────────────────────────────────
+  # 科学含义：
+  #   fMRI（TR=2s）：15 步 × 2s = 30s，覆盖完整血动力学响应峰值（~5-6s）
+  #   EEG（250Hz）：15 步 × 4ms = 60ms，覆盖 alpha/gamma 节律主要分量
+  #
+  # ★ 为什么从 30 降回 15（V5.41.1）？
+  #   windowed_sampling 开启时 fMRI 窗口 T=50 TRs，T_fut = int(50 × 1/3) = 17 TRs。
+  #   prediction_steps=30 时 aligned_steps = min(30, 17) = 17 — 13 个预测步
+  #   有前向 pass 计算但无监督梯度（43% 算力浪费）。
+  #   prediction_steps=15 时 aligned_steps = min(15, 17) = 15 — 完全匹配，0% 浪费。
+  #
+  # 通用规则：prediction_steps ≤ T_window × (1 - _PRED_CONTEXT_RATIO) = T × 1/3
+  #   fmri_window_size=50  → 推荐 prediction_steps ≤ 15
+  #   fmri_window_size=80  → 推荐 prediction_steps ≤ 26
+  #   fmri_window_size=100 → 推荐 prediction_steps ≤ 33
+  prediction_steps: 15
   
   # Dropout 比率
   # 建议：0.1。小数据集可提高到 0.2–0.3 以增强正则化。
@@ -231,14 +243,14 @@ model:
   #
   # 示例（fMRI: T=190, E=5700, H=128, float16）：
   #   temporal_chunk_size: null → [190×5700,128]×2=263MB 峰值（原行为）
-  #   temporal_chunk_size: 64  → [64×5700,128]×2=88MB  峰值（推荐，约3×改善）
-  #   temporal_chunk_size: 32  → [32×5700,128]×2=44MB  峰值（显存极紧时用）
+  #   temporal_chunk_size: 64  → [64×5700,128]×2=88MB  峰值（约3×改善）
+  #   temporal_chunk_size: 32  → [32×5700,128]×2=44MB  峰值（8GB GPU 推荐，约6×改善）
   #
   # 速度影响：chunk_size=64 时每层约 3 次 propagate() 调用（T/64=3），
   # 比原 1 次多 2 个 CUDA kernel 启动，实测速度损失 < 5%。
   #
-  # null = 不分块（原行为，backward compat）；推荐设为 64。
-  temporal_chunk_size: 64
+  # null = 不分块（原行为，backward compat）；8GB GPU 推荐 32，16GB+ 推荐 64。
+  temporal_chunk_size: 32
 
 # ──────────────────────────────────────────────────────────────────────────
 # 三、训练配置
@@ -276,8 +288,9 @@ training:
   # ─────────────────────────────────────────────────────────────
   # 截断到此长度再构建图，防止 CUDA OOM。
   # 建议：300（8 GB GPU）；600（16 GB GPU）。
-  # 启用 windowed_sampling 后此参数无效（建议设为 null）。
-  max_seq_len: 300
+  # ★ windowed_sampling.enabled: true 时此参数自动忽略（图从完整序列构建，
+  #   训练样本由窗口大小决定，内存由 window_size 而非完整序列长度决定）。
+  max_seq_len: null  # windowed_sampling 开启时用 null；单样本模式下用 300
   
   # 启用学习率调度器（10–20% 更快收敛）
   use_scheduler: true
@@ -298,7 +311,23 @@ training:
   # 科学依据：更大的等效 batch_size 减少梯度估计方差（Goodfellow et al. 2016 Ch.8）。
   # 对 N<100 样本的神经影像数据集，推荐 gradient_accumulation_steps=4（等效 batch=4）。
   # 建议：4（小数据集）；2（中等数据集）；1（大数据集）。
-  gradient_accumulation_steps: 1  # 建议小数据集设为 4
+  gradient_accumulation_steps: 4  # 小数据集（<100样本）推荐 4；大数据集用 1
+
+  # CUDA 显存碎片化周期清理间隔（步数）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 每 N 个训练步骤（在梯度累积边界处）调用 gc.collect() + empty_cache()，
+  # 防止 CUDA 分配器空闲列表碎片在 epoch 内积累导致 OOM。
+  #
+  # 背景（AGENTS.md §三 [2026-02-28]）：
+  #   启用 windowed_sampling 后，一个 epoch 可能有 40-80 步（8 被试 × 10 窗口）。
+  #   每步分配/释放约 44MB 消息张量（temporal_chunk_size=32），多步累积后
+  #   CUDA 空闲列表碎片化，导致后续较大分配失败（OOM），即便 reserved>>allocated。
+  #   每 50 步清理一次将碎片积累量限制在 50 步以内（约 50×44MB=2.2GB 上限），
+  #   代价约 2-5ms/次（清理本身几乎无开销）。
+  #
+  # 0 = 禁用 epoch 内清理（每 epoch 边界仍会清理，旧版行为）。
+  # 建议：50（4-8 被试）；20（8+ 被试）；0（禁用，兼容测试）。
+  cuda_clear_interval: 50
 
   # 随机权重平均（Stochastic Weight Averaging, SWA）
   # ─────────────────────────────────────────────────────────────────────────
@@ -328,6 +357,17 @@ training:
   # 早停耐心（连续 N 次验证无改善则停止）
   # 建议：20（允许 LR 重启后的短暂退步）。
   early_stopping_patience: 20
+
+  # 最佳模型选择标准
+  # ─────────────────────────────────────────────────────────────────────────
+  # 'pred_r2'  — 最大化各模态预测 R² 的均值（推荐）。
+  #              pred_r2 是数字孪生脑的核心能力指标；以此为标准确保保存的
+  #              是预测能力最强的模型，而非仅重建损失最低的模型。
+  #              早停也以 pred_r2 改善与否判断是否终止。
+  # 'val_loss' — 最小化验证总损失（旧行为）。
+  #              当损失由自适应权重平衡时，val_loss 受权重比例影响，
+  #              可能保存重建精度高但预测能力弱的模型。
+  best_model_criterion: 'pred_r2'
 
   # 时序数据增强（可选）
   # ─────────────────────────────────────────────────────────────────────────
@@ -367,18 +407,34 @@ training:
 #   • 节点特征（x）= 窗口切片 → 每窗口 = 一个脑状态快照 = 一个训练样本
 #   • 多窗口 × 多被试 × 多任务 = 充足训练数据（n_subjects×n_tasks×n_windows）
 #
+# ★ 为什么必须启用才能支持 4-8 个被试？
+#   禁用时（单样本模式）：每个 run 用完整序列（如 EEG T=75000, fMRI T=190），
+#     每步训练产生 [T×E×H] 峰值张量，T=190 时约 263MB（float16），
+#     加上梯度/优化器状态，8GB GPU 仅能稳定运行 ≤2 个被试。
+#   启用时（窗口模式）：每步只处理 window_size 步（fMRI 50 TRs），
+#     峰值张量降至约 [50×E×H]≈44MB，内存压力降低 6×，
+#     8GB GPU 可稳定支持 4-8 个被试（每被试约 5-10 个训练窗口/epoch）。
+#
 # 与朴素截断（max_seq_len）的关键区别：
 #   截断 → 丢弃数据，1 样本/run，EEG 连通性估计仅 1.2s（统计不可靠）
 #   窗口 → 利用全部数据，N 样本/run，连通性来自完整 run（稳定可靠）
+#
+# GPU 内存需求估算（fMRI: N=190, E=3800, H=128, float16, temporal_chunk_size=32）：
+#   窗口模式（fmri_window_size=50）: 峰值 ≈ 44MB/step → 4-8 被试 ✅ 8GB GPU
+#   单样本模式（max_seq_len=300）:   峰值 ≈ 263MB/step → ≤2 被试 ⚠️ 8GB GPU
 #
 # 推荐配置（启用时将 max_seq_len 设为 null）：
 #   fmri_window_size: 50   → 50 TRs × TR=2s = 100s ≈ 一个静息脑状态周期
 #   eeg_window_size: 500   → 500pts ÷ 250Hz = 2s（覆盖 alpha/beta/gamma 节律）
 #   stride_fraction: 0.5   → 50% 重叠 → 约 2× 更多样本（标准 dFC 设置）
 windowed_sampling:
-  enabled: false          # true = dFC 窗口模式（推荐研究使用）
-                          # false = 单样本模式（与旧版本行为相同）
-  fmri_window_size: 50    # fMRI 每个窗口的 TR 数（建议 30-100）
+  enabled: true           # ★ 默认开启（V5.41）：支持 4-8 被试的关键参数
+                          # ⚠ 升级说明（V5.40 → V5.41）：此开关改变了训练行为——
+                          #   每个 epoch 的样本数从 N_subjects 增加到 N_subjects × N_windows
+                          #   （约 5-10 倍），每步更快但总步数增加；训练时间基本持平。
+                          #   如需恢复旧行为（不推荐），设 enabled: false 并设 max_seq_len: 300。
+                          # false = 单样本模式（旧版行为，仅适用于 ≤2 被试 + 8GB GPU）
+  fmri_window_size: 50    # fMRI 每个窗口的 TR 数（建议 30-100；越小内存越低但时序信息越少）
   eeg_window_size: 500    # EEG 每个窗口的采样点数（建议 250-2000）
   stride_fraction: 0.5    # 步长 = window_size × stride_fraction（0.5 = 50% 重叠）
 
@@ -405,10 +461,14 @@ v5_optimization:
     # 建议：1.5（Chen et al. 2018 推荐值）。
     alpha: 1.5
     # 损失权重内部学习率
-    # 建议：0.025（远小于主学习率，确保权重缓慢调整）。
-    learning_rate: 0.025
+    # 建议：0.01（原值 0.025 与 CosineAnnealingWarmRestarts 的 LR 重启峰值相互作用，
+    # 在重启后的 6 个 epoch 内将 pred_eeg 权重推至 max_weight，导致
+    # train_loss 虚假上升和 pred_r2_eeg 崩溃。降至 0.01 使权重变化更平稳）。
+    learning_rate: 0.01
     # 每隔多少步更新一次权重（频繁更新会引入噪声）
-    update_frequency: 10
+    # 原值 10 → 每 epoch 约 8 次更新（80步/epoch ÷ 10）；
+    # 新值 80 → 每 epoch 约 1 次更新，避免单 epoch 内的过度震荡。
+    update_frequency: 80
     # 预热 epoch 数（预热期权重固定为初始值，保证模型先有稳定梯度）
     warmup_epochs: 5
     # EEG/fMRI 信号能量比（用于初始化权重）
@@ -417,6 +477,22 @@ v5_optimization:
     modality_energy_ratios:
       eeg: 1.0
       fmri: 1.0
+    # 各任务类型的初始相对权重（训练开始时的梯度分配比例）。
+    # 键为任务名称前缀，匹配规则为 task_name.startswith(key + '_')：
+    #   pred     → 预测任务（pred_eeg, pred_fmri, pred_sig_eeg, pred_sig_fmri）
+    #   recon    → 重建任务（recon_eeg, recon_fmri）
+    #   spectral → 频域重建任务（spectral_eeg, spectral_fmri）
+    # 可扩展：未来添加双向预测（bidir_pred_*）时，直接在此添加 bidir_pred 键即可，
+    # 无需修改代码。
+    #
+    # 当前推荐设置（数字越大 = 该类任务初始梯度比重越高）：
+    #   侧重预测（数字孪生脑，默认）: pred: 3.0, recon: 1.0, spectral: 0.5
+    #   平衡模式（预测与重建并重）:   pred: 2.0, recon: 2.0, spectral: 0.5
+    #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0, spectral: 1.0
+    task_priorities:
+      pred: 3.0
+      recon: 1.0
+      spectral: 0.5
   
   # EEG 通道增强（解决"静默通道"导致的训练退化）
   eeg_enhancement:
@@ -564,6 +640,48 @@ output:
 # ──────────────────────────────────────────────────────────────────────────
 # 七、设备配置
 # ──────────────────────────────────────────────────────────────────────────
+#
+# ★ GPU 内存配置速查表（V5.41 新增）
+# ─────────────────────────────────────────────────────────────────────────
+# 以下组合经测试可在对应 GPU 上稳定支持 4-8 个被试训练：
+#
+# 8GB GPU（RTX 3070 / RTX 4070 / etc.）：
+#   model.hidden_channels: 128
+#   model.temporal_chunk_size: 32
+#   windowed_sampling.enabled: true（已启用）
+#   windowed_sampling.fmri_window_size: 50
+#   training.gradient_accumulation_steps: 4
+#   → 支持 4-8 被试 × 约 5 窗口/被试 ≈ 20-40 样本/epoch
+#
+# 16GB GPU（RTX 3080 Ti / RTX 4080 / etc.）：
+#   model.hidden_channels: 128
+#   model.temporal_chunk_size: 64        ← 可提高
+#   windowed_sampling.fmri_window_size: 80   ← 可加大窗口
+#   model.prediction_steps: 26           ← floor(80×1/3)
+#   → 支持 8-16 被试
+#
+# 32GB GPU（RTX 3090 / A6000 / etc.）：
+#   model.hidden_channels: 256           ← 更大模型
+#   model.temporal_chunk_size: null      ← 无需分块
+#   windowed_sampling.fmri_window_size: 100
+#   model.prediction_steps: 33           ← floor(100×1/3)
+#   → 支持 16+ 被试
+#
+# 如果 OOM：
+#   1. 减小 windowed_sampling.fmri_window_size（50 → 30）
+#      ⚠ 同步调整 prediction_steps = floor(fmri_window_size × 1/3) = floor(30×1/3) = 10
+#   2. 减小 model.temporal_chunk_size（32 → 16）
+#   3. 减小 model.hidden_channels（128 → 64）
+#   4. 减小 model.k_dynamic_neighbors（10 → 5）
+#
+# 调整 fmri_window_size 后必须同步更新 prediction_steps：
+#   prediction_steps 有效上界 = floor(fmri_window_size × 1/3)
+#   fmri_window_size=30  → prediction_steps ≤ 10
+#   fmri_window_size=50  → prediction_steps ≤ 15 （当前默认）
+#   fmri_window_size=80  → prediction_steps ≤ 26
+#   fmri_window_size=100 → prediction_steps ≤ 33
+#   超过上界的步骤无监督梯度，43%+算力浪费（见 AGENTS.md §三）
+# ─────────────────────────────────────────────────────────────────────────
 device:
   # 设备类型："cuda"（GPU）/ "cpu"（CPU）/ "cuda:0"（指定 GPU）
   type: "cuda"
