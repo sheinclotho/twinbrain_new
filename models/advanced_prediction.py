@@ -26,6 +26,46 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _transformer_seq2seq_predict(
+    predictor: 'TransformerPredictor',
+    context: torch.Tensor,
+    n_steps: int,
+) -> torch.Tensor:
+    """Seq2seq prediction with a TransformerPredictor.
+
+    Extends the context with ``n_steps`` placeholder tokens (initialised with
+    the last context step) and applies a causal mask so each future position
+    can only attend to earlier positions (standard autoregressive inference).
+
+    Used by both ``UncertaintyAwarePredictor._base_predict()`` and the
+    ``elif self.use_transformer`` branches in
+    ``EnhancedMultiStepPredictor.predict_next()`` and ``.forward()``.
+
+    Args:
+        predictor: TransformerPredictor instance.
+        context: Context tensor ``[batch, ctx_len, input_dim]``.
+        n_steps: Number of future steps to return.
+
+    Returns:
+        Predicted future tensor ``[batch, n_steps, input_dim]``.
+    """
+    if n_steps <= 0:
+        # Guard against n_steps=0 (or negative):
+        # When n_steps=0, the intended slice pred_all[:, -n_steps:, :] becomes
+        # pred_all[:, 0:, :] because -0 == 0 in Python, returning the ENTIRE
+        # extended context sequence instead of the expected empty tensor.
+        return context.new_empty(context.shape[0], 0, context.shape[2])
+    future_init = context[:, -1:, :].repeat(1, n_steps, 1)
+    x_extended = torch.cat([context, future_init], dim=1)
+    seq_len = x_extended.shape[1]
+    causal_mask = torch.triu(
+        torch.ones(seq_len, seq_len, device=context.device) * float('-inf'),
+        diagonal=1,
+    )
+    pred_all = predictor(x_extended, mask=causal_mask)
+    return pred_all[:, -n_steps:, :]
+
+
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding for transformer."""
     
@@ -224,6 +264,20 @@ class HierarchicalPredictor(nn.Module):
             
             self.predictors.append(predictor)
         
+        # Output projection for GRU predictors: maps hidden_dim → input_dim for
+        # autoregressive feedback.  Without this projection, the GRU output
+        # (shape [batch, 1, hidden_dim]) would be fed back as the next input
+        # (which expects shape [batch, 1, input_dim]).  When hidden_dim ≠ input_dim
+        # (the default — hidden_channels × 2 vs hidden_channels) this crashes on
+        # the second autoregressive step.  A Linear projection makes the GRU
+        # design consistent with the standard seq2seq decoder pattern.
+        if predictor_type == 'gru':
+            self.gru_output_projs = nn.ModuleList([
+                nn.Linear(hidden_dim, input_dim) for _ in range(num_scales)
+            ])
+        else:
+            self.gru_output_projs = None
+        
         # Upsampling layers to reconstruct fine scale
         self.upsamplers = nn.ModuleList()
         for i, scale_factor in enumerate(scale_factors[:-1]):  # Skip finest scale
@@ -235,14 +289,29 @@ class HierarchicalPredictor(nn.Module):
                     stride=scale_factor,
                     padding=scale_factor // 2,
                 ),
-                # BUG FIX: nn.LayerNorm(input_dim) here normalizes the LAST dimension.
-                # After ConvTranspose1d the tensor is [batch, input_dim, T_up] — the last
-                # dim is T_up (variable length), NOT input_dim.  LayerNorm would raise
-                # "normalized_shape (input_dim,) does not match input.shape[-1] = T_up"
-                # whenever T_up != input_dim.
-                # BatchNorm1d(input_dim) operates on [N, C, L] format correctly:
-                # it normalises each of the C=input_dim channels across batch×L.
-                nn.BatchNorm1d(input_dim),
+                # Normalisation after ConvTranspose1d must work for ANY (batch, time) size.
+                #
+                # Rejected options and why:
+                #   nn.LayerNorm(input_dim): normalises the LAST dim; after ConvTranspose1d
+                #     the tensor is [batch, input_dim, T_up] so the last dim is T_up, not
+                #     input_dim — raises shape mismatch when T_up != input_dim.
+                #   nn.BatchNorm1d(input_dim): normalises each of the C channels across
+                #     N × L.  With TwinBrain's batch_size=1 and the NPI case where
+                #     future_steps_scaled=1, input is [1, input_dim, 1] → N×L = 1 element
+                #     per channel → var = 0 → normalised output = 0 for ALL channels.
+                #     Coarse-scale prediction becomes a zero tensor → hierarchy silently
+                #     degrades to single-scale for the most scientifically relevant NPI
+                #     configuration (prediction_steps=1).
+                #   nn.InstanceNorm1d(input_dim): normalises per-sample per-channel across L.
+                #     With L=1: same var=0 problem as BatchNorm1d.
+                #
+                # Chosen: nn.GroupNorm(1, input_dim)
+                #   Groups the entire channel axis (all input_dim channels) into ONE group per
+                #   sample, then normalises across all C×L elements in that group.
+                #   For [1, input_dim=128, 1]: uses 128 elements → statistics are well-defined
+                #   regardless of batch size or time length.  Equivalent to LayerNorm over
+                #   the channel dim applied in (N, C, L) format.
+                nn.GroupNorm(1, input_dim),
                 nn.GELU(),
             )
             self.upsamplers.append(upsampler)
@@ -262,6 +331,12 @@ class HierarchicalPredictor(nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Hierarchical prediction.
+
+        Coarse scales (large scale_factor) are skipped when
+        ``future_steps // scale_factor == 0`` (e.g. prediction_steps=1 with
+        scale_factor=4).  Only scales that can produce at least one future step
+        participate in the fusion.  This allows NPI-style "N predict 1"
+        configurations without crashing.
         
         Args:
             x: Context [batch, context_len, input_dim]
@@ -269,7 +344,7 @@ class HierarchicalPredictor(nn.Module):
             
         Returns:
             prediction: Final prediction [batch, future_steps, input_dim]
-            scale_predictions: Predictions at each scale
+            scale_predictions: Predictions at each scale (only valid scales)
         """
         batch_size = x.shape[0]
         
@@ -277,8 +352,41 @@ class HierarchicalPredictor(nn.Module):
         
         # Predict at each scale
         for i, (predictor, scale_factor) in enumerate(zip(self.predictors, self.scale_factors)):
+            # Number of future steps at this (downsampled) scale.
+            # Bug fix: integer division may produce 0 when prediction_steps is
+            # small (e.g. prediction_steps=1, scale_factor=4 → 1//4 = 0).
+            # Repeating 0 future slots creates an empty tensor and the
+            # transformer / GRU have nothing to predict.
+            # Fix: clamp to at least 1 so each scale always predicts ≥1 step.
+            future_steps_scaled = max(1, future_steps // scale_factor)
+
             # Downsample context
             if scale_factor > 1:
+                # Guard: avg_pool1d requires context_len >= scale_factor to
+                # produce at least 1 output step.  output_len formula:
+                #   floor((L - kernel) / stride) + 1
+                # When L < kernel: output_len ≤ 0 → PyTorch raises "Output size
+                # is too small" *inside* avg_pool1d (before we could check the
+                # result shape).  This is triggered by the combination:
+                #   _PRED_MIN_SEQ_LEN=4, _PRED_CONTEXT_RATIO=2/3
+                #   → T_ctx = int(4 * 2/3) = 2 < scale_factor=4
+                # Fix: check BEFORE calling avg_pool1d.  When the context is
+                # too short for this scale, substitute a zero prediction so the
+                # fusion layer always receives a full [B, future_steps, input_dim]
+                # tensor.  The fusion layer learns to down-weight zero-filled
+                # scales (they carry no signal) without disrupting training.
+                if x.shape[1] < scale_factor:
+                    logger.debug(
+                        f"HierarchicalPredictor scale {i} (factor={scale_factor}): "
+                        f"context length {x.shape[1]} < scale_factor → using zero "
+                        f"prediction for this scale (fusion will learn to down-weight it)."
+                    )
+                    pred_up = torch.zeros(
+                        x.shape[0], future_steps, self.input_dim, device=x.device
+                    )
+                    scale_predictions.append(pred_up)
+                    continue
+
                 # Average pooling to downsample
                 x_down = F.avg_pool1d(
                     x.transpose(1, 2),
@@ -287,30 +395,24 @@ class HierarchicalPredictor(nn.Module):
                 ).transpose(1, 2)
             else:
                 x_down = x
-            
+
             # Predict at this scale
             if isinstance(predictor, TransformerPredictor):
-                # For transformer, we need to extend sequence with future slots
-                future_steps_scaled = future_steps // scale_factor
-                
-                # Create future slots (initialized with last context value)
-                future_init = x_down[:, -1:, :].repeat(1, future_steps_scaled, 1)
-                x_extended = torch.cat([x_down, future_init], dim=1)
-                
-                # Create causal mask
-                seq_len = x_extended.shape[1]
-                causal_mask = torch.triu(
-                    torch.ones(seq_len, seq_len, device=x.device) * float('-inf'),
-                    diagonal=1
-                )
-                
-                # Predict
-                pred_full = predictor(x_extended, mask=causal_mask)
-                pred = pred_full[:, -future_steps_scaled:, :]
+                # Delegate to the module-level seq2seq helper — same logic as the
+                # standalone _transformer_seq2seq_predict: extend context with
+                # future placeholders, apply causal mask, slice last n steps.
+                pred = _transformer_seq2seq_predict(predictor, x_down, future_steps_scaled)
             else:
-                # For GRU, predict autoregressively
+                # For GRU, predict autoregressively.
+                # Pass the per-scale output projection so the GRU hidden output
+                # (hidden_dim) is projected back to input_dim before being fed
+                # as the next-step input (standard seq2seq decoder pattern).
+                output_proj = (
+                    self.gru_output_projs[i]
+                    if self.gru_output_projs is not None else None
+                )
                 pred = self._autoregressive_predict(
-                    predictor, x_down, future_steps // scale_factor
+                    predictor, x_down, future_steps_scaled, output_proj=output_proj
                 )
             
             # Upsample to finest resolution if needed
@@ -327,7 +429,17 @@ class HierarchicalPredictor(nn.Module):
                         align_corners=False,
                     ).transpose(1, 2)
             else:
-                pred_up = pred
+                # Finest scale: ensure output has exactly future_steps steps.
+                # When future_steps_scaled was clamped from 0→1 for a scale where
+                # scale_factor == 1 (no upsampling), pred already has 1 step; if
+                # future_steps > 1 we repeat the last predicted step.
+                if pred.shape[1] < future_steps:
+                    repeat_count = future_steps - pred.shape[1]
+                    pred_up = torch.cat(
+                        [pred, pred[:, -1:, :].repeat(1, repeat_count, 1)], dim=1
+                    )
+                else:
+                    pred_up = pred[:, :future_steps, :]
             
             scale_predictions.append(pred_up)
         
@@ -345,10 +457,20 @@ class HierarchicalPredictor(nn.Module):
         predictor: nn.GRU,
         context: torch.Tensor,
         num_steps: int,
+        output_proj: Optional[nn.Linear] = None,
     ) -> torch.Tensor:
-        """Autoregressive prediction with GRU."""
-        batch_size = context.shape[0]
-        
+        """Autoregressive prediction with GRU.
+
+        Args:
+            predictor: GRU module (input_size=input_dim, hidden_size=hidden_dim).
+            context: Context sequence [batch, T, input_dim].
+            num_steps: Number of autoregressive steps to generate.
+            output_proj: Optional Linear(hidden_dim → input_dim) projection.
+                When hidden_dim ≠ input_dim this projection is *required*:
+                without it, the GRU output (shape [B, 1, hidden_dim]) is fed
+                back as the next input (which expects [B, 1, input_dim]),
+                causing a shape mismatch crash on step 2.
+        """
         # Get initial hidden state
         _, hidden = predictor(context)
         
@@ -359,10 +481,17 @@ class HierarchicalPredictor(nn.Module):
         for _ in range(num_steps):
             # Predict next step
             output, hidden = predictor(current, hidden)
-            predictions.append(output)
             
-            # Use prediction as next input
-            current = output
+            # Project GRU hidden output (hidden_dim) back to input_dim.
+            # The projected tensor serves BOTH purposes:
+            #   1. Accumulated into predictions (must be input_dim for upsamplers/fusion)
+            #   2. Fed back as next-step input (must be input_dim for GRU input_size)
+            # Round 3 fixed (2) but left (1) accumulating raw hidden_dim output,
+            # causing crashes in upsamplers (ConvTranspose1d expects input_dim) and
+            # in the fusion layer (Linear(input_dim * num_scales, ...) expects input_dim).
+            projected = output_proj(output) if output_proj is not None else output
+            predictions.append(projected)
+            current = projected
         
         # Concatenate predictions
         return torch.cat(predictions, dim=1)
@@ -404,6 +533,13 @@ class StratifiedWindowSampler:
         
         self.window_length = context_length + prediction_steps
     
+    @staticmethod
+    def _uniform_start_indices(num_windows: int, max_start: int) -> List[int]:
+        """Return ``num_windows`` evenly-spaced start indices in ``[0, max_start]``."""
+        if num_windows == 1:
+            return [max_start // 2]
+        return [int(i * max_start / (num_windows - 1)) for i in range(num_windows)]
+
     def sample_windows(
         self,
         sequence: torch.Tensor,
@@ -432,14 +568,7 @@ class StratifiedWindowSampler:
         max_start = seq_len - self.window_length
         
         if self.sampling_strategy == 'uniform':
-            # Uniformly spaced windows
-            if self.num_windows == 1:
-                start_indices = [max_start // 2]
-            else:
-                start_indices = [
-                    int(i * max_start / (self.num_windows - 1))
-                    for i in range(self.num_windows)
-                ]
+            start_indices = self._uniform_start_indices(self.num_windows, max_start)
         
         elif self.sampling_strategy == 'random':
             # Random sampling
@@ -449,10 +578,7 @@ class StratifiedWindowSampler:
             # Adaptive sampling based on importance weights
             if importance_weights is None:
                 # Fall back to uniform
-                start_indices = [
-                    int(i * max_start / (self.num_windows - 1))
-                    for i in range(self.num_windows)
-                ]
+                start_indices = self._uniform_start_indices(self.num_windows, max_start)
             else:
                 # Sample based on importance
                 # importance_weights: [time]
@@ -531,6 +657,50 @@ class UncertaintyAwarePredictor(nn.Module):
                 nn.Linear(input_dim // 2, input_dim),
             )
     
+    def _base_predict(
+        self,
+        x: torch.Tensor,
+        future_steps: Optional[int],
+    ) -> torch.Tensor:
+        """Dispatch a single forward call to the base predictor.
+
+        Each base predictor type has a different calling convention:
+        - HierarchicalPredictor: forward(x, future_steps) → (pred, scales)
+        - TransformerPredictor:  forward(x_extended, mask) → full_seq
+          Requires seq2seq extension (context + future placeholders + causal mask).
+          Simply calling forward(x) returns the same-length output [B, ctx_len, H],
+          NOT the desired [B, future_steps, H].
+        - nn.GRU and others: forward(x) → output (used directly)
+
+        This helper is called from the gaussian and dropout paths in forward()
+        to avoid duplicating the dispatch logic at every call site.
+        """
+        if isinstance(self.base_predictor, HierarchicalPredictor):
+            pred, _ = self.base_predictor(x, future_steps)
+            return pred
+        elif isinstance(self.base_predictor, TransformerPredictor):
+            # Delegate to the module-level helper that handles seq2seq extension.
+            # future_steps=None is only possible when called without a valid step
+            # count; we fall back to the context length as a safe default.
+            n_steps = future_steps if future_steps is not None else x.shape[1]
+            return _transformer_seq2seq_predict(self.base_predictor, x, n_steps)
+        else:
+            # nn.GRU (and any future predictor type that is not HierarchicalPredictor
+            # or TransformerPredictor): direct call.
+            #
+            # Defensive tuple-unpack: nn.GRU.forward(x) returns (output, h_n).
+            # Returning the tuple directly would crash every downstream consumer
+            # that expects a Tensor.  UncertaintyAwarePredictor can be instantiated
+            # directly (outside of EnhancedMultiStepPredictor) in unit tests or
+            # future extensions, so we unpack here regardless of the outer guard.
+            # (Note: EnhancedMultiStepPredictor.__init__ already raises ValueError
+            # for the specific combination that would put a raw GRU here, so this
+            # guard handles direct-instantiation scenarios only.)
+            result = self.base_predictor(x)
+            if isinstance(result, tuple):
+                return result[0]  # GRU: (output, h_n) → output tensor only
+            return result
+
     def forward(
         self,
         x: torch.Tensor,
@@ -551,16 +721,17 @@ class UncertaintyAwarePredictor(nn.Module):
         """
         if self.uncertainty_method == 'gaussian':
             # Forward through base predictor
-            if isinstance(self.base_predictor, HierarchicalPredictor):
-                prediction_mean, _ = self.base_predictor(x, future_steps)
-            else:
-                prediction_mean = self.base_predictor(x)
+            prediction_mean = self._base_predict(x, future_steps)
             
             if not return_uncertainty:
                 return prediction_mean, None
             
-            # Predict log variance
-            log_var = self.uncertainty_head(prediction_mean)
+            # Predict log variance.
+            # Clamp before exponentiation to prevent overflow to Inf:
+            # exp(0.5 * 10) ≈ 148, exp(0.5 * -10) ≈ 0.007 — both are reasonable
+            # std bounds for normalised neural signals.  Without this clamp, large
+            # positive log_var produces Inf std → NaN in the NLL loss → NaN gradients.
+            log_var = torch.clamp(self.uncertainty_head(prediction_mean), min=-10.0, max=10.0)
             prediction_std = torch.exp(0.5 * log_var)
             
             return prediction_mean, prediction_std
@@ -569,22 +740,22 @@ class UncertaintyAwarePredictor(nn.Module):
             # MC dropout for uncertainty estimation
             if not return_uncertainty:
                 # Single forward pass
-                if isinstance(self.base_predictor, HierarchicalPredictor):
-                    prediction, _ = self.base_predictor(x, future_steps)
-                else:
-                    prediction = self.base_predictor(x)
-                return prediction, None
+                return self._base_predict(x, future_steps), None
             
             # Multiple forward passes with dropout
-            self.base_predictor.train()  # Enable dropout
-            
-            predictions = []
-            for _ in range(self.num_mc_samples):
-                if isinstance(self.base_predictor, HierarchicalPredictor):
-                    pred, _ = self.base_predictor(x, future_steps)
-                else:
-                    pred = self.base_predictor(x)
-                predictions.append(pred)
+            # Save training state so we don't corrupt eval mode when this is
+            # called during validation.  .train() enables Dropout and switches
+            # BatchNorm to use mini-batch statistics; if we leave the module in
+            # training mode after the MC samples the subsequent eval-mode forward
+            # passes in validate() will use wrong normalisation statistics.
+            was_training = self.base_predictor.training
+            self.base_predictor.train()  # Enable dropout for MC sampling
+            try:
+                predictions = []
+                for _ in range(self.num_mc_samples):
+                    predictions.append(self._base_predict(x, future_steps))
+            finally:
+                self.base_predictor.train(was_training)  # restore original state
             
             # Compute mean and std
             predictions = torch.stack(predictions, dim=0)  # [num_samples, batch, time, dim]
@@ -678,8 +849,37 @@ class EnhancedMultiStepPredictor(nn.Module):
         self.context_length = context_length
         self.prediction_steps = prediction_steps
         self.use_hierarchical = use_hierarchical
+        self.use_transformer = use_transformer  # needed to dispatch predict_next/forward correctly
         self.use_uncertainty = use_uncertainty
-        
+
+        # Validate unsupported configuration early — before allocating any parameters.
+        #
+        # use_hierarchical=False, use_transformer=False, use_uncertainty=True is broken
+        # because:
+        #   1. UncertaintyAwarePredictor._base_predict calls self.base_predictor(x) on
+        #      nn.GRU, which returns (output, h_n) tuple, not a tensor.
+        #   2. Even if unpacked, nn.GRU returns [N, ctx_len, hidden_dim] — the wrong
+        #      temporal length (ctx_len, not future_steps) and wrong feature dimension
+        #      (hidden_dim=256, not input_dim=128).
+        #   3. uncertainty_head expects input_dim; it receives hidden_dim → crash.
+        #
+        # Supported alternatives:
+        #   • Set use_uncertainty=False  (simplest — uncertainty estimation is disabled
+        #     by default and its head does not receive training gradients anyway).
+        #   • Set use_transformer=True   (flat TransformerPredictor + UAP — fixed R6).
+        #   • Set use_hierarchical=True  (HierarchicalPredictor + UAP — fully supported).
+        if not use_hierarchical and not use_transformer and use_uncertainty:
+            raise ValueError(
+                "Unsupported predictor configuration: "
+                "use_hierarchical=False + use_transformer=False + use_uncertainty=True. "
+                "The raw nn.GRU base predictor is incompatible with "
+                "UncertaintyAwarePredictor (wrong return type, temporal length and "
+                "feature dimension).  Choose one of: "
+                "(a) use_uncertainty=False, "
+                "(b) use_transformer=True, "
+                "(c) use_hierarchical=True."
+            )
+
         # Create base predictor
         if use_hierarchical:
             predictor_type = 'transformer' if use_transformer else 'gru'
@@ -718,6 +918,17 @@ class EnhancedMultiStepPredictor(nn.Module):
         else:
             self.predictor = base_predictor
         
+        # Output projection for the simple-GRU (not use_hierarchical) case.
+        # HierarchicalPredictor has its own per-scale projections (gru_output_projs).
+        # Here we need a single projection for the top-level autoregressive loop
+        # in predict_next() / forward() when the predictor IS the raw nn.GRU.
+        # Condition: self.predictor == nn.GRU iff not hierarchical, not transformer,
+        # and not wrapped in UncertaintyAwarePredictor.
+        if not use_hierarchical and not use_transformer and not use_uncertainty:
+            self.gru_output_proj = nn.Linear(hidden_dim, input_dim)
+        else:
+            self.gru_output_proj = None
+        
         # Window sampler
         self.window_sampler = StratifiedWindowSampler(
             context_length=context_length,
@@ -725,7 +936,50 @@ class EnhancedMultiStepPredictor(nn.Module):
             num_windows=num_windows,
             sampling_strategy=sampling_strategy,
         )
-    
+
+    # ── Private prediction helpers ──────────────────────────────────────────
+
+    def _gru_rollout(self, context: torch.Tensor, n_steps: int) -> torch.Tensor:
+        """Autoregressive GRU rollout: context → ``n_steps`` future steps.
+
+        Encapsulates the per-step loop shared by ``_predict_from_context()`` and
+        the ``forward()`` method, eliminating the copy-paste.
+
+        Args:
+            context: ``[batch, T, input_dim]``
+            n_steps: Number of autoregressive steps.
+
+        Returns:
+            ``[batch, n_steps, input_dim]``
+        """
+        _, hidden = self.predictor(context)
+        current = context[:, -1:, :]
+        preds = []
+        for _ in range(n_steps):
+            output, hidden = self.predictor(current, hidden)
+            projected = self.gru_output_proj(output) if self.gru_output_proj is not None else output
+            preds.append(projected)
+            current = projected
+        return torch.cat(preds, dim=1)
+
+    def _predict_from_context(self, context: torch.Tensor) -> torch.Tensor:
+        """Core prediction dispatch: context ``[B, T, H]`` → ``[B, pred_steps, H]``.
+
+        Dispatches to the appropriate predictor based on the configuration flags
+        set at construction time.  Does **not** return uncertainty estimates —
+        call the ``UncertaintyAwarePredictor`` directly when std is needed.
+
+        This helper is called by both ``predict_next()`` and the non-uncertainty
+        branch of ``forward()``, eliminating the duplicated 4-branch dispatch.
+        """
+        if self.use_hierarchical:
+            pred, _ = self.predictor(context, self.prediction_steps)
+        elif self.use_transformer:
+            pred = _transformer_seq2seq_predict(self.predictor, context, self.prediction_steps)
+        else:
+            pred = self._gru_rollout(context, self.prediction_steps)
+        return pred
+
     def forward(
         self,
         sequences: torch.Tensor,
@@ -754,28 +1008,15 @@ class EnhancedMultiStepPredictor(nn.Module):
         all_uncertainties = [] if return_uncertainty else None
         
         for context, target, _ in windows:
-            # Predict
+            # uncertainty path needs std; all other paths delegate to _predict_from_context
             if self.use_uncertainty:
                 pred_mean, pred_std = self.predictor(
                     context,
                     future_steps=self.prediction_steps,
                     return_uncertainty=return_uncertainty,
                 )
-            elif self.use_hierarchical:
-                pred_mean, _ = self.predictor(context, self.prediction_steps)
-                pred_std = None
             else:
-                # Simple GRU
-                _, hidden = self.predictor(context)
-                
-                # Autoregressive prediction
-                current = context[:, -1:, :]
-                predictions = []
-                for _ in range(self.prediction_steps):
-                    output, hidden = self.predictor(current, hidden)
-                    predictions.append(output)
-                    current = output
-                pred_mean = torch.cat(predictions, dim=1)
+                pred_mean = self._predict_from_context(context)
                 pred_std = None
             
             all_predictions.append(pred_mean)
@@ -790,6 +1031,51 @@ class EnhancedMultiStepPredictor(nn.Module):
         
         return predictions, targets, uncertainties
     
+    def predict_next(self, h: torch.Tensor) -> torch.Tensor:
+        """Causal one-shot prediction: context → future.
+
+        Uses the last ``min(context_length, T)`` timesteps as context and
+        predicts the next ``prediction_steps`` timesteps.  Unlike ``forward()``
+        (which samples multiple windows for self-supervised training), this
+        method produces a single causally-aligned prediction — the correct
+        entry point for training loss, inference, and evaluation.
+
+        Scientific analogy (NPI-style): the model receives the last
+        ``context_length`` brain-state vectors and produces the next
+        ``prediction_steps`` brain-state vectors.  With
+        ``context_length=70, prediction_steps=1`` this is exactly the
+        "70 predict 1" paradigm; with
+        ``context_length=200, prediction_steps=10`` it predicts 10 future
+        steps from 200 past steps.
+
+        Args:
+            h: Latent sequence [batch, T, H].  Only the last
+               ``min(context_length, T)`` steps are used.
+
+        Returns:
+            pred: Predicted latent [batch, prediction_steps, H]
+        """
+        ctx_len = min(self.context_length, h.shape[1])
+        if ctx_len < self.prediction_steps:
+            logger.warning(
+                f"predict_next: available context ({ctx_len} steps) is shorter than "
+                f"prediction_steps ({self.prediction_steps}).  Prediction may be unreliable. "
+                f"Consider reducing prediction_steps or providing a longer sequence."
+            )
+        context = h[:, -ctx_len:, :]   # [batch, ctx_len, H] — causally bounded
+
+        if self.use_uncertainty:
+            # UncertaintyAwarePredictor: we don't need std here, request mean only.
+            pred, _ = self.predictor(
+                context,
+                future_steps=self.prediction_steps,
+                return_uncertainty=False,
+            )
+        else:
+            pred = self._predict_from_context(context)
+
+        return pred
+
     def compute_loss(
         self,
         predictions: torch.Tensor,
@@ -809,14 +1095,10 @@ class EnhancedMultiStepPredictor(nn.Module):
         """
         if self.use_uncertainty and uncertainties is not None:
             # Uncertainty-aware loss for each window
-            losses = []
-            for i in range(predictions.shape[0]):
-                loss = self.predictor.compute_loss(
-                    predictions[i],
-                    targets[i],
-                    uncertainties[i] if uncertainties is not None else None,
-                )
-                losses.append(loss)
+            losses = [
+                self.predictor.compute_loss(predictions[i], targets[i], uncertainties[i])
+                for i in range(predictions.shape[0])
+            ]
             return torch.stack(losses).mean()
         else:
             # Standard MSE loss

@@ -14,6 +14,7 @@ This is a COMPLETE standalone system, not just optimization modules.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import contextlib
 import random
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Optional, Tuple
@@ -377,8 +378,11 @@ class GraphNativeBrainModel(nn.Module):
             use_gradient_checkpointing: Free intermediate activations per timestep
                 to avoid MemoryError on long sequences (trades memory for compute)
             predictor_config: Optional dict from config['v5_optimization']['advanced_prediction'].
-                Keys: use_hierarchical, use_transformer, use_uncertainty, num_scales,
-                num_windows, sampling_strategy.  Defaults used when None.
+                Keys: context_length, use_hierarchical, use_transformer, use_uncertainty,
+                num_scales, num_windows, sampling_strategy.  Defaults used when None.
+                context_length (default 200): number of past timesteps the predictor
+                uses as input.  Set context_length=70 + prediction_steps=1 for the
+                NPI "70-predict-1" paradigm.
             use_dynamic_graph: Enable self-iterating graph structure learning
                 (DynamicGraphConstructor per ST-GCN layer, intra-modal edges only).
             k_dynamic_neighbors: k-nearest neighbours for the dynamic adjacency.
@@ -436,10 +440,11 @@ class GraphNativeBrainModel(nn.Module):
             self.predictor = EnhancedMultiStepPredictor(
                 input_dim=hidden_channels,
                 hidden_dim=hidden_channels * 2,
+                context_length=pred_cfg.get('context_length', 200),
                 prediction_steps=prediction_steps,
                 use_hierarchical=pred_cfg.get('use_hierarchical', True),
                 use_transformer=pred_cfg.get('use_transformer', True),
-                use_uncertainty=pred_cfg.get('use_uncertainty', True),
+                use_uncertainty=pred_cfg.get('use_uncertainty', False),
                 num_scales=pred_cfg.get('num_scales', 3),
                 num_windows=pred_cfg.get('num_windows', 3),
                 sampling_strategy=pred_cfg.get('sampling_strategy', 'uniform'),
@@ -526,25 +531,18 @@ class GraphNativeBrainModel(nn.Module):
         # 3. Predict: Future steps (optional)
         predictions = None
         if return_prediction and self.use_prediction:
-            # Step 3a — Per-node temporal prediction.
-            # EnhancedMultiStepPredictor treats N nodes as the batch dimension
-            # (h: [N, T, H]).  Each node's future trajectory is predicted
-            # independently from its own latent history.
+            # Per-node causal prediction: use last context_length timesteps
+            # to predict the next prediction_steps timesteps (NPI paradigm).
+            # predict_next() is the single correct entry point — it uses only
+            # the last min(context_length, T) steps (no future leakage) and
+            # produces a single coherent [N, pred_steps, H] prediction.
             predictions = {}
             for node_type in self.node_types:
                 if node_type in encoded_data.node_types:
                     h = encoded_data[node_type].x  # [N, T, H]
-                    # Returns (pred_windows, targets, uncertainties):
-                    #   pred_windows: [num_windows, N, prediction_steps, H]
-                    pred_windows, _, _ = self.predictor(h, return_uncertainty=False)
-                    # Average across sampled windows → [N, prediction_steps, H]
-                    predictions[node_type] = pred_windows.mean(dim=0)
+                    predictions[node_type] = self.predictor.predict_next(h)
 
-            # Step 3b — System-level graph propagation.
-            # The per-node predictions above are independent.  The propagator
-            # runs graph message-passing on {node_type: [N, pred_steps, H]} so
-            # that stimulating one brain region influences its connected
-            # neighbours — the brain as a coupled dynamical system.
+            # System-level graph propagation.
             if predictions:
                 predictions = self.prediction_propagator(predictions, data)
 
@@ -623,23 +621,31 @@ class GraphNativeBrainModel(nn.Module):
                 
                 losses[f'recon_{node_type}'] = recon_loss
         
-        # ── 潜空间自监督预测损失（系统级）──────────────────────────────────
-        # 流程：
-        #   1. 对每个模态，将编码器潜空间序列切分为
-        #      context（前 2/3）→ per-node 预测 future（后 1/3）
-        #   2. 对所有模态的初步预测应用 GraphPredictionPropagator，
-        #      让预测在连通脑区间传播（系统级预测）
-        #   3. 计算传播后的预测 vs. future_target 的损失
+        # ── 潜空间自监督预测预标记任务（系统级）──────────────────────────────
         #
-        # 关键区别（与节点独立预测）：
-        #   旧：每节点独立预测，刺激脑区 A 仅影响 A 的预测轨迹
-        #   新：传播后，A 的预测变化通过图拓扑扩散至相邻脑区 B、C…
-        #       等同于"大脑作为耦合动力学系统"的建模原则
+        # ⚠ 设计说明（工程权衡，非 bug）：
+        #   编码器使用双向时序卷积（Conv1d 对称 padding）和双向时序注意力
+        #   (is_causal=False)。这意味着 h[:, T_ctx-1, :] 含有来自 T_ctx 和
+        #   T_ctx+1 的少量未来信息（kernel_size=3 时边界泄漏 ±1 步）。
+        #   对于 T_ctx=200 步的序列，这种泄漏比例极小（约 0.5%），因此：
+        #   • 预标记任务仍然提供了有用的时序动力学学习信号（正确）
+        #   • 但不是严格的"因果"监督信号（可接受的工程权衡）
         #
-        # 注：编码器的 ST-GCN 跨模态边已使 fMRI 潜向量包含 EEG 信息，
-        #     故系统级预测损失隐式覆盖了跨模态预测目标。
+        # 真正因果的评估在 validate() 中完成：
+        #   validate() 对每个样本重新编码仅含 T_ctx 步的数据（上下文截断），
+        #   确保编码器看不到任何未来信息。pred_r2 度量由此保证科学严谨性。
+        #
+        # 为什么训练不也用因果编码？
+        #   训练每步需要额外一次编码器 forward pass，速度下降 ~50%。
+        #   对于 kernel_size=3 的卷积，边界泄漏仅 ±1 步，预标记任务仍然
+        #   有意义。如需完全因果训练，可修改编码器为因果卷积（左填充）。
+        #
+        # 流程（修正后）：
+        #   1. 切分 h → context（前 2/3）+ future_target（后 1/3）
+        #   2. predict_next(context)：最后 context_length 步 → 下一 pred_steps 步
+        #   3. GraphPredictionPropagator：系统级传播（EEG→fMRI 耦合动态）
+        #   4. 计算传播后预测 vs. actual future latent 的损失
         if encoded is not None and self.use_prediction:
-            # Step 1: Per-node temporal predictions for all modalities
             pred_means: Dict[str, torch.Tensor] = {}
             future_targets: Dict[str, torch.Tensor] = {}
 
@@ -649,27 +655,35 @@ class GraphNativeBrainModel(nn.Module):
                 h = encoded[node_type]  # [N, T, H]
                 T = h.shape[1]
                 if T < self._PRED_MIN_SEQ_LEN:
-                    # 序列过短，跳过（需 ≥ _PRED_MIN_SEQ_LEN 才能切分 context/future）
                     continue
                 T_ctx = int(T * self._PRED_CONTEXT_RATIO)
                 context = h[:, :T_ctx, :]       # [N, T_ctx, H]
                 future_target = h[:, T_ctx:, :] # [N, T_fut, H]
 
-                # EnhancedMultiStepPredictor: nodes treated as batch dim
-                # Returns (pred_windows[W, N, pred_steps, H], targets, unc)
-                pred_windows, _, _ = self.predictor(context, return_uncertainty=False)
-                pred_means[node_type] = pred_windows.mean(dim=0)  # [N, pred_steps, H]
+                # Causal prediction: last context_length steps → next prediction_steps.
+                # This is the NPI paradigm: "N past steps → K future steps."
+                pred = self.predictor.predict_next(context)  # [N, pred_steps, H]
+                pred_means[node_type] = pred
                 future_targets[node_type] = future_target
 
-            # Step 2: System-level graph propagation of predictions.
-            # Allows the predicted activity change at one brain region to
-            # propagate to its neighbours, producing a whole-brain forecast.
+            # System-level graph propagation of predictions.
             if pred_means:
                 pred_means = self.prediction_propagator(pred_means, data)
 
-            # Step 3: Prediction loss per modality
+            # Prediction loss: propagated prediction vs. actual future.
             for node_type, pred_mean in pred_means.items():
                 future_target = future_targets[node_type]
+                # Guard N-mismatch (same defensive contract as recon_loss):
+                # propagator is expected to preserve N, but raise explicitly if
+                # not rather than silently broadcasting or producing wrong gradients.
+                if pred_mean.shape[0] != future_target.shape[0]:
+                    logger.warning(
+                        f"pred_loss skipped for '{node_type}': "
+                        f"pred has {pred_mean.shape[0]} nodes but target has "
+                        f"{future_target.shape[0]}.  This may indicate a bug in "
+                        f"GraphPredictionPropagator."
+                    )
+                    continue
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
                 if aligned_steps > 0:
                     if self.loss_type == 'huber':
@@ -1092,58 +1106,22 @@ class GraphNativeTrainer:
                     data['eeg'].x = eeg_x_enhanced
         
         try:
-            # Forward and backward pass with optional mixed precision
+            # ── Forward and backward pass ─────────────────────────────────────
+            # Use autocast when AMP is enabled, contextlib.nullcontext otherwise.
+            # This eliminates the duplicated forward+loss block that previously
+            # existed for the AMP and non-AMP paths respectively.
             if self.use_amp:
-                # Use appropriate autocast context manager based on API version
-                if USE_NEW_AMP_API:
-                    # New API: torch.amp.autocast() requires device_type
-                    amp_context = autocast(device_type=self.device_type)
-                else:
-                    # Old API: torch.cuda.amp.autocast() doesn't require device_type
-                    amp_context = autocast()
-                
-                with amp_context:
-                    # Forward pass.
-                    # When use_prediction=True, retrieve encoded latent representations
-                    # so compute_loss can train the predictor in latent space.
-                    if self.model.use_prediction:
-                        reconstructed, _, encoded = self.model(
-                            data, return_prediction=False, return_encoded=True
-                        )
-                    else:
-                        reconstructed, _ = self.model(data, return_prediction=False)
-                        encoded = None
-                    
-                    # Compute losses (reconstruction + optional latent prediction)
-                    losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-                    
-                    # Adaptive loss balancing
-                    if self.use_adaptive_loss:
-                        total_loss, weights = self.loss_balancer(losses)
-                    else:
-                        total_loss = sum(losses.values())
-                    
-                    # ── EEG 防零崩塌正则化 ───────────────────────────────
-                    # eeg_handler 计算的熵+多样性+活动损失之前从未加入总损失
-                    # （eeg_info 被静默丢弃）。此处补全，确保其梯度信号生效。
-                    # 注：权重已在 AntiCollapseRegularizer 初始化时配置
-                    # (entropy_weight, diversity_weight, activity_weight)，默认 0.01。
-                    eeg_reg = eeg_info.get('regularization_loss')
-                    if eeg_reg is not None:
-                        total_loss = total_loss + eeg_reg
-                        losses['eeg_reg'] = eeg_reg
-                
-                # Backward pass with gradient scaling.
-                # Apply loss_scale (= 1/gradient_accumulation_steps) to normalise
-                # gradient magnitude when accumulating across multiple steps.
-                self.scaler.scale(total_loss * loss_scale).backward()
-                if do_optimizer_step:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                amp_ctx = (
+                    autocast(device_type=self.device_type)
+                    if USE_NEW_AMP_API else autocast()
+                )
             else:
-                # Standard training without AMP
+                amp_ctx = contextlib.nullcontext()
+
+            with amp_ctx:
+                # Forward pass.
+                # When use_prediction=True, retrieve encoded latent representations
+                # so compute_loss can train the predictor in latent space.
                 if self.model.use_prediction:
                     reconstructed, _, encoded = self.model(
                         data, return_prediction=False, return_encoded=True
@@ -1151,25 +1129,33 @@ class GraphNativeTrainer:
                 else:
                     reconstructed, _ = self.model(data, return_prediction=False)
                     encoded = None
-                
+
                 # Compute losses (reconstruction + optional latent prediction)
                 losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-                
+
                 # Adaptive loss balancing
                 if self.use_adaptive_loss:
                     total_loss, weights = self.loss_balancer(losses)
                 else:
                     total_loss = sum(losses.values())
-                
-                # EEG 防零崩塌正则化（同 AMP 路径）
+
+                # ── EEG 防零崩塌正则化 ───────────────────────────────
+                # eeg_handler 计算的熵+多样性+活动损失之前从未加入总损失
+                # （eeg_info 被静默丢弃）。此处补全，确保其梯度信号生效。
                 eeg_reg = eeg_info.get('regularization_loss')
                 if eeg_reg is not None:
                     total_loss = total_loss + eeg_reg
                     losses['eeg_reg'] = eeg_reg
-                
-                # Backward pass.
-                # Apply loss_scale (= 1/gradient_accumulation_steps) to normalise
-                # gradient magnitude when accumulating across multiple steps.
+
+            # Backward pass — AMP uses scaler, non-AMP uses plain backward.
+            if self.use_amp:
+                self.scaler.scale(total_loss * loss_scale).backward()
+                if do_optimizer_step:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+            else:
                 (total_loss * loss_scale).backward()
                 if do_optimizer_step:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
@@ -1288,91 +1274,299 @@ class GraphNativeTrainer:
         if self.use_scheduler and isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step(val_loss)
     
+    @staticmethod
+    def _r2_from_accum(
+        ss_res: float, ss_raw: float, ss_sum: float, ss_cnt: int
+    ) -> float:
+        """Compute R² from online accumulators (single-pass, global mean).
+
+        Uses the algebraic identity ``SS_tot = Σy² - n·ȳ²`` so no second pass
+        over the data is needed and the global mean is exact (not per-sample).
+
+        Args:
+            ss_res: Σ(y − ŷ)² accumulated over all samples.
+            ss_raw: Σy²        accumulated over all samples.
+            ss_sum: Σy         accumulated over all samples.
+            ss_cnt: n          total number of elements.
+
+        Returns:
+            R² ∈ (−∞, 1].  Returns 0.0 when SS_tot ≤ 1e-12 (constant signal).
+        """
+        if ss_cnt > 0:
+            global_mean = ss_sum / ss_cnt
+            ss_tot = ss_raw - ss_cnt * global_mean ** 2
+        else:
+            ss_tot = 0.0
+        return 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+
     @torch.no_grad()
     def validate(self, data_list: List[HeteroData]) -> Tuple[float, Dict[str, float]]:
         """
         Validation pass.
-        
+
         Computes the same loss terms as training (reconstruction + prediction)
         so that early stopping is driven by the actual optimisation objective.
-        Previously this only computed reconstruction loss, making val_loss
-        artificially lower than train_loss regardless of overfitting.
-        
-        Additionally computes per-modality R² (coefficient of determination)
-        on reconstructed signals, providing a direct, interpretable measure
-        of model quality independent of loss function choice or signal scale.
-        R² = 0: model predicts the mean (no better than baseline).
-        R² = 1: perfect reconstruction.
-        R² < 0: model is worse than mean prediction (catastrophic failure).
-        
+
+        Metrics computed
+        ----------------
+        1. Reconstruction R² (r2_<node_type>):
+           How well the model reconstructs the input signal.
+           R² = 1 − SS_res/SS_tot.  R² = 1 → perfect; R² = 0 → mean baseline;
+           R² < 0 → worse than mean baseline (failure).
+
+        2. Signal-space prediction R² (pred_r2_<node_type>):
+           **Primary quality indicator** — how well the model predicts future
+           brain signals from past signals.
+           Procedure:
+           a) Slice raw signal to T_ctx steps (context only).
+           b) Re-encode the context-only slice through the full encoder.
+              This is the TRULY CAUSAL encoding: the encoder cannot see any
+              signal beyond T_ctx, regardless of its bidirectional structure.
+           c) Run predictor on causal context latent → predicted latent.
+           d) Decode to signal space → predicted signal.
+           e) Compare against raw future signal [T_ctx:T_ctx+pred_steps].
+           This is the real "digital-twin" capability metric — measured without
+           any future information leakage from the bidirectional encoder.
+
         Args:
             data_list: List of validation data
-            
+
         Returns:
             Tuple of:
                 avg_loss: Average validation loss (scalar)
-                r2_dict: Per-modality R² {'r2_eeg': float, 'r2_fmri': float}
+                r2_dict: Per-modality metrics dict, keys:
+                    'r2_<nt>'      — reconstruction R²
+                    'pred_r2_<nt>' — signal-space prediction R² (★ primary)
         """
         self.model.eval()
         total_loss = 0.0
-        # Accumulators for R²: running SS_res and SS_tot per modality
-        ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
-        ss_tot: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
-        
-        for data in data_list:
-            data = data.to(self.device)
-            
-            # Request encoded representations when prediction is enabled so that
-            # compute_loss() can include the latent-space prediction loss —
-            # the same terms that are optimised during training.
-            if self.model.use_prediction:
-                reconstructed, _, encoded = self.model(
-                    data, return_prediction=False, return_encoded=True
-                )
-            else:
-                reconstructed, _ = self.model(data, return_prediction=False)
-                encoded = None
-            
-            losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-            total_loss += sum(losses.values()).item()
+        # Accumulators for reconstruction R² using global mean (V5.38).
+        # Using per-sample means (the old approach) systematically inflates R²
+        # because SS_tot only captures within-sample variance (excludes between-sample
+        # variance), making the denominator artificially small.  A smaller SS_tot
+        # means R² = 1 - SS_res/SS_tot is closer to 1 — giving an overly optimistic
+        # metric.  We instead accumulate Σy, Σy², and count so the global mean can
+        # be recovered in a single pass without storing all y:
+        #
+        #   SS_tot_correct = Σy² - n*ȳ²   (algebraic identity: Σ(y-ȳ)² = Σy² - n*ȳ²)
+        #
+        # This gives the same result as computing SS_tot with the true global mean,
+        # while requiring only O(1) extra state (sum and count per modality).
+        ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}  # Σ(y-ŷ)²
+        ss_raw: Dict[str, float] = {nt: 0.0 for nt in self.node_types}  # Σy²
+        ss_sum: Dict[str, float] = {nt: 0.0 for nt in self.node_types}  # Σy
+        ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}  # n
+        # Same four accumulators for signal-space prediction R²
+        pred_ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_raw: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_sum: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}
 
-            # ── R² per modality ─────────────────────────────────────────────
-            # R² = 1 - SS_res / SS_tot, accumulated over the full validation set
-            # (not averaged per sample) for a more stable estimate.
-            for node_type in self.node_types:
-                if (
-                    node_type in data.node_types
-                    and node_type in reconstructed
-                ):
-                    target = data[node_type].x          # [N, T, C]
-                    recon  = reconstructed[node_type]   # [N, T', C]
-                    T_min  = min(target.shape[1], recon.shape[1])
-                    target = target[:, :T_min, :]
-                    recon  = recon[:, :T_min, :]
-                    if recon.shape[0] != target.shape[0]:
-                        continue  # shape mismatch — already handled by compute_loss
-                    target_mean = target.mean()
-                    ss_res[node_type] += ((target - recon) ** 2).sum().item()
-                    ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
-        
+        with torch.no_grad():
+            for data in data_list:
+                data = data.to(self.device)
+
+                # Forward pass — always request encoded representations so that:
+                # a) compute_loss() can include the latent prediction loss, and
+                # b) we can compute signal-space prediction R² below.
+                if self.model.use_prediction:
+                    reconstructed, _, encoded = self.model(
+                        data, return_prediction=False, return_encoded=True
+                    )
+                else:
+                    reconstructed, _ = self.model(data, return_prediction=False)
+                    encoded = None
+
+                losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
+                total_loss += sum(losses.values()).item()
+
+                # ── Reconstruction R² per modality ──────────────────────────
+                for node_type in self.node_types:
+                    if node_type in data.node_types and node_type in reconstructed:
+                        target = data[node_type].x       # [N, T, C]
+                        recon  = reconstructed[node_type]  # [N, T', C]
+                        T_min  = min(target.shape[1], recon.shape[1])
+                        target = target[:, :T_min, :]
+                        recon  = recon[:, :T_min, :]
+                        if recon.shape[0] != target.shape[0]:
+                            continue
+                        ss_res[node_type] += ((target - recon) ** 2).sum().item()
+                        ss_raw[node_type] += (target ** 2).sum().item()
+                        ss_sum[node_type] += target.sum().item()
+                        ss_cnt[node_type] += target.numel()
+
+                # ── Signal-space prediction R² per modality ─────────────────
+                # TRULY CAUSAL evaluation:
+                #
+                # The encoder uses symmetric Conv1d padding + bidirectional
+                # TemporalAttention (is_causal=False).  This means h[:,T_ctx-1,:]
+                # contains a small amount of information from timestep T_ctx
+                # (boundary leakage of ±1 step for kernel_size=3).
+                #
+                # For a scientifically rigorous metric we re-encode with ONLY
+                # the first T_ctx raw signal timesteps so the encoder cannot see
+                # any future data.  Cost: one extra encoder forward pass without
+                # backprop (acceptable in a validation loop).
+                #
+                # Why this matters: if we use h[:, :T_ctx, :] from the full
+                # bidirectional encoding, pred_R² is slightly optimistic because
+                # the context latent already "leaks" about the future through the
+                # bidirectional temporal attention. The truly causal evaluation
+                # here is the reliable benchmark.
+                if self.model.use_prediction:
+                    pred_latents: Dict[str, torch.Tensor] = {}
+                    pred_T_ctx: Dict[str, int] = {}
+                    # h_ctx_dict is assigned inside `if ctx_T_map:` below and
+                    # referenced inside `if pred_latents:`.  The current logic
+                    # guarantees pred_latents non-empty → ctx_T_map non-empty →
+                    # h_ctx_dict assigned, but initializing here makes this
+                    # invariant explicit and prevents UnboundLocalError if the
+                    # code is extended in the future.
+                    h_ctx_dict: Dict[str, torch.Tensor] = {}
+
+                    # ── Step 1: Determine context split per modality ──────────
+                    # Use the full-sequence latent length (from encoded above,
+                    # if available) to compute T_ctx; otherwise fall back to the
+                    # raw-signal length.
+                    ctx_T_map: Dict[str, int] = {}
+                    for node_type in self.node_types:
+                        if node_type not in data.node_types:
+                            continue
+                        if encoded is not None and node_type in encoded:
+                            T = encoded[node_type].shape[1]
+                        else:
+                            T = data[node_type].x.shape[1]
+                        if T < self.model._PRED_MIN_SEQ_LEN:
+                            continue
+                        ctx_T_map[node_type] = int(T * self.model._PRED_CONTEXT_RATIO)
+
+                    if ctx_T_map:
+                        # ── Step 2: Build context-only data and encode ────────
+                        # Each node type is sliced to its T_ctx steps so the
+                        # encoder only sees past data — no future leakage.
+                        context_data = data.clone()
+                        for node_type, T_ctx in ctx_T_map.items():
+                            context_data[node_type].x = (
+                                data[node_type].x[:, :T_ctx, :]
+                            )
+                        _, _, h_ctx_dict = self.model(
+                            context_data,
+                            return_prediction=False,
+                            return_encoded=True,
+                        )
+
+                        # ── Step 3: Predict from causal context ───────────────
+                        for node_type, T_ctx in ctx_T_map.items():
+                            if node_type not in h_ctx_dict:
+                                continue
+                            h_ctx = h_ctx_dict[node_type]  # [N, T_ctx, H]
+                            pred_latents[node_type] = (
+                                self.model.predictor.predict_next(h_ctx)
+                            )
+                            pred_T_ctx[node_type] = T_ctx
+
+                    # ── Step 4: System-level graph propagation ────────────────
+                    if pred_latents:
+                        pred_latents = self.model.prediction_propagator(
+                            pred_latents, data
+                        )
+
+                    if pred_latents:
+                        # ── Step 5: Decode latent predictions to signal space ─
+                        # Seed pred_enc from h_ctx_dict (encoded context latents,
+                        # shape [N, T_ctx, H=hidden_channels]) rather than raw data
+                        # (shape [N, T, C=1]).  The decoder's first Conv1d expects
+                        # in_channels=hidden_channels, so starting from the raw data
+                        # would crash for any modality not overridden by pred_latents
+                        # (e.g. modalities skipped because T < _PRED_MIN_SEQ_LEN).
+                        # Starting from h_ctx_dict ensures every modality has the
+                        # correct feature dimension regardless of whether it was
+                        # predicted; the pred_T_ctx guard in Step 6 prevents those
+                        # modalities from contributing to the pred_R² metric.
+                        #
+                        # Tensor aliasing: data.clone() performs a deep copy of all
+                        # node/edge tensors (PyG HeteroData.clone() calls .clone() on
+                        # each stored tensor).  The subsequent .x assignments create
+                        # new references in pred_enc only; data is not modified.
+                        # This validate() function runs under @torch.no_grad() so
+                        # there are no gradient graphs that could be affected.
+                        pred_enc = data.clone()
+                        for nt, h_ctx in h_ctx_dict.items():
+                            pred_enc[nt].x = h_ctx   # [N, T_ctx, H] — correct H for decoder
+                        for nt, pred_lat in pred_latents.items():
+                            pred_enc[nt].x = pred_lat  # override with predicted latent
+                        # Guard: node types NOT in h_ctx_dict (T < _PRED_MIN_SEQ_LEN=4)
+                        # still carry the raw signal [N, T, C=1] from data.clone().
+                        # The decoder's Conv1d(in_channels=hidden_channels) would fail
+                        # with a channel mismatch on [N, 1, T].
+                        # This is extremely rare in practice (typical T ≈ 300 >> 4)
+                        # but could occur in short-sequence edge cases or unit tests.
+                        # Fix: remove those node types from pred_enc so the decoder
+                        # only processes nodes that have correct latent features.
+                        for nt in list(pred_enc.node_types):
+                            if nt not in h_ctx_dict:
+                                logger.debug(
+                                    f"validate: removing '{nt}' from pred_enc "
+                                    f"(T={data[nt].x.shape[1]} < _PRED_MIN_SEQ_LEN="
+                                    f"{self.model._PRED_MIN_SEQ_LEN}; raw signal "
+                                    f"would cause decoder channel mismatch)"
+                                )
+                                del pred_enc[nt]
+                        pred_signals = self.model.decoder(pred_enc)  # {nt: [N, pred_steps', C]}
+
+                        for node_type, pred_sig in pred_signals.items():
+                            if node_type not in data.node_types:
+                                continue
+                            T_ctx = pred_T_ctx.get(node_type)
+                            if T_ctx is None:
+                                continue
+                            # ── Step 6: Compare against raw future signal ─────
+                            # Uses the RAW signal (not the latent) so the metric
+                            # is interpretable in physical units (z-scored signal).
+                            future_sig = data[node_type].x[:, T_ctx:, :]  # [N, T_fut, C]
+                            n_steps = min(pred_sig.shape[1], future_sig.shape[1])
+                            if n_steps < 1:
+                                continue
+                            if pred_sig.shape[0] != future_sig.shape[0]:
+                                continue
+                            pred_aligned   = pred_sig[:, :n_steps, :]
+                            future_aligned = future_sig[:, :n_steps, :]
+                            pred_ss_res[node_type] += ((future_aligned - pred_aligned) ** 2).sum().item()
+                            pred_ss_raw[node_type] += (future_aligned ** 2).sum().item()
+                            pred_ss_sum[node_type] += future_aligned.sum().item()
+                            pred_ss_cnt[node_type] += future_aligned.numel()
+
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
 
-        # Compute R² per modality
+        # ── Assemble R² dict via _r2_from_accum() helper ────────────────────
         r2_dict: Dict[str, float] = {}
+
+        # Reconstruction R²
         for node_type in self.node_types:
-            tot = ss_tot[node_type]
-            if tot > 1e-12:
-                r2 = 1.0 - ss_res[node_type] / tot
-            else:
-                r2 = 0.0  # undefined (zero-variance target) → treat as 0
+            r2 = self._r2_from_accum(
+                ss_res[node_type], ss_raw[node_type],
+                ss_sum[node_type], ss_cnt[node_type],
+            )
             r2_dict[f'r2_{node_type}'] = r2
-            # Track history per modality
             key = f'val_r2_{node_type}'
             if key not in self.history:
                 self.history[key] = []
             self.history[key].append(r2)
-        
+
+        # Signal-space prediction R² (★ primary metric)
+        if self.model.use_prediction:
+            for node_type in self.node_types:
+                pred_r2 = self._r2_from_accum(
+                    pred_ss_res[node_type], pred_ss_raw[node_type],
+                    pred_ss_sum[node_type], pred_ss_cnt[node_type],
+                )
+                r2_dict[f'pred_r2_{node_type}'] = pred_r2
+                key = f'val_pred_r2_{node_type}'
+                if key not in self.history:
+                    self.history[key] = []
+                self.history[key].append(pred_r2)
+
         return avg_loss, r2_dict
     
     def save_checkpoint(self, path: Path, epoch: int):

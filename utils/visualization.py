@@ -475,23 +475,30 @@ def plot_training_curves(
         _plt.close(fig)
 
     # ── R² curve ───────────────────────────────────────────────────────────
-    # Collect all val_r2_* keys present in history
-    r2_keys = sorted(k for k in history if k.startswith('val_r2_') and history[k])
+    # Collect all R² history keys: prediction (primary) and reconstruction.
+    # val_pred_r2_* = signal-space prediction R² (★ primary metric)
+    # val_r2_*      = reconstruction R²
+    pred_r2_keys  = sorted(k for k in history if k.startswith('val_pred_r2_') and history[k])
+    recon_r2_keys = sorted(k for k in history if k.startswith('val_r2_') and history[k])
+    r2_keys = pred_r2_keys + recon_r2_keys
     if r2_keys:
         fig, ax = _plt.subplots(figsize=(8, 4))
-        colors = ['steelblue', 'tomato', 'forestgreen', 'darkorange', 'purple']
+        colors = ['steelblue', 'tomato', 'forestgreen', 'darkorange', 'purple', 'brown', 'pink']
         for idx, key in enumerate(r2_keys):
             vals = history[key]
-            label = key.replace('val_r2_', 'R² ')
+            is_pred = key.startswith('val_pred_r2_')
+            label = key.replace('val_pred_r2_', 'Pred-R² ').replace('val_r2_', 'R² ')
+            lw = 2.0 if is_pred else 1.5
+            ls = '-' if is_pred else '--'
             ax.plot(range(1, len(vals) + 1), vals,
                     label=label, color=colors[idx % len(colors)],
-                    linewidth=1.5, marker='o', markersize=3)
+                    linewidth=lw, linestyle=ls, marker='o', markersize=3)
         # Reference lines
-        ax.axhline(0.3, color='green',  linestyle='--', linewidth=0.8, alpha=0.6, label='R²=0.3 (good)')
-        ax.axhline(0.0, color='orange', linestyle='--', linewidth=0.8, alpha=0.6, label='R²=0 (baseline)')
+        ax.axhline(0.3, color='green',  linestyle=':', linewidth=0.8, alpha=0.6, label='R²=0.3 (good)')
+        ax.axhline(0.0, color='orange', linestyle=':', linewidth=0.8, alpha=0.6, label='R²=0 (baseline)')
         ax.set_xlabel('Validation Index')
         ax.set_ylabel('R² (coefficient of determination)')
-        ax.set_title('TwinBrain V5 — Validation R² Curve')
+        ax.set_title('TwinBrain V5 — Validation R² Curve\n(solid=prediction ★, dashed=reconstruction)')
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         # Annotate best R² values if provided

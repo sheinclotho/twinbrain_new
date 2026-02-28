@@ -357,10 +357,11 @@ v5_optimization:
     update_frequency: 10
     # 预热 epoch 数（预热期权重固定为初始值，保证模型先有稳定梯度）
     warmup_epochs: 5
-    # EEG/fMRI 信号能量比（用于初始化权重，防止 fMRI 信号幅度主导损失）
-    # EEG 信号典型幅度 ~10μV，fMRI BOLD ~1–5%；此比值使初始损失量级一致。
+    # EEG/fMRI 信号能量比（用于初始化权重）
+    # 注意：EEG 在 map_eeg_to_graph() 中已逐通道 z-score 归一化，与 fMRI 尺度相同；
+    # 因此设为 1:1 即可。若使用未归一化的 EEG 数据，可调低 eeg 值（如 0.02）。
     modality_energy_ratios:
-      eeg: 0.02
+      eeg: 1.0
       fmri: 1.0
   
   # EEG 通道增强（解决"静默通道"导致的训练退化）
@@ -383,19 +384,50 @@ v5_optimization:
   
   # 潜空间预测头配置（EnhancedMultiStepPredictor）
   advanced_prediction:
+    # 预测上下文长度（context_length）
+    # ─────────────────────────────────────────────────────────────
+    # 用于预测的历史时间步数 = 预测头的输入窗口大小。
+    # 训练和推理使用完全相同的长度（因果对齐，无数据泄漏）。
+    #
+    # 科学依据（NPI 范式，NUST 等）：
+    #   NPI 方法使用 3 或 70 个时间步的历史预测下一个时间步。
+    #   本模型同样支持此范式；通过调节以下两个参数：
+    #     context_length=70, prediction_steps=1  → "70步预测1步"（NPI风格）
+    #     context_length=200, prediction_steps=10 → "200步预测10步"（长程预测）
+    #
+    # 默认值 200：
+    #   对应 max_seq_len=300 时上下文部分的全部历史（2/3 × 300 = 200 步）。
+    #   改为更小的值（如 70）可以用更少历史做预测，训练更稳定但长程信息减少。
+    #
+    # fMRI (TR=2s, 200步 × 2s = 400秒历史):  建议 context_length=50-200
+    # EEG (250Hz, 200步 / 250Hz = 0.8秒历史): 建议 context_length=50-500
+    context_length: 200
     # true：多尺度层级预测（粗→细，Transformer + 上采样）
     # 理论基础：大脑对时间信息的处理本身是层级的（Hasson et al. 2015）。
     use_hierarchical: true
     # true：使用 Transformer（长程依赖）；false：使用 GRU（短程、更快）
     # 建议：序列长度 < 100 用 GRU（内存低），> 100 用 Transformer。
     use_transformer: true
-    # true：输出预测均值 + 方差（不确定性估计），启用 NLL 损失
-    # 不确定性信号可用于下游任务的置信度度量
-    use_uncertainty: true
+    # 不确定性估计头（预留接口，当前版本为后处理工具，不参与训练损失）
+    # ─────────────────────────────────────────────────────────────
+    # true：在预测头内注册一个 uncertainty_head（Linear → GELU → Linear），
+    #       可通过 predictor.predictor(context, return_uncertainty=True) 手动获取
+    #       对预测均值的对数方差估计（解释为置信区间大小的代理指标）。
+    #
+    # ⚠ 当前限制：uncertainty_head 不参与训练损失计算（NLL 损失**未**启用）。
+    #   predict_next() 始终以 return_uncertainty=False 调用，
+    #   因此 uncertainty_head 参数在训练中不接收梯度，其输出不保证有意义。
+    #   若需可靠的不确定性估计，应在完成充分训练后：
+    #   1. 手动调用: predictor.predictor(h_ctx, future_steps, return_uncertainty=True)
+    #   2. 解读输出 log_var 作为定性置信度参考（非定量校准）
+    #
+    # false（建议，默认）：不注册 uncertainty_head，节省 ~input_dim×1.5 个参数。
+    # 对大多数用户建议保持 false 直到明确需要不确定性量化。
+    use_uncertainty: false
     # 时间尺度数（Hierarchical 模式下的粗-中-细层数）
     # 建议：3（2^2, 2^1, 2^0 下采样因子，覆盖不同频率成分）。
     num_scales: 3
-    # 采样窗口数（每次 forward 从序列中采样的窗口数量）
+    # 采样窗口数（每次 forward 从序列中采样的窗口数量，仅用于预训练/自监督）
     # 建议：3（Stratified 采样覆盖序列首/中/尾）。
     num_windows: 3
     # 窗口采样策略：uniform（均匀）/ random（随机）/ adaptive（重要性加权）

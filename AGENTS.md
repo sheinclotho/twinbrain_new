@@ -436,7 +436,439 @@ train_step()
 
 ---
 
-## 九、数字孪生脑架构状态（持续更新）
+### [2026-02-27] 预测功能系统性审查：三个叠加盲区
+
+**背景**：要求以"哪都可能有问题"的批判态度对预测功能进行完整审查。
+
+---
+
+**盲区 1 — HierarchicalPredictor 整数除法产生空张量（P0 bug）**
+
+**思维误区**：以为 `future_steps // scale_factor` 总是正整数。
+
+**根因**：当 `prediction_steps=1`（NPI 风格）且 `scale_factor=4` 时，`1 // 4 = 0`。
+`future_init = x_down[:, -1:, :].repeat(1, 0, 1)` 产生形状 `[N, 0, H]` 的空张量，
+Transformer 对空序列的输出仍是空张量，`pred_full[:, -0:, :]` = 完整序列（Python 负索引！），
+导致 fusion 的输入维度从 `input_dim * 3` 变为 `input_dim * 3 + 全序列 * 2`，报 shape mismatch。
+
+**触发条件**：`prediction_steps` < `max(scale_factors)` = 4（默认 num_scales=3）。
+即 `prediction_steps ∈ {1, 2, 3}` 都会在前两个尺度上产生空预测。
+
+**修复**：`future_steps_scaled = max(1, future_steps // scale_factor)`。
+每个尺度至少预测 1 步，粗尺度用下采样后的 context 预测 1 步后再上采样到 future_steps，
+物理语义为"低分辨率趋势预测"，融合后给细尺度提供全局先验。
+
+**规则**：**所有整数除法，若分子可能小于分母，必须用 max(1, ...) 或 ceiling 除法。**
+
+---
+
+**盲区 2 — validate() pred_R² 使用非因果 context（P1 科学问题）**
+
+**思维误区**：以为 `h[:, :T_ctx, :]` 是"上下文的表示"，没有追问编码器是否是因果的。
+
+**根因**：编码器使用：
+- `Conv1d(kernel=3, padding=1)`：对称填充，`h[t]` 包含 `signal[t-1, t, t+1]` 的信息
+- `TemporalAttention(is_causal=False)`：全局双向注意力，每个时间步可看到所有其他时间步
+
+因此 `h[:, T_ctx-1, :]`（context 最后一步）包含来自 `T_ctx, T_ctx+1` 的少量未来信息。
+旧 validate() 用这个"污染"的 context 做预测，pred_r2 会偏乐观。
+
+**影响评估**：对 `kernel_size=3`, `T_ctx=200` 的情况，泄漏量约为 0.5%（仅边界步受影响）。
+训练时接受此近似（避免 2× forward pass cost）。**但评估指标必须严格，不能接受偏差。**
+
+**修复**：validate() 中重新编码仅含 T_ctx 步的数据：
+```python
+context_data = data.clone()
+context_data[nt].x = data[nt].x[:, :T_ctx, :]  # 切片原始信号
+_, _, h_ctx = self.model(context_data, return_encoded=True)  # 编码器只见 T_ctx 步
+pred_latents = predictor.predict_next(h_ctx[nt])  # 真正因果预测
+```
+代价：验证时多一次无反向传播的 forward pass（可接受）。
+
+**规则**：**科学评估指标不能有任何信息泄漏。训练效率 vs 评估严格性的权衡，必须让评估端严格。**
+
+---
+
+**盲区 3 — 声明"因果"但未追问编码器是否真的因果**
+
+**思维误区**：看到注释"causal prediction using predict_next()"就以为整个流程是因果的。
+
+**根因**：`predict_next()` 本身是因果的（只用 context 的最后 context_length 步），
+但如果 context 是由非因果编码器产生的（包含未来信息），因果预测器也无济于事。
+"因果"需要端到端保证：**编码器因果 + 预测器因果 + 评估因果**，缺一不可。
+
+**现状**：
+- 训练：编码器非因果（工程权衡，边界泄漏极小）→ 预测器因果 → 近似因果（可接受）
+- 评估：**编码器强制因果**（重新编码 T_ctx 步）→ 预测器因果 → 完全因果（严格）
+
+**规则**：**对任何标榜"因果"的预测功能，逐一检查信息流的每一步：原始信号 → 编码 → 预测 → 解码 → 评估，看哪一步有未来信息的访问权限。**
+
+---
+
+**附：StratifiedWindowSampler.forward() 是训练中的死代码**
+
+`EnhancedMultiStepPredictor.forward()`（使用 StratifiedWindowSampler 采样多个窗口）
+在当前训练循环中**从未被调用**。训练用 `predict_next()`，验证也用 `predict_next()`。
+
+`forward()` 是 API 的一部分（向后兼容），保留不删除，但新用户不应依赖它进行训练。
+
+---
+
+### [2026-02-27] 预测功能第二轮审查：归一化层选型盲区 + 配置误导
+
+**背景**：对预测系统进行独立第二轮审查，假设所有地方都可能有问题。
+
+---
+
+**盲区 1 — BatchNorm1d 在 prediction_steps_scaled=1 时静默归零粗尺度（P0 静默失效）**
+
+**思维误区**：以为"前一轮修复了整数除法 → 预测步数不再为零 → 一切正常"，
+没有追问"steps=1 时，归一化层是否还有问题"。
+
+**根因**：上一轮修复将 `future_steps_scaled = max(1, future_steps // scale_factor)` 后，
+预测步数不再为零。但上采样器中的 `BatchNorm1d(input_dim)` 接收形状 `[batch=1, input_dim=128, time=1]`：
+- 每通道仅有 N×L = 1×1 = **1 个样本**
+- var = 0 → normalized = (x − x) / sqrt(eps) = **0**
+- output = gamma × 0 + beta = **0**（BatchNorm 初始化 gamma=1, beta=0）
+
+粗尺度和中等尺度的上采样输出全为零，Fusion 输入 `cat([zeros, zeros, valid_fine])`，
+层级预测**静默退化为单尺度**——在 NPI 风格（prediction_steps=1）这一最重要的科学配置下，
+多尺度层级架构完全失效，但不会有任何报错或警告。
+
+**修复**：`nn.BatchNorm1d(input_dim)` → `nn.GroupNorm(1, input_dim)`
+
+GroupNorm(num_groups=1, num_channels=C) 将所有 C 个通道作为一个组归一化，
+每个样本使用 C×L×N 个值计算统计量。对 `[1, 128, 1]`：128 个值 → 统计量有意义。
+
+归一化层比较（对 [batch=1, channels=128, time=1]）：
+| 层 | 每次统计的元素数 | 适用性 |
+|----|----|------|
+| BatchNorm1d(C) | N×L = 1×1 = 1 | 🔴 退化 |
+| InstanceNorm1d(C) | L = 1 | 🔴 退化 |
+| GroupNorm(C, C) = InstanceNorm | L = 1 | 🔴 退化 |
+| GroupNorm(1, C) | C×L×N = 128 | ✅ 正常 |
+
+**规则**：**在 batch_size=1 的图神经网络场景中，凡 L（时间/空间维度）可能为 1 的地方，
+必须选用不依赖 batch 维度和时间维度的归一化层（GroupNorm(1, C) 或 LayerNorm）。**
+
+---
+
+**盲区 2 — 配置注释声称"启用 NLL 损失"但实际从未执行**
+
+**思维误区**：以为"配置里写 use_uncertainty: true + NLL 损失"就代表 NLL 损失在工作。
+
+**根因**：
+1. `predict_next()` 硬编码 `return_uncertainty=False`
+2. `compute_loss()` → `predict_next()` → uncertainty_head 从不被调用
+3. `uncertainty_head` 参数存在于模型中但永远不会收到梯度
+4. `default.yaml` 注释"启用 NLL 损失"是**错误的描述**
+
+**后果**：
+- 用户相信已启用不确定性估计，实际上什么都没发生
+- 浪费 ~input_dim×1.5 个永不更新的参数
+- 如果用户依赖不确定性估计做临床决策，将产生虚假安全感
+
+**修复**：
+- 更正 `default.yaml` 注释，明确说明"当前版本为后处理工具，不参与训练损失"
+- 将默认值从 `true` 改为 `false`（诚实接口原则：默认配置只启用真正工作的功能）
+
+**规则**：**凡是"声明了但从未真正工作"的配置选项，默认值必须为 false，且注释必须如实描述实际状态。**
+（参见 AGENTS.md §三 [2026-02-21] "声明了但从未真正工作"的功能）
+
+---
+
+### [2026-02-27] 预测功能第三轮审查：YAML 与代码默认值不同步 + GRU 自回归维度崩溃
+
+**背景**：第三轮以全新视角独立审查，验证前两轮已修复项的正确性，并寻找新盲区。
+
+---
+
+**盲区 1 — use_uncertainty Python 默认值未与 YAML 同步（P1 逻辑不一致）**
+
+**思维误区**：以为"上一轮改了 YAML 就完成了"，没有检查 Python 代码层的 fallback 默认值。
+
+**根因**：Round 2 已将 `default.yaml` 中 `use_uncertainty` 改为 `false`，并在 AGENTS.md 中记录了意图。但 `graph_native_system.py:446` 中的 Python fallback 默认值仍为 `True`：
+
+```python
+use_uncertainty=pred_cfg.get('use_uncertainty', True),  # ← 仍为 True！
+```
+
+任何不通过 YAML 创建模型的代码（单元测试、API用户、`predictor_config` 缺少该键时）会得到 `True`，创建从未训练的 `uncertainty_head` 参数，浪费显存且误导用户。
+
+**修复**：`True` → `False`（1行改动）。
+
+**规则**：**配置项的 Python fallback 默认值必须与 YAML 默认值保持一致。每次修改 YAML 默认值时，必须同时检索代码中所有对应的 `.get(key, python_default)` 调用并同步修改。**
+
+---
+
+**盲区 2 — GRU 自回归滚动在第2步后崩溃（P0 运行时崩溃）**
+
+**思维误区**：以为"GRU 是简单替代品，没有复杂的维度问题"，没有追问反馈维度是否和输入维度匹配。
+
+**根因**：`EnhancedMultiStepPredictor` 创建时 `hidden_dim = input_dim × 2`（例如 128 → 256）。GRU 的 `input_size=input_dim=128`，`hidden_size=hidden_dim=256`。自回归滚动代码（3处）：
+
+```python
+current = context[:, -1:, :]          # [batch, 1, 128] ✓
+output, hidden = predictor(current)    # output: [batch, 1, 256]
+current = output                       # BUG: 256 ≠ 128 → 第2步崩溃
+```
+
+第2步开始 GRU 收到 256 维输入但只接受 128 维 → `RuntimeError`。
+
+**影响的3处位置**：
+1. `HierarchicalPredictor._autoregressive_predict()` — 触发条件: `use_transformer=False`
+2. `EnhancedMultiStepPredictor.predict_next()` GRU分支 — `use_hierarchical=False, use_transformer=False`
+3. `EnhancedMultiStepPredictor.forward()` GRU分支 — 同上
+
+**修复**：为 GRU 添加输出投影层 `nn.Linear(hidden_dim, input_dim)`，在反馈前将 GRU 输出投影回 input_dim。这是标准 seq2seq 解码器设计模式（隐藏空间 ≠ 输入空间，学习投影桥接两者）。
+
+- `HierarchicalPredictor.__init__`: 添加 `self.gru_output_projs = nn.ModuleList([nn.Linear(hidden_dim, input_dim) × num_scales])`（仅 predictor_type='gru' 时）
+- `_autoregressive_predict()`: 接受 `output_proj` 参数，使用 `current = proj(output) if proj else output`
+- `HierarchicalPredictor.forward()`: 传入 `self.gru_output_projs[i]`
+- `EnhancedMultiStepPredictor.__init__`: 添加 `self.gru_output_proj = nn.Linear(hidden_dim, input_dim)`（仅简单GRU模式）
+- `predict_next()` / `forward()` GRU分支: 使用 `self.gru_output_proj`
+
+**规则**：**任何 GRU/RNN 自回归滚动，第一步的输入维度和输出维度可能不同。反馈前必须确认 output.shape[-1] == input_size。若不同，必须添加投影层。**
+
+---
+
+### [2026-02-27] 预测功能第四轮审查：GRU 累积输出维度未投影（Round 3 遗漏的对称问题）
+
+**背景**：第四轮独立审查，假设所有已修复项都可能存在遗漏。
+
+---
+
+**盲区 — GRU 累积预测维度错误（P0 运行时崩溃）**
+
+**思维误区**：以为"Round 3 修复了 GRU 输出投影"就等于"GRU 自回归循环完全正确"。没有追问：**修复了反馈路径，累积路径是否也修了？**
+
+**根因**：Round 3 的修复代码：
+
+```python
+output, hidden = predictor(current, hidden)  # output: [B, 1, 256]
+predictions.append(output)                   # ← 仍然累积 256 维！（遗漏）
+current = output_proj(output)                # ← 反馈正确投影到 128 维 ✓
+```
+
+`predictions` 累积的是 `hidden_dim=256` 维的原始 GRU 输出，而下游所有消费者都期待 `input_dim=128`：
+- `upsamplers[i]` = `ConvTranspose1d(in_channels=128)` → 收到 256 → **CRASH**
+- `fusion` = `Linear(input_dim*3=384)` → 收到 768 → **CRASH**
+- `prediction_propagator` = `SpatialTemporalGraphConv(in_channels=128)` → 收到 256 → **CRASH**
+
+**影响的3处位置**：
+1. `HierarchicalPredictor._autoregressive_predict()` — GRU 模式（`use_transformer=False`）
+2. `EnhancedMultiStepPredictor.predict_next()` GRU分支
+3. `EnhancedMultiStepPredictor.forward()` GRU分支
+
+**修复**：在所有3处，将"累积"与"反馈"统一为同一个投影后的变量：
+
+```python
+# 修复后（每处完全对称）：
+output, hidden = predictor(current, hidden)
+projected = output_proj(output) if output_proj is not None else output
+predictions.append(projected)   # ← 累积 128 维 ✓
+current = projected              # ← 反馈 128 维 ✓
+```
+
+**根本规则**：**自回归循环中"用于累积（append）"的张量和"用于反馈（current=）"的张量必须是同一个对象。** 如果两者不同，必须追问：两者的维度是否一致，下游消费者期待哪个维度？
+
+---
+
+### [2026-02-27] 预测功能第五轮审查：avg_pool1d 崩溃前守卫 + pred_enc 初始化 + N守卫 + 训练状态污染
+
+**背景**：第五轮独立审查，重新审视每个函数，假设所有已修复项都可能仍有遗漏。
+
+---
+
+**盲区 1 — avg_pool1d 在返回前内部崩溃（P2 潜在崩溃）**
+
+**思维误区**：以为"检查 x_down.shape[1] == 0 就能保护空张量"——没有追问：**PyTorch 是在返回前还是返回后抛出异常？**
+
+**根因**：`F.avg_pool1d` 在计算出 `output_len ≤ 0` 时**直接在函数内部**抛出 "Output size is too small"，*在*返回之前。所以"在 avg_pool1d 调用之后检查结果"永远不会执行。触发条件：`_PRED_MIN_SEQ_LEN=4`、`_PRED_CONTEXT_RATIO=2/3` → T_ctx=2 < scale_factor=4。
+
+```python
+# 错误修复（Round 4 分析的方案）：
+x_down = F.avg_pool1d(...)   # ← 已经崩溃，走不到下面
+if x_down.shape[1] == 0:     # ← 永远不会执行
+    ...
+
+# 正确修复（Round 5）：
+if x.shape[1] < scale_factor:   # ← 在调用前检查
+    logger.debug(f"... zero prediction for this scale ...")
+    pred_up = torch.zeros(...)
+    scale_predictions.append(pred_up)
+    continue
+x_down = F.avg_pool1d(...)      # ← 安全
+```
+
+**规则**：**对所有可能抛出内部异常的函数（不仅仅是返回错误值），必须在调用前就验证前置条件，不能依赖检查返回值。**
+
+---
+
+**盲区 2 — validate() pred_enc 用原始信号初始化导致 decoder 维度崩溃（P2 潜在崩溃）**
+
+**根因**：
+```python
+pred_enc = data.clone()  # x shape = [N, T, C=1] — 原始信号！
+for nt, pred_lat in pred_latents.items():
+    pred_enc[nt].x = pred_lat  # 只覆盖了 pred_latents 中的 modality
+# 未被覆盖的 modality: pred_enc[nt].x = [N, T, 1]
+# decoder: Conv1d(in_channels=128) 收到 1 通道 → CRASH
+```
+触发条件：某个 modality 因 T < `_PRED_MIN_SEQ_LEN` 被跳过。
+
+**修复**：先从 `h_ctx_dict` 初始化（正确 H=128 维），再用 pred_latents 覆盖。
+未被预测的 modality 的 context latent 喂给 decoder 不影响 R² 评估（`pred_T_ctx.get(nt) is None` 在 Step 6 跳过它们）。
+
+---
+
+**盲区 3 — compute_loss() pred_loss 缺少 N 不匹配守卫（P3 不一致）**
+
+`recon_loss` 有 `if recon.shape[0] != target.shape[0]: raise RuntimeError(...)` 守卫；`pred_loss` 没有。**修复**：添加 `if pred_mean.shape[0] != future_target.shape[0]: logger.warning(...); continue`，与 recon_loss 保持一致的防御性编程。
+
+---
+
+**盲区 4 — UncertaintyAwarePredictor 强制 .train() 污染 eval 状态（P2）**
+
+MC dropout 路径中 `self.base_predictor.train()` 被无条件调用，在 validate() 的 `@torch.no_grad()` 上下文中也会执行，污染 BatchNorm running stats。**修复**：`was_training = self.base_predictor.training`，try/finally 恢复。
+
+---
+
+### [2026-02-27] 预测功能第六轮审查：非层级 TransformerPredictor 错误分派 + UAP shape 错误 + h_ctx_dict 初始化
+
+**背景**：第六轮独立审查，系统性验证所有配置组合。
+
+---
+
+**盲区 1 — 非层级 TransformerPredictor 分派到 GRU 分支（P2 运行时崩溃/静默错误）**
+
+**思维误区**：以为"修复了 GRU 投影就修好了所有 else 分支"，没有追问：**else 分支覆盖了哪些配置？**
+
+**根因**：`EnhancedMultiStepPredictor.__init__()` 存储了 `self.use_hierarchical` 和 `self.use_uncertainty`，但**未存储 `self.use_transformer`**。当 `use_hierarchical=False, use_transformer=True, use_uncertainty=False` 时：
+- `self.predictor = TransformerPredictor(...)` (返回单一 Tensor)
+- `predict_next()` 和 `forward()` 的 `else` 分支执行 `_, hidden = self.predictor(context)`
+- TransformerPredictor 返回 `[B, T, H]`（不是 `(output, hidden)`）
+- batch_size ≠ 2 时崩溃；batch_size = 2 时静默产生错误结果
+
+**修复**：
+1. `__init__` 中保存 `self.use_transformer = use_transformer`
+2. 在 `predict_next()` 和 `forward()` 中添加 `elif self.use_transformer:` 分支
+3. 提取模块级辅助函数 `_transformer_seq2seq_predict(predictor, context, n_steps)` — 消除3处重复的 seq2seq 扩展逻辑（extend context + causal mask + take last n_steps）
+
+---
+
+**盲区 2 — UncertaintyAwarePredictor 包装 TransformerPredictor 时返回错误形状（P2 静默错误）**
+
+**思维误区**：以为"修复了 EnhancedMultiStepPredictor 的分派就覆盖了 UAP 的分派"，没有追问：**UAP.forward() 的 isinstance 分支是否正确处理 TransformerPredictor？**
+
+**根因**：`UncertaintyAwarePredictor.forward()` 中 gaussian/dropout 路径只检查 `isinstance(self.base_predictor, HierarchicalPredictor)`；对非 Hierarchical 的情况调用 `self.base_predictor(x)`（TransformerPredictor 返回 `[B, ctx_len, H]`，不是 `[B, future_steps, H]`）。
+
+**修复**：提取 `UncertaintyAwarePredictor._base_predict(x, future_steps)` 辅助方法，使用 `_transformer_seq2seq_predict` 正确处理 TransformerPredictor；gaussian/dropout 所有分支统一调用 `_base_predict`，消除重复的 isinstance 分散逻辑。
+
+---
+
+**盲区 3 — validate() h_ctx_dict 未初始化（P3 鲁棒性）**
+
+`h_ctx_dict` 仅在 `if ctx_T_map:` 块内赋值，在 `if pred_latents:` 块内使用。当前逻辑保证安全（pred_latents 非空 → ctx_T_map 非空 → h_ctx_dict 已赋值），但这是隐式不变式。
+
+**修复**：在 `if ctx_T_map:` 之前添加 `h_ctx_dict: Dict[str, torch.Tensor] = {}` 显式初始化，使不变式变得显式，防止未来代码修改破坏此假设。
+
+**配置空间全覆盖审查结果（Round 6）**：
+| 配置 | 状态 |
+|------|------|
+| use_hierarchical=True（默认） | ✅ 正确 |
+| use_hierarchical=False, use_transformer=False (GRU) | ✅ 正确 |
+| use_hierarchical=False, use_transformer=True | **已修复 V5.36** |
+| use_uncertainty=True 包装任意 base | **已修复 V5.36**（UAP._base_predict） |
+
+---
+
+### [2026-02-28] 预测功能第七轮审查：GRU+不确定性彻底破损 + validate() decoder 潜在崩溃
+
+**背景**：第七轮独立审查，假设所有已修复项都可能存在遗漏，穷举所有配置组合的完整调用链。
+
+---
+
+**盲区 1 — GRU + UncertaintyAwarePredictor 组合三重破损（P2 运行时崩溃）**
+
+**配置**：`use_hierarchical=False, use_transformer=False, use_uncertainty=True`
+
+**思维误区**：以为"Round 6 修复了 UAP._base_predict 就覆盖了所有 else 分支"，没有追问：**当 base_predictor = nn.GRU 时，`_base_predict` else 分支是否还会崩溃？**
+
+**三重根因**：
+1. `_base_predict` else 分支调用 `return self.base_predictor(x)` = `nn.GRU(x)` → 返回 `(output, h_n)` **tuple**，不是 Tensor → TypeError
+2. 即使解包 `output`：`nn.GRU(x)` 返回 `[N, ctx_len, hidden_dim]`，不是 `[N, future_steps, input_dim]`（时间维度长度错误，特征维度 256≠128）
+3. `uncertainty_head` 期待 `input_dim=128`，收到 `hidden_dim=256` → 形状崩溃
+
+**修复**：
+1. `EnhancedMultiStepPredictor.__init__` 对不支持的组合提前抛出 `ValueError`（构造时即报告，而非运行时神秘崩溃）
+2. `UAP._base_predict` else 分支防御性解包：`result = self.base_predictor(x); return result[0] if isinstance(result, tuple) else result`（保护直接实例化 UAP 的场景，如单元测试）
+
+---
+
+**盲区 2 — validate() decoder 在 T < _PRED_MIN_SEQ_LEN 时崩溃（P3 潜在崩溃）**
+
+**根因**：`pred_enc = data.clone()` 会保留 T < 4 的节点的原始信号 `[N, T, C=1]`。`h_ctx_dict` 不包含这些节点（因 T < _PRED_MIN_SEQ_LEN）。decoder 的 `Conv1d(in_channels=128)` 应用于 `[N, 1, T]` → 通道不匹配崩溃。
+
+**修复**：在调用 decoder 前删除 pred_enc 中不在 h_ctx_dict 中的节点类型：
+```python
+for nt in list(pred_enc.node_types):
+    if nt not in h_ctx_dict:
+        logger.debug(f"validate: removing '{nt}' from pred_enc (T < _PRED_MIN_SEQ_LEN)")
+        del pred_enc[nt]
+```
+
+**配置空间完整覆盖审查结果（Round 7）**：
+| 配置 | 状态 |
+|------|------|
+| use_hierarchical=True（默认） | ✅ |
+| use_hierarchical=True, use_transformer=False | ✅ |
+| use_hierarchical=False, use_transformer=True | ✅ |
+| use_hierarchical=False, use_transformer=False | ✅ |
+| + use_uncertainty=True（上述前三种） | ✅ |
+| **use_hierarchical=False, use_transformer=False, use_uncertainty=True** | **✅ 已明确禁止（ValueError）V5.37** |
+
+**新规则**：**每次新增 isinstance 分支时，必须追问：`else` 分支现在还有哪些类型会落入？每种落入类型的返回值格式是否兼容后续代码？** 特别是 `nn.GRU` 等 PyTorch 原生模块的返回格式（tuple），永远不应假设与自定义 nn.Module 相同。
+
+---
+
+### [2026-02-28] 预测功能第八轮审查：R² 科学精确性 + 数值稳定性 + 边界防御
+
+**背景**：第八轮独立审查。前七轮已消除所有已知的运行时崩溃类型，本轮聚焦于**科学指标的数学正确性**和**数值稳定性**。
+
+---
+
+**盲区 1 — validate() R² 使用每样本均值而非全局均值（P2 科学精确性）**
+
+**思维误区**：以为"每个样本内计算均值，再累加 SS_tot"在语义上等价于"全局均值 SS_tot"。
+
+**根因**：`SS_tot = Σ_samples Σ(y - ȳ_sample)²` 只包含**样本内方差**（within-sample variance），不包含**样本间方差**（between-sample variance = `Σ n_s*(ȳ_s - ȳ_global)²`）。根据方差分解：`SS_tot_global = SS_tot_within + SS_tot_between`，因此 `SS_tot_per-sample ≤ SS_tot_global`。分母偏小 → `R² = 1 - SS_res/SS_tot` 偏高（乐观偏差）。
+
+**影响**：对 z-scored 信号（全局均值 ≈ 0），每样本均值也 ≈ 0，偏差极小。但训练可信度摘要对 R² = 0.3 做通过/失败判断，数学上正确的指标至关重要。
+
+**修复**：使用**在线单遍算法**（无需存储所有样本）：累积 `ss_res, ss_raw(Σy²), ss_sum(Σy), ss_cnt(n)`，最终用代数恒等式 `SS_tot = Σy² - n·ȳ²` 计算全局均值 SS_tot。对重建 R² 和预测 R² 均应用。
+
+**规则**：**多样本累积 R² 必须使用全局均值。若无法两遍扫描，使用代数恒等式 `SS_tot = Σy² - n·ȳ²` 在单遍内正确计算。**
+
+---
+
+**盲区 2 — `_transformer_seq2seq_predict(n_steps=0)` 返回完整序列（P2）**
+
+**根因**：`pred_all[:, -n_steps:, :]` 当 `n_steps=0` 时，`-0 == 0`，切片返回整个序列而非空张量。
+
+**修复**：调用 `repeat` 之前添加早返回：`if n_steps <= 0: return context.new_empty(B, 0, H)`
+
+---
+
+**盲区 3 — `UncertaintyAwarePredictor.uncertainty_head` 无数值稳定性保护（P3）**
+
+**根因**：`exp(0.5 * log_var)` 无上界约束。`log_var > 88`（float32）时溢出为 Inf，NLL 损失产生 NaN 梯度，训练静默失败。
+
+**修复**：`torch.clamp(log_var, min=-10.0, max=10.0)` → std ∈ [0.007, 148]，覆盖 z-scored 神经信号全范围。
+
+---
+
+## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
 |------|------|---------|
@@ -451,6 +883,28 @@ train_step()
 | 训练曲线可视化（loss + R² PNGs） | ✅ 已实现 | V5.30 |
 | 断点续训（--resume） | ✅ 已实现 | V5.30 |
 | 时序数据增强（noise + scale，可选） | ✅ 已实现（默认关闭） | V5.30 |
+| NPI 风格 context_length 可配置 | ✅ 已实现 | V5.31 |
+| HierarchicalPredictor NPI 兼容（prediction_steps=1 整数除法） | ✅ 已修复 | V5.31 |
+| validate() 真因果 pred_R²（因果编码） | ✅ 已修复 | V5.31 |
+| HierarchicalPredictor 上采样器 BatchNorm1d→GroupNorm（静默归零修复） | ✅ 已修复 | V5.32 |
+| use_uncertainty 配置文档准确化（默认关闭） | ✅ 已修复 | V5.32 |
+| use_uncertainty Python 默认值同步 YAML（True→False） | ✅ 已修复 | V5.33 |
+| GRU 自回归滚动输出投影——反馈维度修复 | ✅ 已修复 | V5.33 |
+| GRU 自回归滚动输出投影——累积维度修复（对称完整） | ✅ 已修复 | V5.34 |
+| avg_pool1d 调用前守卫（短 context 崩溃修复） | ✅ 已修复 | V5.35 |
+| validate() pred_enc 从 h_ctx_dict 初始化（decoder 维度修复） | ✅ 已修复 | V5.35 |
+| pred_loss N 不匹配守卫（防御性一致性） | ✅ 已修复 | V5.35 |
+| UncertaintyAwarePredictor MC dropout eval 状态恢复 | ✅ 已修复 | V5.35 |
+| 非层级 TransformerPredictor 错误分派修复（predict_next/forward） | ✅ 已修复 | V5.36 |
+| UAP._base_predict 统一分派（TransformerPredictor shape 修复） | ✅ 已修复 | V5.36 |
+| _transformer_seq2seq_predict 模块级辅助函数（DRY 消重） | ✅ 已实现 | V5.36 |
+| validate() h_ctx_dict 显式初始化（鲁棒性） | ✅ 已修复 | V5.36 |
+| GRU+uncertainty 不支持组合 ValueError（构造时明确拒绝） | ✅ 已修复 | V5.37 |
+| UAP._base_predict GRU tuple 防御性解包 | ✅ 已修复 | V5.37 |
+| validate() decoder 在 T < _PRED_MIN_SEQ_LEN 时删除节点守卫 | ✅ 已修复 | V5.37 |
+| validate() R² 全局均值（per-sample mean → 在线单遍算法） | ✅ 已修复 | V5.38 |
+| _transformer_seq2seq_predict n_steps=0 返回空张量守卫 | ✅ 已修复 | V5.38 |
+| UAP uncertainty_head log_var clamp（防溢出 → NaN 梯度） | ✅ 已修复 | V5.38 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 
