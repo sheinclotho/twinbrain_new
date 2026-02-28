@@ -11,6 +11,7 @@ Full reimagination of TwinBrain training pipeline:
 This is a COMPLETE standalone system, not just optimization modules.
 """
 
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -381,7 +382,12 @@ class GraphNativeBrainModel(nn.Module):
         # as T=300 used by default.  The resulting scalar loss is then
         # compatible with the float16 computation graph via autocast.
         pred_f = pred.float()
-        tgt_f  = target.float()
+        # Detach target: tgt_f is the ground-truth signal (data[node_type].x),
+        # used as a fixed reference for the magnitude spectrum comparison.
+        # Gradients should flow only through pred_f (the model reconstruction).
+        # Detaching also avoids creating an unnecessary float32 copy of the
+        # target in the autograd graph, reducing peak memory during backward.
+        tgt_f  = target.detach().float()
         pred_fft = torch.fft.rfft(pred_f, dim=1)   # [N, T//2+1, C] complex
         tgt_fft  = torch.fft.rfft(tgt_f,  dim=1)   # [N, T//2+1, C] complex
         return F.mse_loss(pred_fft.abs(), tgt_fft.abs()) / T
@@ -413,7 +419,11 @@ class GraphNativeBrainModel(nn.Module):
         # almost-zero predictions) then produce NaN → training divergence.
         # float32 has sufficient precision so 1e-8 is correctly enforced.
         p = pred.float().reshape(N * C, T)    # [N*C, T]
-        t = target.float().reshape(N * C, T)  # [N*C, T]
+        # Detach target: the reference signal is supervision only; gradients
+        # should flow through *pred* alone.  Detaching also prevents the
+        # float32 reshape of the target from being retained in the autograd
+        # graph as a saved activation, reducing peak memory during backward.
+        t = target.detach().float().reshape(N * C, T)  # [N*C, T]
         # Centre
         p = p - p.mean(dim=1, keepdim=True)
         t = t - t.mean(dim=1, keepdim=True)
@@ -760,8 +770,18 @@ class GraphNativeBrainModel(nn.Module):
                 if T < self._PRED_MIN_SEQ_LEN:
                     continue
                 T_ctx = int(T * self._PRED_CONTEXT_RATIO)
-                context = h[:, :T_ctx, :]       # [N, T_ctx, H]
-                future_target = h[:, T_ctx:, :] # [N, T_fut, H]
+                context = h[:, :T_ctx, :]               # [N, T_ctx, H]
+                # Stop-gradient on the prediction target: future_target is
+                # supervision (analogous to a label in supervised learning),
+                # so gradients should flow only through the *prediction*
+                # (pred_mean / predictor / context) and NOT back through
+                # future_target into the encoder.
+                # Benefits:
+                #   1. Semantically correct: the target should be treated as
+                #      a fixed reference, not as a model output to be optimised.
+                #   2. Reduces peak GPU memory during backward() by removing
+                #      the gradient path through h[:, T_ctx:, :] → encoder.
+                future_target = h[:, T_ctx:, :].detach() # [N, T_fut, H]
 
                 # Causal prediction: last context_length steps → next prediction_steps.
                 # This is the NPI paradigm: "N past steps → K future steps."
@@ -1499,7 +1519,14 @@ class GraphNativeTrainer:
         # 仅在 CUDA 设备上执行；对 CPU/MPS 无影响。
         # 注意：此处清理缓存（释放碎片化 reserved 块），而非清理活跃内存
         # （模型参数/优化器状态等活跃张量不受影响）。
+        # gc.collect() must run BEFORE empty_cache(): Python's reference
+        # counting normally frees tensors immediately, but reference cycles
+        # (common in complex module graphs) are only broken by the cyclic
+        # garbage collector.  Running gc.collect() first ensures all
+        # unreachable CUDA tensors are released so empty_cache() can
+        # return their memory to the CUDA allocator pool.
         if self._device_type == 'cuda':
+            gc.collect()
             torch.cuda.empty_cache()
         
         # Advance epoch counter in the adaptive loss balancer so that the warmup
@@ -1542,6 +1569,7 @@ class GraphNativeTrainer:
         # the tail of this epoch and the head of the next start from a low-
         # fragmentation state.
         if self._device_type == 'cuda':
+            gc.collect()
             torch.cuda.empty_cache()
         
         # Step scheduler (if not ReduceLROnPlateau)
