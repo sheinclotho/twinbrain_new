@@ -1316,11 +1316,18 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         else:
             eta_str = "计算中..."
         
-        # Memory monitoring every 10 epochs
-        if epoch % 10 == 0 and torch.cuda.is_available():
+        # Memory monitoring every 5 epochs with fragmentation warning
+        if epoch % 5 == 0 and torch.cuda.is_available():
             allocated_gb = torch.cuda.memory_allocated() / 1e9
             reserved_gb = torch.cuda.memory_reserved() / 1e9
+            frag_ratio = (reserved_gb - allocated_gb) / max(reserved_gb, 1e-6)
             logger.info(f"  💾 GPU Memory: allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
+            if frag_ratio > 0.5 and reserved_gb > 0.5:
+                logger.warning(
+                    f"  ⚠️ GPU 显存碎片化较高 ({frag_ratio*100:.0f}% 碎片): "
+                    f"reserved={reserved_gb:.2f} GB 中仅 {allocated_gb:.2f} GB 被使用。"
+                    f" 若遇到 CUDA OOM，建议启用 gradient_checkpointing 或减小 max_seq_len/prediction_steps。"
+                )
         
         # Check for NaN loss
         if np.isnan(train_loss) or np.isinf(train_loss):
@@ -1330,6 +1337,15 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         # 验证
         if epoch % config['training']['val_frequency'] == 0:
             val_loss, r2_dict = trainer.validate(val_graphs)
+            
+            # Free fragmented GPU memory after validation.
+            # validate() performs multiple forward passes (one causal-context
+            # re-encode per sample plus the main forward), creating many
+            # intermediate tensors.  Even with torch.no_grad() these can leave
+            # the CUDA allocator's reserved pool fragmented, making it harder
+            # for the next training epoch's backward() to find contiguous blocks.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # Step scheduler based on validation loss (for ReduceLROnPlateau)
             trainer.step_scheduler_on_validation(val_loss)
