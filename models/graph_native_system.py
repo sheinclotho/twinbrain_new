@@ -399,8 +399,16 @@ class GraphNativeBrainModel(nn.Module):
             Scalar loss in [0, 2]  (0 = perfect positive correlation).
         """
         N, T, C = pred.shape
-        p = pred.reshape(N * C, T)    # [N*C, T]
-        t = target.reshape(N * C, T)  # [N*C, T]
+        # Cast to float32 before computing Pearson correlation.
+        # In AMP training (float16), the clamp(min=1e-8) guard below is
+        # ineffective: 1e-8 is below the float16 minimum representable
+        # positive normal value (~6.1e-5) and rounds to 0, so the clamp
+        # becomes clamp(min=0) and does not prevent division by zero.
+        # Near-zero norms (common in early training when the model outputs
+        # almost-zero predictions) then produce NaN → training divergence.
+        # float32 has sufficient precision so 1e-8 is correctly enforced.
+        p = pred.float().reshape(N * C, T)    # [N*C, T]
+        t = target.float().reshape(N * C, T)  # [N*C, T]
         # Centre
         p = p - p.mean(dim=1, keepdim=True)
         t = t - t.mean(dim=1, keepdim=True)

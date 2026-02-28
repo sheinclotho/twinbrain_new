@@ -1597,7 +1597,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
             swa_model.eval()
             swa_total_loss = 0.0
             swa_ss_res: Dict[str, float] = {}
-            swa_ss_tot: Dict[str, float] = {}
+            swa_ss_raw: Dict[str, float] = {}
+            swa_ss_sum: Dict[str, float] = {}
+            swa_ss_cnt: Dict[str, int] = {}
             with torch.no_grad():
                 for val_data in val_graphs:
                     val_data = val_data.to(trainer.device)
@@ -1613,7 +1615,11 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                     # compute_loss is defined on the underlying module
                     swa_losses = _orig_model.compute_loss(val_data, recon_swa, encoded=enc_swa)
                     swa_total_loss += sum(swa_losses.values()).item()
-                    # R² per modality
+                    # R² per modality — use online accumulators for global-mean SS_tot.
+                    # The old approach used tgt.mean() (per-sample mean), which misses
+                    # between-sample variance and gives an inflated R² estimate.
+                    # The _r2_from_accum helper uses SS_tot = Σy² - n*ȳ² (algebraic
+                    # identity) which recovers the exact global mean without a second pass.
                     for nt in trainer.node_types:
                         if nt in val_data.node_types and nt in recon_swa:
                             tgt = val_data[nt].x
@@ -1623,12 +1629,18 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                             rec = rec[:, :T_min, :]
                             if rec.shape[0] != tgt.shape[0]:
                                 continue
-                            tgt_mean = tgt.mean()
                             swa_ss_res[nt] = swa_ss_res.get(nt, 0.0) + ((tgt - rec) ** 2).sum().item()
-                            swa_ss_tot[nt] = swa_ss_tot.get(nt, 0.0) + ((tgt - tgt_mean) ** 2).sum().item()
+                            swa_ss_raw[nt] = swa_ss_raw.get(nt, 0.0) + (tgt ** 2).sum().item()
+                            swa_ss_sum[nt] = swa_ss_sum.get(nt, 0.0) + tgt.sum().item()
+                            swa_ss_cnt[nt] = swa_ss_cnt.get(nt, 0)   + tgt.numel()
             swa_val_loss = swa_total_loss / max(len(val_graphs), 1)
             swa_r2_dict = {
-                f'r2_{nt}': (1.0 - swa_ss_res.get(nt, 0.0) / max(swa_ss_tot.get(nt, 1e-12), 1e-12))
+                f'r2_{nt}': GraphNativeTrainer._r2_from_accum(
+                    swa_ss_res.get(nt, 0.0),
+                    swa_ss_raw.get(nt, 0.0),
+                    swa_ss_sum.get(nt, 0.0),
+                    swa_ss_cnt.get(nt, 0),
+                )
                 for nt in trainer.node_types
             }
 
