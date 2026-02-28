@@ -14,6 +14,7 @@ This is a COMPLETE standalone system, not just optimization modules.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import contextlib
 import random
 from torch_geometric.data import HeteroData
 from typing import Dict, List, Optional, Tuple
@@ -1105,58 +1106,22 @@ class GraphNativeTrainer:
                     data['eeg'].x = eeg_x_enhanced
         
         try:
-            # Forward and backward pass with optional mixed precision
+            # ── Forward and backward pass ─────────────────────────────────────
+            # Use autocast when AMP is enabled, contextlib.nullcontext otherwise.
+            # This eliminates the duplicated forward+loss block that previously
+            # existed for the AMP and non-AMP paths respectively.
             if self.use_amp:
-                # Use appropriate autocast context manager based on API version
-                if USE_NEW_AMP_API:
-                    # New API: torch.amp.autocast() requires device_type
-                    amp_context = autocast(device_type=self.device_type)
-                else:
-                    # Old API: torch.cuda.amp.autocast() doesn't require device_type
-                    amp_context = autocast()
-                
-                with amp_context:
-                    # Forward pass.
-                    # When use_prediction=True, retrieve encoded latent representations
-                    # so compute_loss can train the predictor in latent space.
-                    if self.model.use_prediction:
-                        reconstructed, _, encoded = self.model(
-                            data, return_prediction=False, return_encoded=True
-                        )
-                    else:
-                        reconstructed, _ = self.model(data, return_prediction=False)
-                        encoded = None
-                    
-                    # Compute losses (reconstruction + optional latent prediction)
-                    losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-                    
-                    # Adaptive loss balancing
-                    if self.use_adaptive_loss:
-                        total_loss, weights = self.loss_balancer(losses)
-                    else:
-                        total_loss = sum(losses.values())
-                    
-                    # ── EEG 防零崩塌正则化 ───────────────────────────────
-                    # eeg_handler 计算的熵+多样性+活动损失之前从未加入总损失
-                    # （eeg_info 被静默丢弃）。此处补全，确保其梯度信号生效。
-                    # 注：权重已在 AntiCollapseRegularizer 初始化时配置
-                    # (entropy_weight, diversity_weight, activity_weight)，默认 0.01。
-                    eeg_reg = eeg_info.get('regularization_loss')
-                    if eeg_reg is not None:
-                        total_loss = total_loss + eeg_reg
-                        losses['eeg_reg'] = eeg_reg
-                
-                # Backward pass with gradient scaling.
-                # Apply loss_scale (= 1/gradient_accumulation_steps) to normalise
-                # gradient magnitude when accumulating across multiple steps.
-                self.scaler.scale(total_loss * loss_scale).backward()
-                if do_optimizer_step:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+                amp_ctx = (
+                    autocast(device_type=self.device_type)
+                    if USE_NEW_AMP_API else autocast()
+                )
             else:
-                # Standard training without AMP
+                amp_ctx = contextlib.nullcontext()
+
+            with amp_ctx:
+                # Forward pass.
+                # When use_prediction=True, retrieve encoded latent representations
+                # so compute_loss can train the predictor in latent space.
                 if self.model.use_prediction:
                     reconstructed, _, encoded = self.model(
                         data, return_prediction=False, return_encoded=True
@@ -1164,25 +1129,33 @@ class GraphNativeTrainer:
                 else:
                     reconstructed, _ = self.model(data, return_prediction=False)
                     encoded = None
-                
+
                 # Compute losses (reconstruction + optional latent prediction)
                 losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-                
+
                 # Adaptive loss balancing
                 if self.use_adaptive_loss:
                     total_loss, weights = self.loss_balancer(losses)
                 else:
                     total_loss = sum(losses.values())
-                
-                # EEG 防零崩塌正则化（同 AMP 路径）
+
+                # ── EEG 防零崩塌正则化 ───────────────────────────────
+                # eeg_handler 计算的熵+多样性+活动损失之前从未加入总损失
+                # （eeg_info 被静默丢弃）。此处补全，确保其梯度信号生效。
                 eeg_reg = eeg_info.get('regularization_loss')
                 if eeg_reg is not None:
                     total_loss = total_loss + eeg_reg
                     losses['eeg_reg'] = eeg_reg
-                
-                # Backward pass.
-                # Apply loss_scale (= 1/gradient_accumulation_steps) to normalise
-                # gradient magnitude when accumulating across multiple steps.
+
+            # Backward pass — AMP uses scaler, non-AMP uses plain backward.
+            if self.use_amp:
+                self.scaler.scale(total_loss * loss_scale).backward()
+                if do_optimizer_step:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+            else:
                 (total_loss * loss_scale).backward()
                 if do_optimizer_step:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
@@ -1301,6 +1274,31 @@ class GraphNativeTrainer:
         if self.use_scheduler and isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step(val_loss)
     
+    @staticmethod
+    def _r2_from_accum(
+        ss_res: float, ss_raw: float, ss_sum: float, ss_cnt: int
+    ) -> float:
+        """Compute R² from online accumulators (single-pass, global mean).
+
+        Uses the algebraic identity ``SS_tot = Σy² - n·ȳ²`` so no second pass
+        over the data is needed and the global mean is exact (not per-sample).
+
+        Args:
+            ss_res: Σ(y − ŷ)² accumulated over all samples.
+            ss_raw: Σy²        accumulated over all samples.
+            ss_sum: Σy         accumulated over all samples.
+            ss_cnt: n          total number of elements.
+
+        Returns:
+            R² ∈ (−∞, 1].  Returns 0.0 when SS_tot ≤ 1e-12 (constant signal).
+        """
+        if ss_cnt > 0:
+            global_mean = ss_sum / ss_cnt
+            ss_tot = ss_raw - ss_cnt * global_mean ** 2
+        else:
+            ss_tot = 0.0
+        return 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+
     @torch.no_grad()
     def validate(self, data_list: List[HeteroData]) -> Tuple[float, Dict[str, float]]:
         """
@@ -1541,37 +1539,28 @@ class GraphNativeTrainer:
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
 
-        # ── Assemble R² dict ────────────────────────────────────────────────
+        # ── Assemble R² dict via _r2_from_accum() helper ────────────────────
         r2_dict: Dict[str, float] = {}
 
-        # Reconstruction R²: compute SS_tot from global mean using algebraic identity.
-        # SS_tot = Σy² - n*ȳ²  where ȳ = Σy / n.
-        # This is correct for any number of validation samples regardless of
-        # z-scoring; per-sample means (the old approach) systematically inflate R².
+        # Reconstruction R²
         for node_type in self.node_types:
-            n = ss_cnt[node_type]
-            if n > 0:
-                global_mean = ss_sum[node_type] / n
-                tot = ss_raw[node_type] - n * global_mean ** 2
-            else:
-                tot = 0.0
-            r2 = 1.0 - ss_res[node_type] / tot if tot > 1e-12 else 0.0
+            r2 = self._r2_from_accum(
+                ss_res[node_type], ss_raw[node_type],
+                ss_sum[node_type], ss_cnt[node_type],
+            )
             r2_dict[f'r2_{node_type}'] = r2
             key = f'val_r2_{node_type}'
             if key not in self.history:
                 self.history[key] = []
             self.history[key].append(r2)
 
-        # Signal-space prediction R² (★ primary metric) — same global-mean approach.
+        # Signal-space prediction R² (★ primary metric)
         if self.model.use_prediction:
             for node_type in self.node_types:
-                n = pred_ss_cnt[node_type]
-                if n > 0:
-                    global_mean = pred_ss_sum[node_type] / n
-                    tot = pred_ss_raw[node_type] - n * global_mean ** 2
-                else:
-                    tot = 0.0
-                pred_r2 = 1.0 - pred_ss_res[node_type] / tot if tot > 1e-12 else 0.0
+                pred_r2 = self._r2_from_accum(
+                    pred_ss_res[node_type], pred_ss_raw[node_type],
+                    pred_ss_sum[node_type], pred_ss_cnt[node_type],
+                )
                 r2_dict[f'pred_r2_{node_type}'] = pred_r2
                 key = f'val_pred_r2_{node_type}'
                 if key not in self.history:
