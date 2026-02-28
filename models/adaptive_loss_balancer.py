@@ -47,7 +47,7 @@ class AdaptiveLossBalancer(nn.Module):
         warmup_epochs: int = 5,
         modality_energy_ratios: Optional[Dict[str, float]] = None,
         min_weight: float = 0.01,
-        max_weight: float = 100.0,
+        max_weight: float = 10.0,
     ):
         """
         Initialize adaptive loss balancer.

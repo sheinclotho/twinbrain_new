@@ -1146,9 +1146,16 @@ class GraphNativeTrainer:
                     end_factor=1.0,
                     total_iters=warmup_epochs,
                 )
+                # T_0=20: first cosine restart at warmup_epochs+20 (epoch 25 with default warmup=5).
+                # The original T_0=10 caused a premature restart at epoch 15, which spiked LR and
+                # triggered the AdaptiveLossBalancer to misread the transient loss increase as
+                # "pred_eeg converging much slower" → inflated pred_eeg weight rapidly → train_loss
+                # appeared to rise and pred_r2_eeg collapsed (matching the epoch-11/15 divergence
+                # pattern observed in logs).  T_0=20 delays the restart well past the balancer's
+                # warmup stabilisation period.
                 cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     self.optimizer,
-                    T_0=10,    # restart every 10 epochs
+                    T_0=20,    # restart every 20 epochs (was 10)
                     T_mult=2,  # double period after each restart
                     eta_min=learning_rate * 0.01,
                 )
@@ -1159,7 +1166,7 @@ class GraphNativeTrainer:
                 )
                 logger.info(
                     f"LR scheduler: Linear warmup ({warmup_epochs} epochs) "
-                    f"→ CosineAnnealingWarmRestarts(T_0=10, T_mult=2)"
+                    f"→ CosineAnnealingWarmRestarts(T_0=20, T_mult=2)"
                 )
             elif scheduler_type == 'onecycle':
                 # OneCycle (will need total_steps, set in train_epoch)
@@ -1479,9 +1486,15 @@ class GraphNativeTrainer:
                 detached_losses = {k: v.detach() for k, v in losses.items()}
                 self.loss_balancer.update_weights(detached_losses)
             
-            # Return loss values
+            # Return loss values.
+            # total_raw = unweighted sum of all task losses (interpretable metric for logging).
+            # total     = weighted sum after adaptive balancing (used for backward; inflates
+            #             when balancer increases pred weights, so NOT suitable as a user-
+            #             visible training metric — using it caused the apparent "train_loss
+            #             rising" symptom even when individual task losses were stable).
             loss_dict = {k: v.item() for k, v in losses.items()}
-            loss_dict['total'] = total_loss.item()
+            loss_dict['total_raw'] = sum(loss_dict.values())   # unweighted; used as train_loss
+            loss_dict['total'] = total_loss.item()             # weighted; used for backward only
             
             return loss_dict
         
@@ -1593,7 +1606,7 @@ class GraphNativeTrainer:
                 do_optimizer_step=is_accum_boundary,
                 loss_scale=1.0 / ga,
             )
-            total_loss += loss_dict['total']
+            total_loss += loss_dict.get('total_raw', loss_dict['total'])
             
             # ── 精细碎片控制（epoch 内周期清理）─────────────────────────────
             # 每 _cuda_clear_interval 步执行一次 gc.collect() + empty_cache()。

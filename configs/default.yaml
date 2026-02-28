@@ -444,16 +444,20 @@ v5_optimization:
   # 建议：5（约总 epoch 数的 5–10%）。
   warmup_epochs: 5
 
-  # 自适应损失平衡（GradNorm 变体）
+    # 自适应损失平衡（GradNorm 变体）
   adaptive_loss:
     # GradNorm 恢复力系数。较大 → 更激进地平衡各任务训练速度。
     # 建议：1.5（Chen et al. 2018 推荐值）。
     alpha: 1.5
     # 损失权重内部学习率
-    # 建议：0.025（远小于主学习率，确保权重缓慢调整）。
-    learning_rate: 0.025
+    # 建议：0.01（原值 0.025 与 CosineAnnealingWarmRestarts 的 LR 重启峰值相互作用，
+    # 在重启后的 6 个 epoch 内将 pred_eeg 权重推至 max_weight，导致
+    # train_loss 虚假上升和 pred_r2_eeg 崩溃。降至 0.01 使权重变化更平稳）。
+    learning_rate: 0.01
     # 每隔多少步更新一次权重（频繁更新会引入噪声）
-    update_frequency: 10
+    # 原值 10 → 每 epoch 约 8 次更新（80步/epoch ÷ 10）；
+    # 新值 80 → 每 epoch 约 1 次更新，避免单 epoch 内的过度震荡。
+    update_frequency: 80
     # 预热 epoch 数（预热期权重固定为初始值，保证模型先有稳定梯度）
     warmup_epochs: 5
     # EEG/fMRI 信号能量比（用于初始化权重）
