@@ -190,6 +190,7 @@ class GraphPredictionPropagator(nn.Module):
         hidden_channels: int,
         num_prop_layers: int = 2,
         dropout: float = 0.1,
+        use_gradient_checkpointing: bool = False,
     ):
         """
         Args:
@@ -200,6 +201,9 @@ class GraphPredictionPropagator(nn.Module):
                 sufficient to reach 2-hop neighbours (e.g. A→B→C), which
                 covers the typical cortical relay distance.
             dropout: Dropout rate.
+            use_gradient_checkpointing: Free intermediate activations inside
+                each ST-GCN propagate() call to reduce peak GPU memory during
+                backward.  Mirrors the same flag on the main encoder.
         """
         super().__init__()
         self.node_types = node_types
@@ -219,6 +223,7 @@ class GraphPredictionPropagator(nn.Module):
                     temporal_kernel_size=1,
                     use_attention=True,
                     use_spectral_norm=True,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
                     dropout=dropout,
                 )
             self.prop_layers.append(nn.ModuleDict(conv_dict))
@@ -547,6 +552,7 @@ class GraphNativeBrainModel(nn.Module):
                 hidden_channels=hidden_channels,
                 num_prop_layers=pred_cfg.get('num_prop_layers', 2),
                 dropout=dropout,
+                use_gradient_checkpointing=use_gradient_checkpointing,
             )
     
     def forward(
@@ -954,6 +960,13 @@ class GraphNativeTrainer:
         self._optimization_config = optimization_config or {}
         self.model = model.to(device)
         self.device = device
+        # Cache device type string (e.g. 'cuda', 'cpu') once so all methods can
+        # use it without re-deriving it from self.device each time.
+        self._device_type = getattr(
+            torch.device(device) if isinstance(device, str) else device,
+            'type',
+            str(device).split(':')[0],
+        )
         self.node_types = node_types
         self.max_grad_norm = max_grad_norm
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
@@ -1242,9 +1255,26 @@ class GraphNativeTrainer:
         # 提升模型对信号噪声和个体差异的鲁棒性（类似神经影像信号增强文献中
         # 的 jitter 和 scaling 方法）。验证时不增强，保证评估一致性。
         # 实现为纯 in-place-free 加法/乘法，不影响 autograd 图。
+        #
+        # IMPORTANT: Save pre-augmentation tensors and restore in finally.
+        # If HeteroData.to(device) returns the SAME object (in-place move, which
+        # is the default PyG behaviour when data is already on the target device
+        # or in some PyG versions), `data` is the SAME object as data_list[i].
+        # Without restoration, noise+scale augmentation permanently corrupts the
+        # cached graph tensors: each epoch augments the already-augmented signal
+        # from the previous epoch, causing unbounded signal drift.
+        # Storing originals in _orig_aug and restoring in finally gives the same
+        # safety guarantee that EEG enhancement and time masking already have.
+        _orig_aug: Dict[str, torch.Tensor] = {}
         if self._aug_enabled:
             for _nt in data.node_types:
                 if hasattr(data[_nt], 'x') and data[_nt].x is not None:
+                    # .clone() makes an independent copy of the original tensor.
+                    # Without clone(), _orig_aug[_nt] would be an alias of the
+                    # same storage; any in-place operation performed later on
+                    # data[_nt].x (e.g. by HeteroData internals or PyG operators)
+                    # would silently corrupt the saved "original".
+                    _orig_aug[_nt] = data[_nt].x.clone()
                     _x = data[_nt].x
                     if self._aug_noise_std > 0:
                         _x = _x + torch.randn_like(_x) * self._aug_noise_std
@@ -1416,6 +1446,21 @@ class GraphNativeTrainer:
                 if _nt_r == 'eeg' and original_eeg_x is not None:
                     continue  # EEG already restored to original_eeg_x above
                 data[_nt_r].x = _x_orig_r
+            # Restore noise+scale augmented features to the pre-augmentation originals.
+            # This must happen LAST (after EEG and time-mask restorations) because:
+            # - _orig_aug[nt] holds the tensor that existed BEFORE any augmentation
+            # - _orig_tm[nt] holds the tensor AFTER augmentation but BEFORE masking
+            # - Restoring _orig_aug unconditionally gives the cleanest, deterministic
+            #   result: every data[nt].x ends up at the original cached signal.
+            #
+            # Why this is necessary: if HeteroData.to(device) moves tensors in-place
+            # (the default PyG behaviour when data is already on the target device),
+            # `data` IS the same Python object as data_list[i].  Without this
+            # restoration, the noise+scale-augmented tensor persists in the cached
+            # graph and is re-augmented on every subsequent epoch, causing
+            # cumulative signal drift across epochs.
+            for _nt_a, _x_orig_a in _orig_aug.items():
+                data[_nt_a].x = _x_orig_a
     
     def train_epoch(self, data_list: List[HeteroData], epoch: int = None, total_epochs: int = None) -> float:
         """
@@ -1447,6 +1492,15 @@ class GraphNativeTrainer:
         total_loss = 0.0
         num_batches = len(epoch_data)
         ga = self.gradient_accumulation_steps  # shorthand
+        
+        # ── 显存清理（epoch 开始时）────────────────────────────────────────
+        # 在每个 epoch 的训练步骤开始前清理 CUDA 分配器的碎片化缓存，
+        # 确保本 epoch 的 backward() 能分配到连续显存块。
+        # 仅在 CUDA 设备上执行；对 CPU/MPS 无影响。
+        # 注意：此处清理缓存（释放碎片化 reserved 块），而非清理活跃内存
+        # （模型参数/优化器状态等活跃张量不受影响）。
+        if self._device_type == 'cuda':
+            torch.cuda.empty_cache()
         
         # Advance epoch counter in the adaptive loss balancer so that the warmup
         # period expires correctly and weight adaptation becomes active.
@@ -1483,12 +1537,11 @@ class GraphNativeTrainer:
         avg_loss = total_loss / len(data_list)
         self.history['train_loss'].append(avg_loss)
         
-        # Release fragmented GPU memory blocks once per epoch.
-        # This frees reserved-but-unallocated blocks back to the allocator so
-        # they can be reused, reducing fragmentation OOM across epochs.
-        # Called per-epoch (not per-step) to avoid repeated sync overhead.
-        device_type = getattr(self.device, 'type', str(self.device).split(':')[0])
-        if device_type == 'cuda':
+        # Release fragmented GPU memory blocks once per epoch (end of epoch).
+        # Complements the cache clear at the start of next epoch so that both
+        # the tail of this epoch and the head of the next start from a low-
+        # fragmentation state.
+        if self._device_type == 'cuda':
             torch.cuda.empty_cache()
         
         # Step scheduler (if not ReduceLROnPlateau)
