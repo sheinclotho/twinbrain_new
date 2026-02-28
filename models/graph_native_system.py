@@ -371,8 +371,14 @@ class GraphNativeBrainModel(nn.Module):
             Scalar spectral MSE (scale-normalised by T).
         """
         T = pred.shape[1]
-        pred_fft = torch.fft.rfft(pred, dim=1)    # [N, T//2+1, C] complex
-        tgt_fft  = torch.fft.rfft(target, dim=1)  # [N, T//2+1, C] complex
+        # cuFFT in half precision (float16/AMP) only supports power-of-two
+        # signal sizes.  Cast to float32 to support arbitrary lengths such
+        # as T=300 used by default.  The resulting scalar loss is then
+        # compatible with the float16 computation graph via autocast.
+        pred_f = pred.float()
+        tgt_f  = target.float()
+        pred_fft = torch.fft.rfft(pred_f, dim=1)   # [N, T//2+1, C] complex
+        tgt_fft  = torch.fft.rfft(tgt_f,  dim=1)   # [N, T//2+1, C] complex
         return F.mse_loss(pred_fft.abs(), tgt_fft.abs()) / T
 
     @staticmethod
