@@ -19,6 +19,15 @@ openneuro-py 的 ``download()`` 函数在遍历数据集根目录时，无论是
 - 每个文件直接通过 HTTPS 下载，无需 openneuro-py 介入。
 - 若 S3 方式失败（非公共数据集等情况），自动回退到 openneuro-py。
 
+**性能优化（多线程 + 断点续传）**
+
+- 多线程：``max_concurrent_downloads`` 控制同时下载的文件数（默认 8），
+  内部使用 ``ThreadPoolExecutor`` 并行拉取多个文件，充分利用带宽。
+- 断点续传：每个文件先写到 ``.part`` 临时文件；若中断重启，自动检测
+  已有的字节数并发送 ``Range: bytes=<offset>-`` 请求，从断点续传。
+- 大分块：``_CHUNK_SIZE`` 提升至 4 MiB，减少系统调用开销，提高吞吐量。
+- 连接复用：每线程内使用长连接 ``httpx.Client``，避免重复 TCP 握手。
+
 使用方法::
 
     # 下载单个被试
@@ -41,10 +50,12 @@ from __future__ import annotations
 import inspect
 import logging
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import httpx
 from tqdm import tqdm
@@ -59,7 +70,7 @@ _OPENNEURO_GQL_URL = "https://openneuro.org/crn/graphql"
 _S3_BUCKET = "openneuro.org"
 _S3_BASE_URL = f"https://s3.amazonaws.com/{_S3_BUCKET}"
 _S3_XML_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
-_CHUNK_SIZE = 64 * 1024  # 64 KiB per read chunk
+_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB per read chunk (up from 64 KiB)
 _MAX_BACKOFF_SECONDS = 60  # cap for exponential retry delay
 
 _TAG_QUERY = """
@@ -152,19 +163,60 @@ def _s3_download_file(
     timeout: float = 600.0,
     max_retries: int = 10,
     file_label: str = "",
+    client: Optional[httpx.Client] = None,
 ) -> None:
-    """从 S3 下载单个文件（流式传输，支持断点重试，含字节级进度条）。"""
+    """从 S3 下载单个文件（流式传输，断点续传，含字节级进度条）。
+
+    断点续传逻辑：下载期间写入 ``<dest>.part`` 临时文件，完成后原子重命名。
+    若 ``.part`` 文件已存在（上次中断残留），自动发送
+    ``Range: bytes=<offset>-`` 请求从断点继续，而非从头重下。
+
+    Parameters
+    ----------
+    client:
+        可选的复用 ``httpx.Client`` 实例（多线程场景下每线程传入独立实例）。
+        若为 ``None``，则为每次请求临时创建连接。
+    """
     url = f"{_S3_BASE_URL}/{key}"
     dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+
+    label = file_label or dest.name
 
     for attempt in range(1, max_retries + 1):
+        # ── 断点续传：检查已有的字节数 ────────────────────────────────────
         try:
-            with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as resp:
+            resume_offset = part.stat().st_size if part.exists() else 0
+        except OSError:
+            resume_offset = 0
+
+        headers: Dict[str, str] = {}
+        if resume_offset > 0:
+            headers["Range"] = f"bytes={resume_offset}-"
+            logger.debug("断点续传 %s，从 %d 字节处继续", key, resume_offset)
+
+        try:
+            _get = client.stream if client is not None else httpx.stream
+            with _get(  # type: ignore[operator]
+                "GET", url, headers=headers, timeout=timeout, follow_redirects=True
+            ) as resp:
+                # 206 Partial Content → resume OK；200 → server ignores Range, restart
+                if resp.status_code == 200 and resume_offset > 0:
+                    logger.debug("服务端不支持 Range，重新下载 %s", key)
+                    resume_offset = 0
                 resp.raise_for_status()
-                total_bytes = int(resp.headers["content-length"]) if "content-length" in resp.headers else None
-                label = file_label or dest.name
+
+                # Determine open mode AFTER confirming server's Range support.
+                # If resume_offset was reset to 0 (server returned 200), use "wb"
+                # so the .part file is overwritten rather than appended to.
+                open_mode = "ab" if resume_offset > 0 else "wb"
+
+                content_length = int(resp.headers["content-length"]) if "content-length" in resp.headers else None
+                total_bytes = (resume_offset + content_length) if content_length is not None else None
+
                 with tqdm(
                     total=total_bytes,
+                    initial=resume_offset,
                     unit="B",
                     unit_scale=True,
                     unit_divisor=1024,
@@ -172,10 +224,13 @@ def _s3_download_file(
                     leave=False,
                     dynamic_ncols=True,
                 ) as bar:
-                    with open(dest, "wb") as fh:
+                    with open(part, open_mode) as fh:
                         for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
                             fh.write(chunk)
                             bar.update(len(chunk))
+
+            # ── 成功：原子重命名 ──────────────────────────────────────────
+            part.replace(dest)
             return
         except Exception as exc:  # noqa: BLE001
             if attempt == max_retries:
@@ -194,8 +249,12 @@ def _download_subject_via_s3(
     target_dir: Path,
     max_retries: int = 10,
     timeout: float = 60.0,
+    max_concurrent_downloads: int = 8,
 ) -> int:
     """通过 S3 公共存储桶下载指定被试的全部文件。
+
+    多线程并发下载（由 ``max_concurrent_downloads`` 控制），每线程独立维护
+    ``httpx.Client`` 连接池，支持断点续传。
 
     Returns
     -------
@@ -216,33 +275,83 @@ def _download_subject_via_s3(
 
     # dataset_id 部分已包含在 key 中，下载到 target_dir/{dataset_id}/... 下
     dataset_prefix = f"{dataset_id}/"
-    downloaded = 0
+
+    # ── 筛选需要下载的文件 ──────────────────────────────────────────────────
+    to_download: List[Tuple[str, int, Path]] = []  # (key, size, dest)
+    skipped = 0
+    for key, size in files:
+        if not key.startswith(dataset_prefix):
+            logger.warning("S3 返回的对象键不符合预期格式，已跳过: %s", key)
+            skipped += 1
+            continue
+        rel = key[len(dataset_prefix):]
+        dest = target_dir / rel
+        if dest.exists() and dest.stat().st_size == size:
+            logger.debug("跳过已存在文件: %s", rel)
+            skipped += 1
+        else:
+            to_download.append((key, size, dest))
+
+    if not to_download:
+        logger.info("全部文件已存在，无需下载")
+        return len(files)
+
+    logger.info(
+        "待下载 %d 个文件，跳过 %d 个已完成文件，并发数: %d",
+        len(to_download), skipped, max_concurrent_downloads,
+    )
+
+    # ── 多线程下载 ──────────────────────────────────────────────────────────
+    bar_lock = threading.Lock()
+    errors: List[str] = []
+
+    def _worker(args: Tuple[str, int, Path]) -> str:
+        """单文件下载任务，返回相对路径（用于进度条）。"""
+        key, _size, dest = args
+        rel = key[len(dataset_prefix):]
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+        ) as cli:
+            _s3_download_file(
+                key=key,
+                dest=dest,
+                timeout=600.0,
+                max_retries=max_retries,
+                file_label=rel,
+                client=cli,
+            )
+        return rel
+
     with logging_redirect_tqdm():
         with tqdm(
             total=len(files),
+            initial=skipped,
             unit="file",
             desc=subject_prefix,
             dynamic_ncols=True,
         ) as file_bar:
-            for key, _size in files:
-                if not key.startswith(dataset_prefix):
-                    logger.warning("S3 返回的对象键不符合预期格式，已跳过: %s", key)
-                    file_bar.update(1)
-                    continue
-                rel = key[len(dataset_prefix):]
-                dest = target_dir / rel
-                file_bar.set_postfix_str(rel, refresh=True)
-                if dest.exists() and dest.stat().st_size == _size:
-                    logger.debug("跳过已存在文件: %s", rel)
-                    downloaded += 1
-                    file_bar.update(1)
-                    continue
-                logger.debug("下载: %s", rel)
-                _s3_download_file(key, dest, timeout=600.0, max_retries=max_retries, file_label=rel)
-                downloaded += 1
-                file_bar.update(1)
+            with ThreadPoolExecutor(max_workers=max_concurrent_downloads) as pool:
+                futures = {pool.submit(_worker, item): item for item in to_download}
+                for future in as_completed(futures):
+                    key, _size, dest = futures[future]
+                    rel = key[len(dataset_prefix):]
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error("下载失败 %s: %s", rel, exc)
+                        errors.append(rel)
+                    with bar_lock:
+                        file_bar.set_postfix_str(rel, refresh=True)
+                        file_bar.update(1)
 
-    return downloaded
+    if errors:
+        raise RuntimeError(
+            f"以下 {len(errors)} 个文件下载失败（已用尽重试次数）:\n"
+            + "\n".join(f"  {e}" for e in errors)
+        )
+
+    return len(files)
 
 
 # ── openneuro-py 回退（备用路径）─────────────────────────────────────────────
@@ -283,12 +392,12 @@ def download_subject(
     dataset_id: str = DATASET_ID,
     max_retries: int = 10,
     metadata_timeout: float = 30.0,
-    max_concurrent_downloads: int = 5,  # kept for API compatibility; downloads are sequential
+    max_concurrent_downloads: int = 8,
 ) -> None:
     """Download all data files for *subject* from OpenNeuro.
 
-    先ず S3 公共存储桶方式（主路径，无分页限制）；若 S3 方式失败，
-    自动回退到 openneuro-py 方式（备用路径，需先获取快照标签）。
+    先ず S3 公共存储桶方式（主路径，无分页限制，多线程并发下载）；
+    若 S3 方式失败，自动回退到 openneuro-py 方式（备用路径）。
 
     Parameters
     ----------
@@ -302,9 +411,11 @@ def download_subject(
     max_retries:
         Maximum retry attempts per file.
     metadata_timeout:
-        Timeout in seconds for GraphQL metadata requests.
+        Timeout in seconds for GraphQL metadata requests and S3 listing.
     max_concurrent_downloads:
-        Retained for API compatibility; currently downloads are sequential.
+        Number of files to download in parallel. Defaults to 8.
+        Increase for faster downloads on high-bandwidth connections;
+        decrease if the server throttles connections.
     """
     target_dir = Path(target_dir)
     subject_prefix = f"sub-{subject.zfill(3)}"
@@ -324,6 +435,7 @@ def download_subject(
             target_dir=target_dir,
             max_retries=max_retries,
             timeout=metadata_timeout,
+            max_concurrent_downloads=max_concurrent_downloads,
         )
         if count > 0:
             logger.info("下载完成（S3）: %s / %s，共 %d 个文件", dataset_id, subject_prefix, count)
