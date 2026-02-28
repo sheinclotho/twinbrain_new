@@ -1,10 +1,83 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-27  
-**版本**：V5.30  
+**最后更新**：2026-02-28  
+**版本**：V5.39  
 **状态**：生产就绪
 
 ---
+
+## [V5.39] 2026-02-28 — 信号空间预测损失 + 预测步数扩展（pred_r2 改善）
+
+### 背景
+
+用户观察到训练结果呈现异常模式：重建 R² 优秀（EEG=0.985, fMRI=0.980），但预测 R² 极差
+（pred_r2_eeg=-0.026 < 0, pred_r2_fmri=0.193）。这种"重建好但预测坏"的模式不是数据不足造成
+的，而是训练目标与评估指标之间存在根本性的对齐缺陷。
+
+### 根因分析
+
+**1. 训练目标-评估指标脱节（最严重）**
+
+训练阶段：预测器仅在**潜空间**接受监督信号
+- `pred_eeg` / `pred_fmri` = `huber_loss(pred_latent, future_latent)` ← 纯潜空间
+
+评估阶段：`pred_r2` 在**信号空间**计算
+- `pred_r2` = `1 - SS_res/SS_tot`，其中 SS_res 来自 `decoder(pred_latent)` vs `raw_future_signal`
+
+**解码器在训练期间从未见过预测潜向量**（只见过编码器潜向量），因此即使潜空间预测尚可，
+解码后的信号预测也可能很差——解码器没有被训练来泛化到预测潜向量。
+
+**2. prediction_steps=10 太小**
+
+EEG @ 250Hz: 10 步 = 40ms，不足一个 alpha 周期（80-125ms），预测信号在如此短的窗口内与
+随机噪声无法区分，导致 pred_r2 < 0。
+
+**3. pred_sig_* 任务未注册到 AdaptiveLossBalancer**
+
+如果信号空间损失未在 balancer.task_names 中注册，use_adaptive_loss=True 时 forward()
+会静默跳过这些损失，它们的梯度完全丢失。
+
+### 修复
+
+**A. 新增信号空间预测损失（核心修复）**
+
+`compute_loss()` 在现有潜空间预测损失之后，额外计算端到端信号空间损失：
+```
+decoded = decoder(pred_latents)               # [N, pred_steps, 1]
+target  = data[nt].x[:, T_ctx:T_ctx+steps, :] # [N, steps, 1]
+pred_sig_{nt} = huber_loss(decoded, target)
+```
+梯度路径：`pred_sig_loss → decoder → prediction_propagator → predictor.predict_next`
+同时训练解码器（对预测潜向量的解码）和预测器（端到端信号质量）。
+
+**B. 注册 pred_sig_* 到 AdaptiveLossBalancer**
+
+`GraphNativeTrainer.__init__()` 的 `task_names` 列表在 `use_prediction=True` 时
+新增 `pred_sig_{node_type}`，确保信号空间损失参与自适应权重调整。
+
+**C. prediction_steps 默认值 10 → 30**
+
+- EEG: 30 步 × 4ms = 120ms（覆盖完整 alpha 节律周期）
+- fMRI: 30 步 × 2s = 60s（覆盖血动力学完整响应）
+- pred_r2 的评估窗口从 40ms/20s 扩展到 120ms/60s，更有科学意义
+
+### 代码变更
+
+- `models/graph_native_system.py`：
+  - `compute_loss()`: 新增 `T_ctx_dict` 追踪 + 信号空间预测损失块
+  - `GraphNativeTrainer.__init__()`: `task_names` 增加 `pred_sig_{node_type}`
+- `configs/default.yaml`: `prediction_steps: 10 → 30`
+- `AGENTS.md`: 更新损失表 + 新增错误记录
+
+### 向后兼容性
+
+- 现有检查点：可继续加载，无架构变更（新损失是运行时计算项，非模型参数）
+- `use_prediction: false` 时：新代码路径完全跳过，与旧版本行为完全一致
+- `use_adaptive_loss: false` 时：`pred_sig_*` 损失以均等权重加入 total_loss
+
+---
+
+
 
 ## [V5.30] 2026-02-27 — 相关性跨模态边 + 训练曲线可视化 + 断点续训 + 数据增强 + 缓存架构重设计
 

@@ -648,6 +648,9 @@ class GraphNativeBrainModel(nn.Module):
         if encoded is not None and self.use_prediction:
             pred_means: Dict[str, torch.Tensor] = {}
             future_targets: Dict[str, torch.Tensor] = {}
+            # Track T_ctx per modality so the signal-space loss block below can
+            # slice the correct future window from the raw signal.
+            T_ctx_dict: Dict[str, int] = {}
 
             for node_type in self.node_types:
                 if node_type not in encoded:
@@ -665,12 +668,14 @@ class GraphNativeBrainModel(nn.Module):
                 pred = self.predictor.predict_next(context)  # [N, pred_steps, H]
                 pred_means[node_type] = pred
                 future_targets[node_type] = future_target
+                T_ctx_dict[node_type] = T_ctx
 
             # System-level graph propagation of predictions.
             if pred_means:
                 pred_means = self.prediction_propagator(pred_means, data)
 
-            # Prediction loss: propagated prediction vs. actual future.
+            # ── Latent-space prediction loss ─────────────────────────────────
+            # Propagated latent prediction vs. actual future latent.
             for node_type, pred_mean in pred_means.items():
                 future_target = future_targets[node_type]
                 # Guard N-mismatch (same defensive contract as recon_loss):
@@ -698,6 +703,74 @@ class GraphNativeBrainModel(nn.Module):
                             future_target[:, :aligned_steps, :],
                         )
                     losses[f'pred_{node_type}'] = pred_loss
+
+            # ── Signal-space prediction loss ─────────────────────────────────
+            # Decode the predicted latents to raw signal space and compare with
+            # the actual future raw signal.
+            #
+            # Rationale: the latent-space loss above teaches the predictor to
+            # predict abstract latent dynamics.  However, the pred_r2 metric in
+            # validate() is measured in signal space (decoder(pred_latent) vs
+            # future raw signal).  If the decoder was never trained to decode
+            # *predicted* latents (only *encoded* latents), the round-trip quality
+            # can be poor even when the latent prediction itself is reasonable.
+            # Adding this end-to-end signal-space loss directly optimises the
+            # metric that is reported to the user.
+            #
+            # The gradient flows:  pred_sig_loss → decoder → prediction_propagator
+            #                       → predictor.predict_next
+            # Training both the decoder (for predicted-latent decoding) and the
+            # predictor (for signal-quality alignment) in a single backward pass.
+            if pred_means and T_ctx_dict:
+                # Build a minimal HeteroData containing only predicted latents.
+                # The decoder (GraphNativeDecoder) accesses only encoded_data[nt].x
+                # and runs 1-D temporal convolutions — it does NOT use edge_index or
+                # edge_attr.  A node-feature-only HeteroData is therefore sufficient.
+                _pred_dec = HeteroData()
+                for _nt, _pred_lat in pred_means.items():
+                    _pred_dec[_nt].x = _pred_lat   # [N, pred_steps, H]
+                try:
+                    _pred_sigs = self.decoder(_pred_dec)
+                except Exception as _e:
+                    logger.debug(
+                        f"pred_sig decoder call failed for "
+                        f"node_types={list(pred_means.keys())} — "
+                        f"pred shapes={[tuple(v.shape) for v in pred_means.values()]}: {_e}"
+                    )
+                    _pred_sigs = {}
+                for _nt, _pred_sig in _pred_sigs.items():
+                    _T_ctx = T_ctx_dict.get(_nt)
+                    if _T_ctx is None or _nt not in data.node_types:
+                        continue
+                    _future_sig = data[_nt].x[
+                        :, _T_ctx:_T_ctx + _pred_sig.shape[1], :
+                    ]
+                    _n = min(_pred_sig.shape[1], _future_sig.shape[1])
+                    if _n < 1:
+                        logger.debug(
+                            f"pred_sig_{_nt}: skipped (aligned_steps=0; "
+                            f"pred_sig.shape={tuple(_pred_sig.shape)}, "
+                            f"future_sig.shape={tuple(_future_sig.shape)})"
+                        )
+                        continue
+                    if _pred_sig.shape[0] != _future_sig.shape[0]:
+                        logger.debug(
+                            f"pred_sig_{_nt}: skipped (N mismatch; "
+                            f"pred N={_pred_sig.shape[0]}, future N={_future_sig.shape[0]})"
+                        )
+                        continue
+                    if self.loss_type == 'huber':
+                        losses[f'pred_sig_{_nt}'] = F.huber_loss(
+                            _pred_sig[:, :_n, :],
+                            _future_sig[:, :_n, :],
+                            delta=1.0,
+                        )
+                    else:
+                        losses[f'pred_sig_{_nt}'] = F.mse_loss(
+                            _pred_sig[:, :_n, :],
+                            _future_sig[:, :_n, :],
+                        )
+
 
         
         return losses
@@ -925,12 +998,18 @@ class GraphNativeTrainer:
         # Adaptive loss balancing
         self.use_adaptive_loss = use_adaptive_loss
         if use_adaptive_loss:
-            # Create task names from node types
+            # Create task names from node types.
+            # pred_sig_{nt} is the signal-space prediction loss added in V5.39
+            # (compute_loss decodes predicted latents and compares with future raw
+            # signal).  It must be registered here so the balancer weights it
+            # appropriately; without registration the balancer ignores it and
+            # the total_loss computation would not include it when use_adaptive_loss=True.
             task_names = []
             for node_type in node_types:
                 task_names.append(f'recon_{node_type}')
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
+                    task_names.append(f'pred_sig_{node_type}')
             
             al_cfg = self._optimization_config.get('adaptive_loss', {})
             self.loss_balancer = AdaptiveLossBalancer(

@@ -166,8 +166,10 @@ model:
   use_prediction: true
   
   # 预测步数（T_future = T × 1/3 与此参数的最小值）
-  # 建议：10（fMRI 10 TRs = 20s，EEG 10 pts = 40ms）。
-  prediction_steps: 10
+  # 建议：30（fMRI 30 TRs = 60s，覆盖完整血动力学响应周期；
+  #          EEG 30 pts = 120ms，覆盖 alpha 节律整周期，比旧默认值 10 有更多训练信号）。
+  # V5.39 起默认从 10 调整为 30，以与 signal-space 预测损失配合获得更好的预测质量。
+  prediction_steps: 30
   
   # Dropout 比率
   # 建议：0.1。小数据集可提高到 0.2–0.3 以增强正则化。
