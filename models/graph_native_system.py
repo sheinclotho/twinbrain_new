@@ -1481,6 +1481,23 @@ class GraphNativeTrainer:
                             pred_enc[nt].x = h_ctx   # [N, T_ctx, H] — correct H for decoder
                         for nt, pred_lat in pred_latents.items():
                             pred_enc[nt].x = pred_lat  # override with predicted latent
+                        # Guard: node types NOT in h_ctx_dict (T < _PRED_MIN_SEQ_LEN=4)
+                        # still carry the raw signal [N, T, C=1] from data.clone().
+                        # The decoder's Conv1d(in_channels=hidden_channels) would fail
+                        # with a channel mismatch on [N, 1, T].
+                        # This is extremely rare in practice (typical T ≈ 300 >> 4)
+                        # but could occur in short-sequence edge cases or unit tests.
+                        # Fix: remove those node types from pred_enc so the decoder
+                        # only processes nodes that have correct latent features.
+                        for nt in list(pred_enc.node_types):
+                            if nt not in h_ctx_dict:
+                                logger.debug(
+                                    f"validate: removing '{nt}' from pred_enc "
+                                    f"(T={data[nt].x.shape[1]} < _PRED_MIN_SEQ_LEN="
+                                    f"{self.model._PRED_MIN_SEQ_LEN}; raw signal "
+                                    f"would cause decoder channel mismatch)"
+                                )
+                                del pred_enc[nt]
                         pred_signals = self.model.decoder(pred_enc)  # {nt: [N, pred_steps', C]}
 
                         for node_type, pred_sig in pred_signals.items():

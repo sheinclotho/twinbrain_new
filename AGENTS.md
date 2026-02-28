@@ -773,13 +773,62 @@ MC dropout 路径中 `self.base_predictor.train()` 被无条件调用，在 vali
 
 **修复**：在 `if ctx_T_map:` 之前添加 `h_ctx_dict: Dict[str, torch.Tensor] = {}` 显式初始化，使不变式变得显式，防止未来代码修改破坏此假设。
 
-**配置空间全覆盖审查结果**：
+**配置空间全覆盖审查结果（Round 6）**：
 | 配置 | 状态 |
 |------|------|
 | use_hierarchical=True（默认） | ✅ 正确 |
 | use_hierarchical=False, use_transformer=False (GRU) | ✅ 正确 |
 | use_hierarchical=False, use_transformer=True | **已修复 V5.36** |
 | use_uncertainty=True 包装任意 base | **已修复 V5.36**（UAP._base_predict） |
+
+---
+
+### [2026-02-28] 预测功能第七轮审查：GRU+不确定性彻底破损 + validate() decoder 潜在崩溃
+
+**背景**：第七轮独立审查，假设所有已修复项都可能存在遗漏，穷举所有配置组合的完整调用链。
+
+---
+
+**盲区 1 — GRU + UncertaintyAwarePredictor 组合三重破损（P2 运行时崩溃）**
+
+**配置**：`use_hierarchical=False, use_transformer=False, use_uncertainty=True`
+
+**思维误区**：以为"Round 6 修复了 UAP._base_predict 就覆盖了所有 else 分支"，没有追问：**当 base_predictor = nn.GRU 时，`_base_predict` else 分支是否还会崩溃？**
+
+**三重根因**：
+1. `_base_predict` else 分支调用 `return self.base_predictor(x)` = `nn.GRU(x)` → 返回 `(output, h_n)` **tuple**，不是 Tensor → TypeError
+2. 即使解包 `output`：`nn.GRU(x)` 返回 `[N, ctx_len, hidden_dim]`，不是 `[N, future_steps, input_dim]`（时间维度长度错误，特征维度 256≠128）
+3. `uncertainty_head` 期待 `input_dim=128`，收到 `hidden_dim=256` → 形状崩溃
+
+**修复**：
+1. `EnhancedMultiStepPredictor.__init__` 对不支持的组合提前抛出 `ValueError`（构造时即报告，而非运行时神秘崩溃）
+2. `UAP._base_predict` else 分支防御性解包：`result = self.base_predictor(x); return result[0] if isinstance(result, tuple) else result`（保护直接实例化 UAP 的场景，如单元测试）
+
+---
+
+**盲区 2 — validate() decoder 在 T < _PRED_MIN_SEQ_LEN 时崩溃（P3 潜在崩溃）**
+
+**根因**：`pred_enc = data.clone()` 会保留 T < 4 的节点的原始信号 `[N, T, C=1]`。`h_ctx_dict` 不包含这些节点（因 T < _PRED_MIN_SEQ_LEN）。decoder 的 `Conv1d(in_channels=128)` 应用于 `[N, 1, T]` → 通道不匹配崩溃。
+
+**修复**：在调用 decoder 前删除 pred_enc 中不在 h_ctx_dict 中的节点类型：
+```python
+for nt in list(pred_enc.node_types):
+    if nt not in h_ctx_dict:
+        logger.debug(f"validate: removing '{nt}' from pred_enc (T < _PRED_MIN_SEQ_LEN)")
+        del pred_enc[nt]
+```
+
+**配置空间完整覆盖审查结果（Round 7）**：
+| 配置 | 状态 |
+|------|------|
+| use_hierarchical=True（默认） | ✅ |
+| use_hierarchical=True, use_transformer=False | ✅ |
+| use_hierarchical=False, use_transformer=True | ✅ |
+| use_hierarchical=False, use_transformer=False | ✅ |
+| + use_uncertainty=True（上述前三种） | ✅ |
+| **use_hierarchical=False, use_transformer=False, use_uncertainty=True** | **✅ 已明确禁止（ValueError）V5.37** |
+
+**新规则**：**每次新增 isinstance 分支时，必须追问：`else` 分支现在还有哪些类型会落入？每种落入类型的返回值格式是否兼容后续代码？** 特别是 `nn.GRU` 等 PyTorch 原生模块的返回格式（tuple），永远不应假设与自定义 nn.Module 相同。
 
 ---
 
@@ -814,6 +863,9 @@ MC dropout 路径中 `self.base_predictor.train()` 被无条件调用，在 vali
 | UAP._base_predict 统一分派（TransformerPredictor shape 修复） | ✅ 已修复 | V5.36 |
 | _transformer_seq2seq_predict 模块级辅助函数（DRY 消重） | ✅ 已实现 | V5.36 |
 | validate() h_ctx_dict 显式初始化（鲁棒性） | ✅ 已修复 | V5.36 |
+| GRU+uncertainty 不支持组合 ValueError（构造时明确拒绝） | ✅ 已修复 | V5.37 |
+| UAP._base_predict GRU tuple 防御性解包 | ✅ 已修复 | V5.37 |
+| validate() decoder 在 T < _PRED_MIN_SEQ_LEN 时删除节点守卫 | ✅ 已修复 | V5.37 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

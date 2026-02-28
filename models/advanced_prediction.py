@@ -693,8 +693,21 @@ class UncertaintyAwarePredictor(nn.Module):
             n_steps = future_steps if future_steps is not None else x.shape[1]
             return _transformer_seq2seq_predict(self.base_predictor, x, n_steps)
         else:
-            # nn.GRU (and any other future predictor types): direct call.
-            return self.base_predictor(x)
+            # nn.GRU (and any future predictor type that is not HierarchicalPredictor
+            # or TransformerPredictor): direct call.
+            #
+            # Defensive tuple-unpack: nn.GRU.forward(x) returns (output, h_n).
+            # Returning the tuple directly would crash every downstream consumer
+            # that expects a Tensor.  UncertaintyAwarePredictor can be instantiated
+            # directly (outside of EnhancedMultiStepPredictor) in unit tests or
+            # future extensions, so we unpack here regardless of the outer guard.
+            # (Note: EnhancedMultiStepPredictor.__init__ already raises ValueError
+            # for the specific combination that would put a raw GRU here, so this
+            # guard handles direct-instantiation scenarios only.)
+            result = self.base_predictor(x)
+            if isinstance(result, tuple):
+                return result[0]  # GRU: (output, h_n) → output tensor only
+            return result
 
     def forward(
         self,
@@ -842,7 +855,35 @@ class EnhancedMultiStepPredictor(nn.Module):
         self.use_hierarchical = use_hierarchical
         self.use_transformer = use_transformer  # needed to dispatch predict_next/forward correctly
         self.use_uncertainty = use_uncertainty
-        
+
+        # Validate unsupported configuration early — before allocating any parameters.
+        #
+        # use_hierarchical=False, use_transformer=False, use_uncertainty=True is broken
+        # because:
+        #   1. UncertaintyAwarePredictor._base_predict calls self.base_predictor(x) on
+        #      nn.GRU, which returns (output, h_n) tuple, not a tensor.
+        #   2. Even if unpacked, nn.GRU returns [N, ctx_len, hidden_dim] — the wrong
+        #      temporal length (ctx_len, not future_steps) and wrong feature dimension
+        #      (hidden_dim=256, not input_dim=128).
+        #   3. uncertainty_head expects input_dim; it receives hidden_dim → crash.
+        #
+        # Supported alternatives:
+        #   • Set use_uncertainty=False  (simplest — uncertainty estimation is disabled
+        #     by default and its head does not receive training gradients anyway).
+        #   • Set use_transformer=True   (flat TransformerPredictor + UAP — fixed R6).
+        #   • Set use_hierarchical=True  (HierarchicalPredictor + UAP — fully supported).
+        if not use_hierarchical and not use_transformer and use_uncertainty:
+            raise ValueError(
+                "Unsupported predictor configuration: "
+                "use_hierarchical=False + use_transformer=False + use_uncertainty=True. "
+                "The raw nn.GRU base predictor is incompatible with "
+                "UncertaintyAwarePredictor (wrong return type, temporal length and "
+                "feature dimension).  Choose one of: "
+                "(a) use_uncertainty=False, "
+                "(b) use_transformer=True, "
+                "(c) use_hierarchical=True."
+            )
+
         # Create base predictor
         if use_hierarchical:
             predictor_type = 'transformer' if use_transformer else 'gru'
