@@ -378,7 +378,8 @@ def _download_subject_via_openneuro_api(
     def _worker_api(args: Tuple[str, int, str, Path]) -> str:
         rel_path, _size, url, dest = args
         _stream_timeout = httpx.Timeout(
-            connect=_CONNECT_TIMEOUT, read=_STREAM_STALL_TIMEOUT
+            connect=_CONNECT_TIMEOUT, read=_STREAM_STALL_TIMEOUT,
+            write=None, pool=None,
         )
         with httpx.Client(timeout=_stream_timeout, follow_redirects=True) as cli:
             _s3_download_file(
@@ -564,7 +565,7 @@ def _s3_download_file_multipart(
 
                 try:
                     _stream = client.stream if client is not None else httpx.stream
-                    _req_timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=timeout)
+                    _req_timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=timeout, write=None, pool=None)
                     with _stream(  # type: ignore[operator]
                         "GET", url, headers=headers,
                         timeout=_req_timeout, follow_redirects=True,
@@ -682,7 +683,7 @@ def _s3_download_file(
             _get = client.stream if client is not None else httpx.stream
             # Use a split timeout: short connect timeout + per-read stall timeout.
             # A flat 600s timeout would not detect a stalled stream for up to 10 min.
-            _req_timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=timeout)
+            _req_timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=timeout, write=None, pool=None)
             with _get(  # type: ignore[operator]
                 "GET", url, headers=headers, timeout=_req_timeout, follow_redirects=True
             ) as resp:
@@ -798,7 +799,8 @@ def _download_subject_via_s3(
         key, _size, dest = args
         rel = key[len(dataset_prefix):]
         _stream_timeout = httpx.Timeout(
-            connect=_CONNECT_TIMEOUT, read=_STREAM_STALL_TIMEOUT
+            connect=_CONNECT_TIMEOUT, read=_STREAM_STALL_TIMEOUT,
+            write=None, pool=None,
         )
         with httpx.Client(
             timeout=_stream_timeout,
