@@ -832,6 +832,42 @@ for nt in list(pred_enc.node_types):
 
 ---
 
+### [2026-02-28] 预测功能第八轮审查：R² 科学精确性 + 数值稳定性 + 边界防御
+
+**背景**：第八轮独立审查。前七轮已消除所有已知的运行时崩溃类型，本轮聚焦于**科学指标的数学正确性**和**数值稳定性**。
+
+---
+
+**盲区 1 — validate() R² 使用每样本均值而非全局均值（P2 科学精确性）**
+
+**思维误区**：以为"每个样本内计算均值，再累加 SS_tot"在语义上等价于"全局均值 SS_tot"。
+
+**根因**：`SS_tot = Σ_samples Σ(y - ȳ_sample)²` 只包含**样本内方差**（within-sample variance），不包含**样本间方差**（between-sample variance = `Σ n_s*(ȳ_s - ȳ_global)²`）。根据方差分解：`SS_tot_global = SS_tot_within + SS_tot_between`，因此 `SS_tot_per-sample ≤ SS_tot_global`。分母偏小 → `R² = 1 - SS_res/SS_tot` 偏高（乐观偏差）。
+
+**影响**：对 z-scored 信号（全局均值 ≈ 0），每样本均值也 ≈ 0，偏差极小。但训练可信度摘要对 R² = 0.3 做通过/失败判断，数学上正确的指标至关重要。
+
+**修复**：使用**在线单遍算法**（无需存储所有样本）：累积 `ss_res, ss_raw(Σy²), ss_sum(Σy), ss_cnt(n)`，最终用代数恒等式 `SS_tot = Σy² - n·ȳ²` 计算全局均值 SS_tot。对重建 R² 和预测 R² 均应用。
+
+**规则**：**多样本累积 R² 必须使用全局均值。若无法两遍扫描，使用代数恒等式 `SS_tot = Σy² - n·ȳ²` 在单遍内正确计算。**
+
+---
+
+**盲区 2 — `_transformer_seq2seq_predict(n_steps=0)` 返回完整序列（P2）**
+
+**根因**：`pred_all[:, -n_steps:, :]` 当 `n_steps=0` 时，`-0 == 0`，切片返回整个序列而非空张量。
+
+**修复**：调用 `repeat` 之前添加早返回：`if n_steps <= 0: return context.new_empty(B, 0, H)`
+
+---
+
+**盲区 3 — `UncertaintyAwarePredictor.uncertainty_head` 无数值稳定性保护（P3）**
+
+**根因**：`exp(0.5 * log_var)` 无上界约束。`log_var > 88`（float32）时溢出为 Inf，NLL 损失产生 NaN 梯度，训练静默失败。
+
+**修复**：`torch.clamp(log_var, min=-10.0, max=10.0)` → std ∈ [0.007, 148]，覆盖 z-scored 神经信号全范围。
+
+---
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -866,6 +902,9 @@ for nt in list(pred_enc.node_types):
 | GRU+uncertainty 不支持组合 ValueError（构造时明确拒绝） | ✅ 已修复 | V5.37 |
 | UAP._base_predict GRU tuple 防御性解包 | ✅ 已修复 | V5.37 |
 | validate() decoder 在 T < _PRED_MIN_SEQ_LEN 时删除节点守卫 | ✅ 已修复 | V5.37 |
+| validate() R² 全局均值（per-sample mean → 在线单遍算法） | ✅ 已修复 | V5.38 |
+| _transformer_seq2seq_predict n_steps=0 返回空张量守卫 | ✅ 已修复 | V5.38 |
+| UAP uncertainty_head log_var clamp（防溢出 → NaN 梯度） | ✅ 已修复 | V5.38 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

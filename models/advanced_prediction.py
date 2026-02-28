@@ -49,6 +49,12 @@ def _transformer_seq2seq_predict(
     Returns:
         Predicted future tensor ``[batch, n_steps, input_dim]``.
     """
+    if n_steps <= 0:
+        # Guard against n_steps=0 (or negative):
+        # When n_steps=0, the intended slice pred_all[:, -n_steps:, :] becomes
+        # pred_all[:, 0:, :] because -0 == 0 in Python, returning the ENTIRE
+        # extended context sequence instead of the expected empty tensor.
+        return context.new_empty(context.shape[0], 0, context.shape[2])
     future_init = context[:, -1:, :].repeat(1, n_steps, 1)
     x_extended = torch.cat([context, future_init], dim=1)
     seq_len = x_extended.shape[1]
@@ -734,8 +740,12 @@ class UncertaintyAwarePredictor(nn.Module):
             if not return_uncertainty:
                 return prediction_mean, None
             
-            # Predict log variance
-            log_var = self.uncertainty_head(prediction_mean)
+            # Predict log variance.
+            # Clamp before exponentiation to prevent overflow to Inf:
+            # exp(0.5 * 10) ≈ 148, exp(0.5 * -10) ≈ 0.007 — both are reasonable
+            # std bounds for normalised neural signals.  Without this clamp, large
+            # positive log_var produces Inf std → NaN in the NLL loss → NaN gradients.
+            log_var = torch.clamp(self.uncertainty_head(prediction_mean), min=-10.0, max=10.0)
             prediction_std = torch.exp(0.5 * log_var)
             
             return prediction_mean, prediction_std

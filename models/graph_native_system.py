@@ -1342,12 +1342,27 @@ class GraphNativeTrainer:
         """
         self.model.eval()
         total_loss = 0.0
-        # Accumulators for reconstruction R²
-        ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
-        ss_tot: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
-        # Accumulators for signal-space prediction R²
+        # Accumulators for reconstruction R² using global mean (V5.38).
+        # Using per-sample means (the old approach) systematically inflates R²
+        # because SS_tot only captures within-sample variance (excludes between-sample
+        # variance), making the denominator artificially small.  A smaller SS_tot
+        # means R² = 1 - SS_res/SS_tot is closer to 1 — giving an overly optimistic
+        # metric.  We instead accumulate Σy, Σy², and count so the global mean can
+        # be recovered in a single pass without storing all y:
+        #
+        #   SS_tot_correct = Σy² - n*ȳ²   (algebraic identity: Σ(y-ȳ)² = Σy² - n*ȳ²)
+        #
+        # This gives the same result as computing SS_tot with the true global mean,
+        # while requiring only O(1) extra state (sum and count per modality).
+        ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}  # Σ(y-ŷ)²
+        ss_raw: Dict[str, float] = {nt: 0.0 for nt in self.node_types}  # Σy²
+        ss_sum: Dict[str, float] = {nt: 0.0 for nt in self.node_types}  # Σy
+        ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}  # n
+        # Same four accumulators for signal-space prediction R²
         pred_ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
-        pred_ss_tot: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_raw: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_sum: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
+        pred_ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}
 
         with torch.no_grad():
             for data in data_list:
@@ -1377,9 +1392,10 @@ class GraphNativeTrainer:
                         recon  = recon[:, :T_min, :]
                         if recon.shape[0] != target.shape[0]:
                             continue
-                        target_mean = target.mean()
                         ss_res[node_type] += ((target - recon) ** 2).sum().item()
-                        ss_tot[node_type] += ((target - target_mean) ** 2).sum().item()
+                        ss_raw[node_type] += (target ** 2).sum().item()
+                        ss_sum[node_type] += target.sum().item()
+                        ss_cnt[node_type] += target.numel()
 
                 # ── Signal-space prediction R² per modality ─────────────────
                 # TRULY CAUSAL evaluation:
@@ -1517,9 +1533,10 @@ class GraphNativeTrainer:
                                 continue
                             pred_aligned   = pred_sig[:, :n_steps, :]
                             future_aligned = future_sig[:, :n_steps, :]
-                            future_mean = future_aligned.mean()
                             pred_ss_res[node_type] += ((future_aligned - pred_aligned) ** 2).sum().item()
-                            pred_ss_tot[node_type] += ((future_aligned - future_mean) ** 2).sum().item()
+                            pred_ss_raw[node_type] += (future_aligned ** 2).sum().item()
+                            pred_ss_sum[node_type] += future_aligned.sum().item()
+                            pred_ss_cnt[node_type] += future_aligned.numel()
 
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
@@ -1527,9 +1544,17 @@ class GraphNativeTrainer:
         # ── Assemble R² dict ────────────────────────────────────────────────
         r2_dict: Dict[str, float] = {}
 
-        # Reconstruction R²
+        # Reconstruction R²: compute SS_tot from global mean using algebraic identity.
+        # SS_tot = Σy² - n*ȳ²  where ȳ = Σy / n.
+        # This is correct for any number of validation samples regardless of
+        # z-scoring; per-sample means (the old approach) systematically inflate R².
         for node_type in self.node_types:
-            tot = ss_tot[node_type]
+            n = ss_cnt[node_type]
+            if n > 0:
+                global_mean = ss_sum[node_type] / n
+                tot = ss_raw[node_type] - n * global_mean ** 2
+            else:
+                tot = 0.0
             r2 = 1.0 - ss_res[node_type] / tot if tot > 1e-12 else 0.0
             r2_dict[f'r2_{node_type}'] = r2
             key = f'val_r2_{node_type}'
@@ -1537,10 +1562,15 @@ class GraphNativeTrainer:
                 self.history[key] = []
             self.history[key].append(r2)
 
-        # Signal-space prediction R² (★ primary metric)
+        # Signal-space prediction R² (★ primary metric) — same global-mean approach.
         if self.model.use_prediction:
             for node_type in self.node_types:
-                tot = pred_ss_tot[node_type]
+                n = pred_ss_cnt[node_type]
+                if n > 0:
+                    global_mean = pred_ss_sum[node_type] / n
+                    tot = pred_ss_raw[node_type] - n * global_mean ** 2
+                else:
+                    tot = 0.0
                 pred_r2 = 1.0 - pred_ss_res[node_type] / tot if tot > 1e-12 else 0.0
                 r2_dict[f'pred_r2_{node_type}'] = pred_r2
                 key = f'val_pred_r2_{node_type}'
