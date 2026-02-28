@@ -115,7 +115,7 @@ def download_subject(
     from openneuro import download  # type: ignore[import-untyped]
 
     target_dir = Path(target_dir)
-    subject_prefix = f"sub-{subject}"
+    subject_prefix = f"sub-{subject.zfill(3)}"
 
     # ── 修复核心 ──────────────────────────────────────────────────────────────
     # 先取得最新 tag，传入 download() 后根目录查询切换为
