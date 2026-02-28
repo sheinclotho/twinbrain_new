@@ -162,6 +162,7 @@ class SpatialTemporalGraphConv(MessagePassing):
         use_spectral_norm: bool = True,
         use_gradient_checkpointing: bool = False,
         dropout: float = 0.1,
+        temporal_chunk_size: Optional[int] = None,
     ):
         super().__init__(aggr='add')  # Sum aggregation
         
@@ -170,6 +171,11 @@ class SpatialTemporalGraphConv(MessagePassing):
         self.use_attention = use_attention
         self.use_spectral_norm = use_spectral_norm
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        # temporal_chunk_size: process T timesteps in chunks during spatial
+        # message passing to bound peak GPU memory during backward recomputation.
+        # Peak message tensor size: O(chunk_size × E × H) instead of O(T × E × H).
+        # None = no chunking (full T, original behaviour).
+        self.temporal_chunk_size = temporal_chunk_size
         
         # Temporal convolution (processes time dimension)
         self.temporal_conv = nn.Conv1d(
@@ -252,82 +258,82 @@ class SpatialTemporalGraphConv(MessagePassing):
         x_t = self.temporal_conv(x_t)     # [N_src, C_out, T]
         x_t = x_t.permute(0, 2, 1)        # [N_src, T, C_out]
 
-        # 2. Vectorised spatial message passing across ALL T timesteps.
+        # 2. Chunked spatial message passing across T timesteps.
         #
-        #    Previous approach: Python ``for t in range(T)`` loop — T separate
-        #    propagate() calls, each launching its own small CUDA kernels.
-        #    With T=300, 4 encoder layers and 3 edge types this is ~3 600 kernel
-        #    launches per forward pass, keeping GPU utilisation very low.
+        #    "Temporal virtual-node" trick: replicate the graph T times so that
+        #    spatial message passing for all timesteps runs in a single propagate()
+        #    call.  Virtual node (n, t) → global index t*N_src + n.
         #
-        #    New approach: "temporal virtual-node" trick.
-        #      Create T independent copies of the graph by expanding edge_index:
-        #        virtual source node (n, t) → global index  t * N_src + n
-        #        virtual dest   node (m, t) → global index  t * N_dst + m
-        #      A single propagate() call then processes all T*E messages in
-        #      parallel on the GPU — much better hardware utilisation.
+        #    temporal_chunk_size controls how many timesteps are batched per
+        #    propagate() call:
+        #      • None / chunk_size ≥ T: one call, full T*E messages (original).
+        #      • chunk_size = k: ceil(T/k) calls, each with k*E messages.
+        #    Peak GPU memory during backward recomputation scales as chunk_size*E*H
+        #    instead of T*E*H, preventing CUDA OOM on large fMRI sequences with
+        #    dynamic graphs.  Typical savings: chunk_size=64 vs T=300 → 4.7× less
+        #    peak memory per layer backward.
         #
-        #    Attention normalisation (see message()): uses pyg_softmax with the
-        #      virtual-node index, which correctly normalises per (m, t), i.e.
-        #      per-node per-timestep — same semantics as the old per-step loop.
+        #    Correctness: spatial propagation for different timesteps is independent
+        #    (no temporal mixing in the spatial step), so chunking is mathematically
+        #    equivalent to a single T*E call.
         #
-        #    Memory: identical total (T*E*H floats for messages) but fused into
-        #      one CUDA launch; gradient checkpointing still available for the
-        #      single large propagate call.
+        #    Indexing fix: x must be permuted to [T, N, H] before flattening so
+        #    that flat row t*N+n correctly addresses (node n, timestep t).
+        #    The previous reshape(N*T, H) on a C-contiguous [N, T, H] tensor gave
+        #    row n*T+t, causing a systematic node/time transposition in the gathered
+        #    source features (only invisible when T==N, e.g. for fMRI ROIs ≈ 190).
         E = edge_index.shape[1]
+        chunk_size = self.temporal_chunk_size if self.temporal_chunk_size is not None else T
 
-        # Build temporal offsets once on the correct device
-        t_idx   = torch.arange(T, device=edge_index.device)   # [T]
-        src_off = (t_idx * N_src).unsqueeze(1)                # [T, 1]
-        dst_off = (t_idx * N_dst).unsqueeze(1)                # [T, 1]
+        # Permute once to [T, N, H] so that index t*N+n correctly addresses (n,t).
+        # contiguous() ensures reshape produces the expected row-major layout.
+        x_t_perm = x_t.permute(1, 0, 2).contiguous()   # [T, N_src, C_out]
+        x_perm   = x.permute(1, 0, 2).contiguous()      # [T, N_src, C_in]
 
-        # Expand edge_index: [2, E] → [2, T*E]
-        ei_src_exp = edge_index[0].unsqueeze(0) + src_off     # [T, E]
-        ei_dst_exp = edge_index[1].unsqueeze(0) + dst_off     # [T, E]
-        edge_index_exp = torch.stack([
-            ei_src_exp.reshape(-1),   # [T*E]
-            ei_dst_exp.reshape(-1),   # [T*E]
-        ], dim=0)                                             # [2, T*E]
+        out_chunks: list = []
+        for t_start in range(0, T, chunk_size):
+            t_end = min(t_start + chunk_size, T)
+            chunk_len = t_end - t_start
 
-        # Expand edge attributes (same weight for every copy of each edge)
-        edge_attr_exp: Optional[torch.Tensor]
-        if edge_attr is not None:
-            edge_attr_exp = edge_attr.repeat(T, 1)            # [T*E, feat_dim]
-        else:
-            edge_attr_exp = None
+            # Build chunk-local edge_index with virtual-node offsets
+            t_local = torch.arange(chunk_len, device=edge_index.device)  # [chunk_len]
+            src_off = (t_local * N_src).unsqueeze(1)   # [chunk_len, 1]
+            dst_off = (t_local * N_dst).unsqueeze(1)   # [chunk_len, 1]
+            ei_src  = edge_index[0].unsqueeze(0) + src_off   # [chunk_len, E]
+            ei_dst  = edge_index[1].unsqueeze(0) + dst_off   # [chunk_len, E]
+            ei_chunk = torch.stack([ei_src.reshape(-1), ei_dst.reshape(-1)])  # [2, chunk*E]
 
-        # Flatten temporal dim: virtual node (n, t) occupies row t*N_src + n
-        x_t_flat    = x_t.reshape(N_src * T, -1)             # [N_src*T, C_out]
-        x_orig_flat = x.reshape(N_src * T, -1)               # [N_src*T, C_in]
+            ea_chunk = edge_attr.repeat(chunk_len, 1) if edge_attr is not None else None
 
-        exp_size = (N_src * T, N_dst * T)
+            # Flatten chunk: row t_local*N_src+n = features of (node n, time t_start+t_local)
+            xt_chunk = x_t_perm[t_start:t_end].reshape(chunk_len * N_src, -1)
+            xo_chunk = x_perm  [t_start:t_end].reshape(chunk_len * N_src, -1)
 
-        def _do_propagate(xt_f, xo_f, ei, ea):
-            # For bipartite (cross-modal) edges where N_src != N_dst, PyG
-            # requires x as a (x_src, x_dst) 2-tuple so it can validate sizes
-            # independently.  Use a zero-filled destination placeholder.
-            if N_src != N_dst:
-                x_in = (xt_f, xt_f.new_zeros(N_dst * T, xt_f.shape[-1]))
+            exp_size_chunk = (N_src * chunk_len, N_dst * chunk_len)
+
+            def _do_propagate(xt_f, xo_f, ei, ea, sz=exp_size_chunk):
+                if N_src != N_dst:
+                    x_in = (xt_f, xt_f.new_zeros(sz[1], xt_f.shape[-1]))
+                else:
+                    x_in = xt_f
+                return self.propagate(ei, x=x_in, x_self=xo_f, edge_attr=ea, size=sz)
+
+            if self.use_gradient_checkpointing and self.training:
+                out_chunk = gradient_checkpoint(
+                    _do_propagate,
+                    xt_chunk, xo_chunk, ei_chunk, ea_chunk,
+                    use_reentrant=False,
+                )
             else:
-                x_in = xt_f
-            return self.propagate(ei, x=x_in, x_self=xo_f, edge_attr=ea,
-                                  size=exp_size)
+                out_chunk = _do_propagate(xt_chunk, xo_chunk, ei_chunk, ea_chunk)
 
-        if self.use_gradient_checkpointing and self.training:
-            out_flat = gradient_checkpoint(
-                _do_propagate,
-                x_t_flat, x_orig_flat, edge_index_exp, edge_attr_exp,
-                use_reentrant=False,
-            )
-        else:
-            out_flat = _do_propagate(
-                x_t_flat, x_orig_flat, edge_index_exp, edge_attr_exp
-            )
+            out_chunks.append(out_chunk)
 
-        # out_flat[t * N_dst + m] = aggregated features for (node m, timestep t)
-        # Reshape [N_dst*T, C_out] → [T, N_dst, C_out] → [N_dst, T, C_out]
+        # Concatenate chunks: out_flat[t*N_dst + m] = features for (node m, timestep t)
+        out_flat = torch.cat(out_chunks, dim=0)  # [T*N_dst, C_out]
         assert out_flat.shape[0] == T * N_dst, (
             f"propagate() output has {out_flat.shape[0]} rows, expected T*N_dst={T * N_dst}. "
-            f"Ensure size=(N_src*T, N_dst*T) was passed correctly."
+            f"chunk_size={chunk_size}, num_chunks={len(out_chunks)}, N_src={N_src}, N_dst={N_dst}."
         )
         out = out_flat.view(T, N_dst, -1).permute(1, 0, 2).contiguous()
 
@@ -519,6 +525,7 @@ class GraphNativeEncoder(nn.Module):
         dropout: float = 0.1,
         use_dynamic_graph: bool = False,
         k_dynamic_neighbors: int = 10,
+        temporal_chunk_size: Optional[int] = None,
     ):
         """
         Initialize graph-native encoder.
@@ -543,6 +550,10 @@ class GraphNativeEncoder(nn.Module):
                 Only applies to intra-modal edges (src == dst node type).
             k_dynamic_neighbors: Number of neighbors kept per node in the
                 dynamically computed adjacency.
+            temporal_chunk_size: Process T timesteps in this many chunks per
+                propagate() call.  Bounds peak GPU memory during backward
+                recomputation to O(chunk_size × E × H) instead of O(T × E × H).
+                None = no chunking (full T, original behaviour).
         """
         super().__init__()
         
@@ -574,6 +585,7 @@ class GraphNativeEncoder(nn.Module):
                     use_attention=True,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     dropout=dropout,
+                    temporal_chunk_size=temporal_chunk_size,
                 )
             
             self.stgcn_layers.append(nn.ModuleDict(conv_dict))

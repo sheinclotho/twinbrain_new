@@ -932,6 +932,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
         k_dynamic_neighbors=config['model'].get('k_dynamic_neighbors', 10),
         num_subjects=num_subjects,
         use_spectral_loss=config['model'].get('use_spectral_loss', False),
+        temporal_chunk_size=config['model'].get('temporal_chunk_size', None),
     )
 
     if num_subjects > 0:
@@ -1327,8 +1328,20 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 logger.warning(
                     f"  ⚠️ GPU 显存碎片化较高 ({frag_ratio*100:.0f}% 碎片): "
                     f"reserved={reserved_gb:.2f} GB 中仅 {allocated_gb:.2f} GB 被使用。"
-                    f" 若遇到 CUDA OOM，建议启用 gradient_checkpointing 或减小 max_seq_len/prediction_steps。"
+                    f" 若遇到 CUDA OOM，建议：(1) 减小 temporal_chunk_size（如 32）；"
+                    f" (2) 关闭 use_dynamic_graph；(3) 减小 max_seq_len 或 k_nearest_fmri。"
                 )
+
+        # ── 每轮清理 GPU 碎片 ─────────────────────────────────────────────
+        # 每个训练步骤都会分配并释放大量中间张量（T×E 消息传递、梯度检查点等），
+        # 导致 CUDA 分配器的空闲列表碎片化累积。若不及时清理，这些碎片在多个 epoch
+        # 后会使较大的连续内存分配失败（OOM），即便 memory_allocated() 仍然很低。
+        # gc.collect() 先释放 Python 引用循环中持有的张量，再由 empty_cache() 将
+        # 空闲块归还给 CUDA，保证每个 epoch 开始时有最大的可用连续内存。
+        # 开销：每 epoch 约 1-5 ms，远低于 OOM 的代价。
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
         
         # Check for NaN loss
         if np.isnan(train_loss) or np.isinf(train_loss):
