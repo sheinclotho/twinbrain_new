@@ -6,10 +6,10 @@ ds006040 数据集下载工具
 
 **下载策略（优先级从高到低）**
 
-1. **OpenNeuro GraphQL 直接 API**（新主路径）：
-   通过 OpenNeuro GraphQL API 查询快照的完整文件列表（``snapshot.files``），
-   不经过根目录树遍历，彻底规避 openneuro-py 的分页限制问题。对每个文件
-   使用 OpenNeuro 返回的下载 URL（CDN/S3 均可）直接下载。
+1. **OpenNeuro GraphQL 直接 API**（主路径）：
+   通过 OpenNeuro GraphQL API 查询快照文件树，与 openneuro-py 使用相同的
+   真实 schema：顶层 ``snapshot(datasetId, tag)`` 字段 + ``files(tree: hash)``
+   逐层递归。对每个文件使用 OpenNeuro 返回的下载 URL（CDN/S3 均可）直接下载。
 
 2. **S3 公共存储桶**（第二备用）：
    公共数据集均已发布至 S3 存储桶 ``openneuro.org``，支持匿名读取。
@@ -18,36 +18,31 @@ ds006040 数据集下载工具
 
 3. **openneuro-py**（最终备用）：
    若上述方式均失败，回退到 openneuro-py 库。
-   注意：openneuro-py 的根目录树遍历受分页限制（约 9 条/页），
-   当根目录文件数 + 被试目录数超限时（如 sub-004、sub-005 等靠后被试），
-   可能报告 "Could not find path in the dataset"，此为已知局限。
 
-**历史说明（为什么曾切换到 S3 直接下载）**
+**GraphQL API 说明**
 
-openneuro-py 的 ``download()`` 函数在遍历数据集根目录时，无论是否传入
-``tag`` 参数，服务端 GraphQL ``files(tree: null)`` 查询均受分页限制，
-每次最多返回约 9 条顶层条目。当数据集根目录条目数超过该限制时
-（根文件 + 多个 sub-XXX 目录），靠后的被试（如 sub-004、sub-005）
-不在第一页，导致 openneuro-py 报告 "Could not find path in the dataset"。
+OpenNeuro 真实 GraphQL schema（与 openneuro-py 一致）：
 
-本次重新设计引入 OpenNeuro GraphQL 直接 API 策略，通过 ``snapshot.files``
-一次性获取所有文件 URL，从根源上解决分页问题，同时避免 S3 多连接并发时
-出现的大文件（>.fdt）下载卡顿（0%）问题。
+- 获取快照信息：``dataset(id: $id) { latestSnapshot { id } }``
+  其中 ``id`` 格式为 ``"ds006040:1.0.1"``，从中解析出 tag ``"1.0.1"``。
+
+- 获取文件列表：``snapshot(datasetId: $id, tag: $tag) { files(tree: $tree) { ... } }``
+  ``files`` 返回指定目录的**单层**内容（文件项 + 目录项）。对目录项通过
+  其 ``key``（git-annex tree hash）递归调用获取子目录内容，直到遍历完所有文件。
+
+  注意：不使用 ``dataset.snapshot(tag)``（该字段不存在于真实 schema），
+  也不使用 ``files(first: N, after: cursor)``（Relay Connection 分页，schema 不支持）。
 
 **性能参数说明**
 
 - ``max_concurrent_downloads``：同时下载的文件数，默认 3。
-  （原默认 8，减少以避免 S3 连接数过多导致限速卡顿。）
 - ``per_file_connections``：每个大文件的并行 Range 连接数，默认 1（关闭分片）。
-  （原默认 4，关闭后大文件不再因 32 路并发而卡死在 0%。
-  在带宽确实充足时可手动设为 4，但一般情况不推荐。）
 - 断点续传：每个文件分片先写到 ``.p<N>`` 临时文件；若中断重启，自动检测
   已有字节数并从断点续传；小文件或单连接模式则沿用 ``.part`` 临时文件。
 - 大分块：``_CHUNK_SIZE`` 为 4 MiB，减少系统调用开销，提高吞吐量。
 - 连接复用：每线程内使用长连接 ``httpx.Client``，避免重复 TCP 握手。
 - 卡顿检测：流式下载使用拆分超时（``_CONNECT_TIMEOUT``/``_STREAM_STALL_TIMEOUT``），
-  若 ``_STREAM_STALL_TIMEOUT``（默认 120 秒）内未收到任何字节，立即触发重试，
-  而非等待 600 秒才能发现连接已静默失效。
+  若 ``_STREAM_STALL_TIMEOUT``（默认 120 秒）内未收到任何字节，立即触发重试。
 - GraphQL 重试：``_fetch_latest_tag`` 和 ``_list_subject_files_via_openneuro``
   均支持最多 ``_METADATA_MAX_RETRIES``（默认 3）次指数退避重试，应对
   ``RemoteProtocolError: Server disconnected without sending a response``
@@ -127,26 +122,20 @@ query GetLatestTag($datasetId: ID!) {
 """
 
 # ── OpenNeuro GraphQL：快照文件列表查询 ────────────────────────────────────────
-# 通过 snapshot.files 获取全部文件的平铺列表（含下载 URL），不经过根目录树遍历，
-# 彻底规避 openneuro-py 的根目录分页限制（约 9 条/页）。
-# 使用 Relay Connection 风格的游标分页以应对超大数据集。
+# 使用 OpenNeuro 真实 GraphQL schema（与 openneuro-py 一致）：
+#   - 顶层 snapshot(datasetId, tag) 字段（不是 dataset.snapshot）
+#   - files(tree: $tree) 返回指定目录树的单层文件列表（含目录项）
+#   - 无 Relay Connection 分页；通过 tree 参数逐层递归获取子目录
+# $tree 为目录的 git-annex tree hash；传 null 则返回快照根目录内容。
 _SNAPSHOT_FILES_QUERY = """
-query GetSnapshotFiles($datasetId: ID!, $tag: String!, $cursor: String) {
-  dataset(id: $datasetId) {
-    snapshot(tag: $tag) {
-      files(first: 100, after: $cursor) {
-        edges {
-          node {
-            filename
-            size
-            urls
-          }
-        }
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
-      }
+query GetSnapshotFiles($datasetId: ID!, $tag: String!, $tree: String) {
+  snapshot(datasetId: $datasetId, tag: $tag) {
+    files(tree: $tree) {
+      filename
+      size
+      urls
+      directory
+      key
     }
   }
 }
@@ -209,13 +198,12 @@ def _list_subject_files_via_openneuro(
 ) -> List[Tuple[str, int, str]]:
     """通过 OpenNeuro GraphQL API 查询指定被试的全部文件。
 
-    与 openneuro-py 不同，本函数使用 ``snapshot.files`` 的平铺列表接口，
-    不经过根目录树遍历，因此不受根目录分页限制（约 9 条/页）的影响。
-    对于拥有大量根目录文件的数据集（如 ds006040），openneuro-py 会因分页
-    而找不到靠后的被试（sub-004 等），本方法从根本上解决该问题。
+    使用与 openneuro-py 一致的真实 OpenNeuro GraphQL schema：
+    - 顶层 ``snapshot(datasetId, tag)`` 字段（不是 ``dataset.snapshot``）
+    - ``files(tree: tree_hash)`` 返回指定目录的单层内容（含目录项和文件项）
+    - 通过递归遍历目录树获取所有文件，不使用 Relay Connection 分页
 
-    使用 Relay Connection 游标分页，支持任意规模的数据集。
-    每页请求发生网络错误时，自动重试最多 *max_retries* 次。
+    每层请求发生网络错误时，自动重试最多 *max_retries* 次（指数退避）。
 
     Parameters
     ----------
@@ -228,7 +216,7 @@ def _list_subject_files_via_openneuro(
     timeout:
         单次 GraphQL 请求超时秒数。
     max_retries:
-        每页请求最大重试次数。
+        每层请求最大重试次数。
 
     Returns
     -------
@@ -237,14 +225,18 @@ def _list_subject_files_via_openneuro(
         *size_bytes*: 文件字节数（0 表示未知）。
         *download_url*: 可直接下载的 URL（由 OpenNeuro 提供，通常指向 S3/CDN）。
     """
-    results: List[Tuple[str, int, str]] = []
-    cursor: Optional[str] = None
 
-    while True:
-        variables: dict = {"datasetId": dataset_id, "tag": tag, "cursor": cursor}
+    def _fetch_tree_level(tree: Optional[str]) -> List[dict]:
+        """Fetch one directory level from the snapshot.
 
-        # Per-page retry loop: transient RemoteProtocolError / server-disconnect
-        # can occur mid-pagination; retry with backoff instead of aborting.
+        Parameters
+        ----------
+        tree:
+            git-annex tree hash for the directory, or ``None`` for the root.
+
+        Returns a list of file/directory node dicts from the GraphQL response.
+        """
+        variables: dict = {"datasetId": dataset_id, "tag": tag, "tree": tree}
         body: dict = {}
         for attempt in range(1, max_retries + 1):
             try:
@@ -264,7 +256,7 @@ def _list_subject_files_via_openneuro(
                     ) from exc
                 wait = min(2 ** attempt, _MAX_BACKOFF_SECONDS)
                 logger.debug(
-                    "GraphQL 分页请求失败（第 %d/%d 次），%d 秒后重试: %s: %s",
+                    "GraphQL 请求失败（第 %d/%d 次），%d 秒后重试: %s: %s",
                     attempt, max_retries, wait, type(exc).__name__, exc,
                 )
                 time.sleep(wait)
@@ -275,36 +267,61 @@ def _list_subject_files_via_openneuro(
             )
 
         try:
-            files_conn = body["data"]["dataset"]["snapshot"]["files"]
-            edges = files_conn.get("edges") or []
+            nodes = body["data"]["snapshot"]["files"]
         except (KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"OpenNeuro GraphQL 响应格式不符合预期: {exc}\n响应: {body}"
             ) from exc
 
-        for edge in edges:
-            node = edge.get("node") or {}
-            filename: str = node.get("filename") or ""
-            # OpenNeuro filename 可能包含或不包含数据集前缀（两种格式均处理）：
-            #   "sub-004/eeg/..."         （无数据集前缀）
-            #   "ds006040/sub-004/eeg/..." （含数据集前缀）
-            rel_filename = filename
-            if rel_filename.startswith(f"{dataset_id}/"):
-                rel_filename = rel_filename[len(dataset_id) + 1:]
-            if not rel_filename.startswith(subject_prefix + "/"):
-                continue
-            size = int(node.get("size") or 0)
-            urls: list = node.get("urls") or []
+        return nodes or []
+
+    results: List[Tuple[str, int, str]] = []
+
+    def _collect_recursive(nodes: List[dict], path_prefix: str) -> None:
+        """Recursively traverse directory nodes, appending file entries to ``results``."""
+        for node in nodes:
+            name: str = node.get("filename") or ""
+            full_path = f"{path_prefix}/{name}" if path_prefix else name
+            if node.get("directory"):
+                key: Optional[str] = node.get("key")
+                if key:
+                    sub_nodes = _fetch_tree_level(key)
+                    _collect_recursive(sub_nodes, full_path)
+            else:
+                urls: list = node.get("urls") or []
+                url = urls[0] if urls else None
+                if url:
+                    size = int(node.get("size") or 0)
+                    results.append((full_path, size, url))
+
+    # Step 1: get root-level entries
+    root_nodes = _fetch_tree_level(None)
+
+    # Step 2: find the subject directory (or file) at root level
+    found = False
+    for node in root_nodes:
+        name: str = node.get("filename") or ""
+        if name != subject_prefix:
+            continue
+        found = True
+        if node.get("directory"):
+            key = node.get("key")
+            if key:
+                sub_nodes = _fetch_tree_level(key)
+                _collect_recursive(sub_nodes, subject_prefix)
+        else:
+            # subject is a top-level file (unlikely but handle gracefully)
+            urls = node.get("urls") or []
             url = urls[0] if urls else None
             if url:
-                results.append((rel_filename, size, url))
+                results.append((name, int(node.get("size") or 0), url))
+        break  # found the subject; no need to continue scanning
 
-        page_info = files_conn.get("pageInfo") or {}
-        if not page_info.get("hasNextPage"):
-            break
-        cursor = page_info.get("endCursor")
-        if not cursor:
-            break
+    if not found:
+        logger.debug(
+            "OpenNeuro API 根目录中未找到 %s（快照中可能不含该被试）",
+            subject_prefix,
+        )
 
     return results
 
@@ -318,10 +335,10 @@ def _download_subject_via_openneuro_api(
     timeout: float = 60.0,
     max_concurrent_downloads: int = _DEFAULT_MAX_CONCURRENT,
 ) -> int:
-    """通过 OpenNeuro GraphQL API 下载指定被试的全部文件（新主路径）。
+    """通过 OpenNeuro GraphQL API 下载指定被试的全部文件（主路径）。
 
-    1. 使用 ``snapshot.files`` 游标分页查询，获取被试全部文件及其下载 URL，
-       完全绕过 openneuro-py 的根目录分页限制。
+    1. 递归遍历 ``snapshot(datasetId, tag).files(tree)`` 目录树，获取被试全部文件
+       及其下载 URL（使用与 openneuro-py 一致的真实 OpenNeuro GraphQL schema）。
     2. 多线程并发下载，支持断点续传。
 
     Returns
