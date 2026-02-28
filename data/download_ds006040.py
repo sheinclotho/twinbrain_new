@@ -57,7 +57,7 @@ _OPENNEURO_GQL_URL = "https://openneuro.org/crn/graphql"
 
 # OpenNeuro open-access datasets are stored in this public S3 bucket.
 _S3_BUCKET = "openneuro.org"
-_S3_BASE_URL = f"https://{_S3_BUCKET}.s3.amazonaws.com"
+_S3_BASE_URL = f"https://s3.amazonaws.com/{_S3_BUCKET}"
 _S3_XML_NS = "http://s3.amazonaws.com/doc/2006-03-01/"
 _CHUNK_SIZE = 64 * 1024  # 64 KiB per read chunk
 _MAX_BACKOFF_SECONDS = 60  # cap for exponential retry delay
