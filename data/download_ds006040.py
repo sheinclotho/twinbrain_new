@@ -34,6 +34,7 @@ openneuro-py 在未提供 ``tag`` 参数时，根目录文件列表查询使用
 
 from __future__ import annotations
 
+import inspect
 import logging
 import sys
 from pathlib import Path
@@ -130,15 +131,23 @@ def download_subject(
         tag or "latest(untagged)",
     )
 
-    download(
-        dataset=dataset_id,
-        tag=tag,
-        target_dir=str(target_dir),
-        include=[subject_prefix],
-        max_retries=max_retries,
-        metadata_timeout=metadata_timeout,
-        max_concurrent_downloads=max_concurrent_downloads,
-    )
+    # 兼容旧版 openneuro-py（不支持 metadata_timeout 参数）
+    _download_kwargs: dict = {
+        "dataset": dataset_id,
+        "tag": tag,
+        "target_dir": str(target_dir),
+        "include": [subject_prefix],
+        "max_retries": max_retries,
+        "max_concurrent_downloads": max_concurrent_downloads,
+    }
+    if "metadata_timeout" in inspect.signature(download).parameters:
+        _download_kwargs["metadata_timeout"] = metadata_timeout
+    else:
+        logger.debug(
+            "当前 openneuro-py 不支持 metadata_timeout 参数，已跳过（请升级到最新版本）"
+        )
+
+    download(**_download_kwargs)
 
     logger.info("下载完成: %s / %s", dataset_id, subject_prefix)
 
