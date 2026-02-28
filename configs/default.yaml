@@ -358,6 +358,17 @@ training:
   # 建议：20（允许 LR 重启后的短暂退步）。
   early_stopping_patience: 20
 
+  # 最佳模型选择标准
+  # ─────────────────────────────────────────────────────────────────────────
+  # 'pred_r2'  — 最大化各模态预测 R² 的均值（推荐）。
+  #              pred_r2 是数字孪生脑的核心能力指标；以此为标准确保保存的
+  #              是预测能力最强的模型，而非仅重建损失最低的模型。
+  #              早停也以 pred_r2 改善与否判断是否终止。
+  # 'val_loss' — 最小化验证总损失（旧行为）。
+  #              当损失由自适应权重平衡时，val_loss 受权重比例影响，
+  #              可能保存重建精度高但预测能力弱的模型。
+  best_model_criterion: 'pred_r2'
+
   # 时序数据增强（可选）
   # ─────────────────────────────────────────────────────────────────────────
   # 仅在训练阶段应用（model.training=True）；验证/推理时不增强，保证评估一致性。
@@ -444,7 +455,7 @@ v5_optimization:
   # 建议：5（约总 epoch 数的 5–10%）。
   warmup_epochs: 5
 
-    # 自适应损失平衡（GradNorm 变体）
+  # 自适应损失平衡（GradNorm 变体）
   adaptive_loss:
     # GradNorm 恢复力系数。较大 → 更激进地平衡各任务训练速度。
     # 建议：1.5（Chen et al. 2018 推荐值）。
@@ -466,6 +477,22 @@ v5_optimization:
     modality_energy_ratios:
       eeg: 1.0
       fmri: 1.0
+    # 各任务类型的初始相对权重（训练开始时的梯度分配比例）。
+    # 键为任务名称前缀，匹配规则为 task_name.startswith(key + '_')：
+    #   pred     → 预测任务（pred_eeg, pred_fmri, pred_sig_eeg, pred_sig_fmri）
+    #   recon    → 重建任务（recon_eeg, recon_fmri）
+    #   spectral → 频域重建任务（spectral_eeg, spectral_fmri）
+    # 可扩展：未来添加双向预测（bidir_pred_*）时，直接在此添加 bidir_pred 键即可，
+    # 无需修改代码。
+    #
+    # 当前推荐设置（数字越大 = 该类任务初始梯度比重越高）：
+    #   侧重预测（数字孪生脑，默认）: pred: 3.0, recon: 1.0, spectral: 0.5
+    #   平衡模式（预测与重建并重）:   pred: 2.0, recon: 2.0, spectral: 0.5
+    #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0, spectral: 1.0
+    task_priorities:
+      pred: 3.0
+      recon: 1.0
+      spectral: 0.5
   
   # EEG 通道增强（解决"静默通道"导致的训练退化）
   eeg_enhancement:

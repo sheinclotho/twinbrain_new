@@ -1216,6 +1216,7 @@ class GraphNativeTrainer:
                 learning_rate=al_cfg.get('learning_rate', 0.025),
                 warmup_epochs=al_cfg.get('warmup_epochs', 5),
                 modality_energy_ratios=al_cfg.get('modality_energy_ratios', {'eeg': 0.02, 'fmri': 1.0}),
+                task_priorities=al_cfg.get('task_priorities'),
             )
         
         # EEG enhancement
@@ -1487,11 +1488,14 @@ class GraphNativeTrainer:
                 self.loss_balancer.update_weights(detached_losses)
             
             # Return loss values.
-            # total_raw = unweighted sum of all task losses (interpretable metric for logging).
-            # total     = weighted sum after adaptive balancing (used for backward; inflates
-            #             when balancer increases pred weights, so NOT suitable as a user-
-            #             visible training metric — using it caused the apparent "train_loss
-            #             rising" symptom even when individual task losses were stable).
+            # IMPORTANT: total_raw must be computed BEFORE total is set, because
+            # loss_dict at this point contains only the individual per-task losses
+            # from compute_loss() (e.g. recon_eeg, pred_fmri, eeg_reg …).  The
+            # weighted aggregate 'total' is not yet in loss_dict, so the sum is
+            # the true unweighted task total — not inflated by adaptive weights.
+            # total_raw = unweighted sum → interpretable train_loss metric.
+            # total     = weighted sum  → used for backward; grows when balancer
+            #             increases task weights even if raw losses are stable.
             loss_dict = {k: v.item() for k, v in losses.items()}
             loss_dict['total_raw'] = sum(loss_dict.values())   # unweighted; used as train_loss
             loss_dict['total'] = total_loss.item()             # weighted; used for backward only
