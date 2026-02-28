@@ -12,6 +12,7 @@ TwinBrain V5 主程序
 """
 
 import argparse
+import gc
 import hashlib
 import json
 import logging
@@ -1344,7 +1345,10 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
             # intermediate tensors.  Even with torch.no_grad() these can leave
             # the CUDA allocator's reserved pool fragmented, making it harder
             # for the next training epoch's backward() to find contiguous blocks.
+            # gc.collect() runs first to release any Python-managed CUDA tensors
+            # held in reference cycles before empty_cache() reclaims the pool.
             if torch.cuda.is_available():
+                gc.collect()
                 torch.cuda.empty_cache()
             
             # Step scheduler based on validation loss (for ReduceLROnPlateau)
