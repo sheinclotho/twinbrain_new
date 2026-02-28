@@ -45,6 +45,13 @@ openneuro-py 的 ``download()`` 函数在遍历数据集根目录时，无论是
   已有字节数并从断点续传；小文件或单连接模式则沿用 ``.part`` 临时文件。
 - 大分块：``_CHUNK_SIZE`` 为 4 MiB，减少系统调用开销，提高吞吐量。
 - 连接复用：每线程内使用长连接 ``httpx.Client``，避免重复 TCP 握手。
+- 卡顿检测：流式下载使用拆分超时（``_CONNECT_TIMEOUT``/``_STREAM_STALL_TIMEOUT``），
+  若 ``_STREAM_STALL_TIMEOUT``（默认 120 秒）内未收到任何字节，立即触发重试，
+  而非等待 600 秒才能发现连接已静默失效。
+- GraphQL 重试：``_fetch_latest_tag`` 和 ``_list_subject_files_via_openneuro``
+  均支持最多 ``_METADATA_MAX_RETRIES``（默认 3）次指数退避重试，应对
+  ``RemoteProtocolError: Server disconnected without sending a response``
+  等偶发服务端断线错误，避免直接回退到较慢的 S3 路径。
 
 使用方法::
 
@@ -100,6 +107,14 @@ _DEFAULT_PER_FILE_CONNECTIONS = 1
 # Default max concurrent file downloads.  8 was the previous value but caused
 # too many simultaneous connections when combined with multipart mode.
 _DEFAULT_MAX_CONCURRENT = 3
+# Number of retries for metadata (GraphQL tag / snapshot files) requests before giving up.
+_METADATA_MAX_RETRIES = 3
+# Stall timeout for streaming downloads: if no bytes arrive within this many seconds,
+# raise ReadTimeout so the retry loop can re-open the connection.  Much shorter than
+# the legacy flat 600s value, which caused stalled connections to go undetected.
+_STREAM_STALL_TIMEOUT = 120.0  # seconds of silence before retrying
+# Short timeout used for the initial TCP connection and TLS handshake.
+_CONNECT_TIMEOUT = 15.0
 
 _TAG_QUERY = """
 query GetLatestTag($datasetId: ID!) {
@@ -138,31 +153,48 @@ query GetSnapshotFiles($datasetId: ID!, $tag: String!, $cursor: String) {
 """
 
 
-def _fetch_latest_tag(dataset_id: str, timeout: float = 30.0) -> Optional[str]:
+def _fetch_latest_tag(
+    dataset_id: str,
+    timeout: float = 30.0,
+    max_retries: int = _METADATA_MAX_RETRIES,
+) -> Optional[str]:
     """Fetch the latest snapshot tag from the OpenNeuro GraphQL API.
+
+    Retries up to *max_retries* times with exponential back-off to handle
+    transient ``RemoteProtocolError`` / server-disconnect errors.
 
     Returns the tag string (e.g. ``"1.0.1"``) or ``None`` on failure.
     """
-    try:
-        response = httpx.post(
-            _OPENNEURO_GQL_URL,
-            json={"query": _TAG_QUERY, "variables": {"datasetId": dataset_id}},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        snapshot_id: str = data["data"]["dataset"]["latestSnapshot"]["id"]
-        # snapshot_id 格式为 "ds006040:1.0.1"
-        tag = snapshot_id.split(":", 1)[-1]
-        logger.debug("数据集 %s 最新快照标签: %s", dataset_id, tag)
-        return tag
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "获取快照标签失败（将尝试 S3 直接下载）: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
-        return None
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = httpx.post(
+                _OPENNEURO_GQL_URL,
+                json={"query": _TAG_QUERY, "variables": {"datasetId": dataset_id}},
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            snapshot_id: str = data["data"]["dataset"]["latestSnapshot"]["id"]
+            # snapshot_id 格式为 "ds006040:1.0.1"
+            tag = snapshot_id.split(":", 1)[-1]
+            logger.debug("数据集 %s 最新快照标签: %s", dataset_id, tag)
+            return tag
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < max_retries:
+                wait = min(2 ** attempt, _MAX_BACKOFF_SECONDS)
+                logger.debug(
+                    "获取快照标签失败（第 %d/%d 次），%d 秒后重试: %s: %s",
+                    attempt, max_retries, wait, type(exc).__name__, exc,
+                )
+                time.sleep(wait)
+    logger.warning(
+        "获取快照标签失败（将尝试 S3 直接下载）: %s: %s",
+        type(last_exc).__name__,
+        last_exc,
+    )
+    return None
 
 
 # ── OpenNeuro GraphQL 直接 API（新主路径）────────────────────────────────────
@@ -173,6 +205,7 @@ def _list_subject_files_via_openneuro(
     tag: str,
     subject_prefix: str,
     timeout: float = 60.0,
+    max_retries: int = _METADATA_MAX_RETRIES,
 ) -> List[Tuple[str, int, str]]:
     """通过 OpenNeuro GraphQL API 查询指定被试的全部文件。
 
@@ -182,6 +215,7 @@ def _list_subject_files_via_openneuro(
     而找不到靠后的被试（sub-004 等），本方法从根本上解决该问题。
 
     使用 Relay Connection 游标分页，支持任意规模的数据集。
+    每页请求发生网络错误时，自动重试最多 *max_retries* 次。
 
     Parameters
     ----------
@@ -193,6 +227,8 @@ def _list_subject_files_via_openneuro(
         被试目录名（如 ``"sub-004"``）。
     timeout:
         单次 GraphQL 请求超时秒数。
+    max_retries:
+        每页请求最大重试次数。
 
     Returns
     -------
@@ -206,18 +242,32 @@ def _list_subject_files_via_openneuro(
 
     while True:
         variables: dict = {"datasetId": dataset_id, "tag": tag, "cursor": cursor}
-        try:
-            resp = httpx.post(
-                _OPENNEURO_GQL_URL,
-                json={"query": _SNAPSHOT_FILES_QUERY, "variables": variables},
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            body = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                f"OpenNeuro GraphQL 请求失败: {type(exc).__name__}: {exc}"
-            ) from exc
+
+        # Per-page retry loop: transient RemoteProtocolError / server-disconnect
+        # can occur mid-pagination; retry with backoff instead of aborting.
+        body: dict = {}
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = httpx.post(
+                    _OPENNEURO_GQL_URL,
+                    json={"query": _SNAPSHOT_FILES_QUERY, "variables": variables},
+                    timeout=timeout,
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                break  # success
+            except Exception as exc:  # noqa: BLE001
+                if attempt == max_retries:
+                    raise RuntimeError(
+                        f"OpenNeuro GraphQL 请求失败（已重试 {max_retries} 次）: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                wait = min(2 ** attempt, _MAX_BACKOFF_SECONDS)
+                logger.debug(
+                    "GraphQL 分页请求失败（第 %d/%d 次），%d 秒后重试: %s: %s",
+                    attempt, max_retries, wait, type(exc).__name__, exc,
+                )
+                time.sleep(wait)
 
         if "errors" in body:
             raise RuntimeError(
@@ -327,12 +377,15 @@ def _download_subject_via_openneuro_api(
 
     def _worker_api(args: Tuple[str, int, str, Path]) -> str:
         rel_path, _size, url, dest = args
-        with httpx.Client(timeout=timeout, follow_redirects=True) as cli:
+        _stream_timeout = httpx.Timeout(
+            connect=_CONNECT_TIMEOUT, read=_STREAM_STALL_TIMEOUT
+        )
+        with httpx.Client(timeout=_stream_timeout, follow_redirects=True) as cli:
             _s3_download_file(
                 key="",  # not used when url is provided directly
                 dest=dest,
                 file_size=_size,
-                timeout=600.0,
+                timeout=_STREAM_STALL_TIMEOUT,
                 max_retries=max_retries,
                 file_label=rel_path,
                 client=cli,
@@ -511,9 +564,10 @@ def _s3_download_file_multipart(
 
                 try:
                     _stream = client.stream if client is not None else httpx.stream
+                    _req_timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=timeout)
                     with _stream(  # type: ignore[operator]
                         "GET", url, headers=headers,
-                        timeout=timeout, follow_redirects=True,
+                        timeout=_req_timeout, follow_redirects=True,
                     ) as resp:
                         if resp.status_code == 200 and existing > 0:
                             # Server ignored Range → restart this part from scratch.
@@ -626,8 +680,11 @@ def _s3_download_file(
 
         try:
             _get = client.stream if client is not None else httpx.stream
+            # Use a split timeout: short connect timeout + per-read stall timeout.
+            # A flat 600s timeout would not detect a stalled stream for up to 10 min.
+            _req_timeout = httpx.Timeout(connect=_CONNECT_TIMEOUT, read=timeout)
             with _get(  # type: ignore[operator]
-                "GET", url, headers=headers, timeout=timeout, follow_redirects=True
+                "GET", url, headers=headers, timeout=_req_timeout, follow_redirects=True
             ) as resp:
                 # 206 Partial Content → resume OK；200 → server ignores Range, restart
                 if resp.status_code == 200 and resume_offset > 0:
@@ -740,15 +797,18 @@ def _download_subject_via_s3(
         """单文件下载任务，返回相对路径（用于进度条）。"""
         key, _size, dest = args
         rel = key[len(dataset_prefix):]
+        _stream_timeout = httpx.Timeout(
+            connect=_CONNECT_TIMEOUT, read=_STREAM_STALL_TIMEOUT
+        )
         with httpx.Client(
-            timeout=timeout,
+            timeout=_stream_timeout,
             follow_redirects=True,
         ) as cli:
             _s3_download_file(
                 key=key,
                 dest=dest,
                 file_size=_size,
-                timeout=600.0,
+                timeout=_STREAM_STALL_TIMEOUT,
                 max_retries=max_retries,
                 file_label=rel,
                 client=cli,
