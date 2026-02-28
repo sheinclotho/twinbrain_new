@@ -428,11 +428,22 @@ train_step()
 |--------|------|------|------|
 | `recon_eeg` | 原始 C=1 | EEG 信号重建 | 自适应 |
 | `recon_fmri` | 原始 C=1 | fMRI 信号重建 | 自适应 |
-| `pred_eeg` | 潜空间 H | EEG 潜向量未来预测 | 自适应 |
-| `pred_fmri` | 潜空间 H | fMRI 潜向量未来预测 | 自适应 |
+| `pred_eeg` | 潜空间 H | EEG 潜向量未来预测（快速收敛锚） | 自适应 |
+| `pred_fmri` | 潜空间 H | fMRI 潜向量未来预测（快速收敛锚） | 自适应 |
+| `pred_sig_eeg` | 原始 C=1 | EEG 信号空间端到端预测（与 pred_r2 对齐，V5.39 新增） | 自适应 |
+| `pred_sig_fmri` | 原始 C=1 | fMRI 信号空间端到端预测（与 pred_r2 对齐，V5.39 新增） | 自适应 |
 | `eeg_reg` | 原始 C=1 | 防止 EEG 通道崩塌 | 固定 0.01×3 |
 
 > `h_fmri` 已含 EEG 跨模态消息，因此 `pred_fmri` 已隐式包含跨模态预测，无需专用跨模态预测头（future work）。
+>
+> **设计说明（V5.39）**：`pred_*`（潜空间）和 `pred_sig_*`（信号空间）是互补的，不是重复的：
+> - `pred_*` 在潜空间提供密集梯度信号，在训练早期快速引导预测器收敛
+> - `pred_sig_*` 直接优化 pred_r2 所测量的端到端指标，确保解码器在预测潜向量上也泛化
+> 两者同时存在才能既快速收敛又指标对齐。
+>
+> **计算开销（V5.39 新增）**：`pred_sig_*` 在每次 `compute_loss()` 调用时额外执行一次解码器
+> 正向推断（仅 pred_steps 步长，远小于完整 T 的解码，通常 < 5% 总训练时间增量）。
+> 若遇到内存或速度瓶颈，可通过将 `use_prediction: false` 关闭整个预测模块来跳过全部 pred_* 损失。
 
 ---
 
@@ -868,6 +879,43 @@ for nt in list(pred_enc.node_types):
 
 ---
 
+### [2026-02-28] pred_r2 长期低下的根因：训练目标与评估指标不对齐
+
+**症状（已观察到）**：
+- r2_eeg=0.985, r2_fmri=0.980（重建优秀）
+- pred_r2_eeg=-0.026, pred_r2_fmri=0.193（预测极差甚至为负）
+
+**思维误区**：以为"在潜空间训练好预测器，解码后信号空间预测自然也会好"，没有追问三个关键问题：
+1. 解码器是否见过预测潜向量作为输入（即被训练来解码 pred_latents）？
+2. prediction_steps=10 对 EEG(250Hz) = 40ms 是否足够长以学到有意义的时序动态？
+3. 潜空间预测损失的梯度是否已到达解码器？
+
+**根因（三叠加）**：
+
+**根因 1 — 训练-评估目标脱节（最严重，P0）**：
+- 训练：`pred_{nt}` 损失 = `huber_loss(pred_latent, future_latent)` ← 纯潜空间
+- 评估：`pred_r2` = 信号空间 R²(decoder(pred_latent) vs raw_future_signal)
+- 解码器在整个训练期间**从未见过预测潜向量作为输入**；它只被训练来解码编码器潜向量。
+  预测潜向量与编码器潜向量可能属于不同分布，解码器无法保证在预测潜向量上泛化。
+
+**根因 2 — prediction_steps=10 与 EEG 动力学不匹配（P1）**：
+- EEG 250Hz → 10 步 = 40ms，而 alpha 周期 = 80-125ms（不到一个完整周期）
+- 从 200 步 context（800ms）预测 40ms 后的精确相位极其困难
+- pred_r2_eeg ≈ -0.026 < 0 意味着预测值比均值基线**更差**，即学到的是噪声而非动态
+
+**根因 3 — AdaptiveLossBalancer 未注册 pred_sig_* 任务（P1）**：
+- 加入信号空间损失后，若 `task_names` 不包含 `pred_sig_{nt}`，balancer.forward() 静默忽略它
+- 等效于信号空间损失不参与 adaptive 加权，其梯度在 use_adaptive_loss=True 时丢失
+
+**修复（V5.39）**：
+1. `compute_loss()` 新增**信号空间预测损失** `pred_sig_{nt}`:
+   解码预测潜向量 → 与真实未来信号对比，直接优化 pred_r2 所测量的端到端能力
+   梯度路径: `pred_sig_loss → decoder → prediction_propagator → predictor.predict_next`
+2. `GraphNativeTrainer.__init__()` 将 `pred_sig_{nt}` 注册进 `AdaptiveLossBalancer.task_names`
+3. `default.yaml`: `prediction_steps: 10 → 30`（EEG 120ms 覆盖 alpha 周期；fMRI 60s 覆盖血动力学）
+
+**规则**：**任何"端到端"的训练目标（如 pred_r2）必须有一条等价的训练损失路径。** 仅在中间表示（潜空间）监督，而在输出空间（信号空间）评估，必然产生训练-评估分布偏移。正确模式是同时计算中间监督（快收敛）+ 端到端监督（对齐评估）。
+
 ## 十、数字孪生脑架构状态（持续更新）
 
 | 维度 | 状态 | 实现版本 |
@@ -905,6 +953,9 @@ for nt in list(pred_enc.node_types):
 | validate() R² 全局均值（per-sample mean → 在线单遍算法） | ✅ 已修复 | V5.38 |
 | _transformer_seq2seq_predict n_steps=0 返回空张量守卫 | ✅ 已修复 | V5.38 |
 | UAP uncertainty_head log_var clamp（防溢出 → NaN 梯度） | ✅ 已修复 | V5.38 |
+| 信号空间预测损失 pred_sig_{nt}（训练-评估对齐，pred_r2 改善） | ✅ 已实现 | V5.39 |
+| pred_sig_{nt} 注册进 AdaptiveLossBalancer | ✅ 已修复 | V5.39 |
+| prediction_steps 默认值 10→30（覆盖 EEG alpha 周期/fMRI 血动力学）| ✅ 已更新 | V5.39 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 
