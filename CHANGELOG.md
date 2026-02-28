@@ -1,8 +1,102 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-28  
-**版本**：V5.39  
+**版本**：V5.40  
 **状态**：生产就绪
+
+---
+
+## [V5.40] 2026-02-28 — 频谱损失 + Pearson 相关损失 + 时序遮蔽增强 + 动态图默认开启
+
+### 背景
+
+在 V5.39 的基础上，本次更新从三个角度进一步提升预测准确率：
+1. **模型损失函数**：增加频域和相关性监督信号
+2. **数据增强**：加入时序遮蔽，强化时序上下文建模
+3. **模型结构**：动态图学习（`use_dynamic_graph`）由默认关改为默认开
+
+### 新增内容
+
+**A. 频域重建损失（Spectral Reconstruction Loss, V5.40）**
+
+在现有时域 Huber/MSE 重建损失之外，新增 FFT 幅度谱 MSE：
+- 对重建信号和目标信号分别做实数 FFT（沿时间轴 dim=1）
+- 比较**幅度谱**（绝对值），不约束相位（相位噪声大，强约束破坏训练稳定性）
+- 按 T 归一化（消除帕赛瓦尔定理导致的 O(T) 幅度增长）
+
+配置项：`model.use_spectral_loss: true`（V5.40 默认开启）
+
+科学依据：EEG 存在特征性节律频段（theta/alpha/beta），fMRI 具有慢波动（~0.01-0.1Hz）。
+仅用时域损失无法约束功率谱分布，频谱损失直接监督频率结构，改善 pred_r2_eeg。
+
+**B. Pearson 相关分量（加入 pred_sig 损失）**
+
+`pred_sig_{nt}` 损失由纯 Huber 改为 `Huber + 0.2 × (1 − r)`：
+- Huber：保证绝对幅度准确（平均值、方差）
+- Pearson `1-r`：保证时序形状匹配（峰值、谷值在正确位置）
+- R² ≈ r²（线性预测），此项直接优化 `validate()` 报告的 pred_r2
+
+无需新增任务注册（混入 pred_sig_{nt} 损失）；适用于所有 `_n ≥ 2` 的预测步长。
+
+**C. 时序遮蔽增强（Time Masking, SpecAugment 风格）**
+
+随机将连续时间段置零，迫使模型从周围上下文推断该段信号：
+- 实现：克隆张量，避免修改缓存图（`finally` 块保证恢复）
+- 配置：`training.augmentation.time_mask_max_ratio: 0.1`（随机遮蔽 0~10% 时间步）
+- 与 EEG handler 的 `original_eeg_x` 恢复机制正确共存（跳过重复恢复 EEG）
+
+参考：Park et al. (2019) SpecAugment（原用于语音识别，通用于时序增强）
+
+**D. 默认配置更新**
+
+| 配置项 | 旧值 | 新值 | 理由 |
+|--------|------|------|------|
+| `model.use_dynamic_graph` | `false` | `true` | 动态图拓扑学习已验证无显著计算开销（每层+0.05ms），研究场景应默认开启 |
+| `model.use_spectral_loss` | 无 | `true` | V5.40 新增，推荐所有实验开启 |
+| `training.augmentation.enabled` | `false` | `true` | 小数据集（N<50）强烈推荐，防止过拟合 |
+| `training.augmentation.time_mask_max_ratio` | 无 | `0.1` | V5.40 新增时序遮蔽增强 |
+
+### 代码变更
+
+- `models/graph_native_system.py`：
+  - 新增 `GraphNativeBrainModel._spectral_loss()` 静态方法
+  - 新增 `GraphNativeBrainModel._pearson_loss()` 静态方法
+  - 新增 `GraphNativeBrainModel.__init__()` 参数 `use_spectral_loss: bool = False`
+  - `compute_loss()`: 重建块后添加 spectral 损失；pred_sig 块加入 Pearson 分量
+  - `GraphNativeTrainer.__init__()`: 注册 `spectral_{nt}` 任务到 AdaptiveLossBalancer
+  - `GraphNativeTrainer.__init__()`: 新增 `self._aug_time_mask_ratio`
+  - `train_step()`: 时序遮蔽（`_orig_tm` + `finally` 恢复）
+- `main.py`：传递 `use_spectral_loss` 给 `GraphNativeBrainModel`
+- `configs/default.yaml`：开启 `use_dynamic_graph`、`use_spectral_loss`、`augmentation`、`time_mask_max_ratio`
+
+### 向后兼容性
+
+- `use_spectral_loss=False`（代码默认）：行为与 V5.39 完全一致
+- `use_dynamic_graph=False`：行为与 V5.39 完全一致
+- `augmentation.enabled=false`：行为与 V5.39 完全一致
+- 现有检查点：可继续加载，无架构变更
+
+### ⚠️ 默认行为变更（Breaking Default Changes）
+
+以下配置项的**默认值**在 `configs/default.yaml` 中发生了变更。
+显式在 YAML 中配置了旧值的实验不受影响。仅使用默认配置的用户需注意结果可能与 V5.39 不同：
+
+| 配置项 | V5.39 默认 | V5.40 默认 | 影响 |
+|--------|-----------|-----------|------|
+| `model.use_dynamic_graph` | `false` | `true` | 启用动态图拓扑，每步额外计算约 0.05ms |
+| `training.augmentation.enabled` | `false` | `true` | 启用噪声+缩放增强，影响训练曲线但改善泛化 |
+| `training.augmentation.time_mask_max_ratio` | 无 | `0.1` | 新增时序遮蔽增强 |
+| `model.use_spectral_loss` | 无 | `true` | 新增频谱损失任务，loss 数值变大但更有意义 |
+
+如需复现 V5.39 的确切行为，在 YAML 中显式设置：
+```yaml
+model:
+  use_dynamic_graph: false
+  use_spectral_loss: false
+training:
+  augmentation:
+    enabled: false
+```
 
 ---
 

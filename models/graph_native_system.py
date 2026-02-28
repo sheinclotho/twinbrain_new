@@ -342,7 +342,68 @@ class GraphNativeBrainModel(nn.Module):
     _PRED_CONTEXT_RATIO: float = 2 / 3
     # 潜空间预测所需最小序列长度（= 保证 T_ctx ≥ 1 且 T_fut ≥ 1）
     _PRED_MIN_SEQ_LEN: int = 4
-    
+
+    # ── Loss helper static methods ──────────────────────────────────────────
+
+    @staticmethod
+    def _spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Frequency-domain magnitude spectrum loss (scale-normalised).
+
+        Scientific basis: EEG signals have characteristic spectral bands
+        (theta 4-7 Hz, alpha 8-12 Hz, beta 13-30 Hz) and fMRI has slow
+        BOLD fluctuations (~0.01-0.1 Hz).  Matching magnitude spectra
+        encourages the model to preserve these rhythms, complementing the
+        time-domain Huber/MSE loss which only penalises pointwise amplitude.
+
+        Implementation: Real FFT along the time axis (dim=1), MSE between
+        magnitude spectra (phase is NOT penalised — phases of stochastic
+        neural signals are noisy and hard to match precisely).
+
+        Scale normalisation: divides by T so the spectral MSE has the same
+        order-of-magnitude as Huber/MSE on the raw signal.  Without this,
+        by Parseval's theorem (sum |X[k]|² = T·σ²) the spectral MSE grows
+        as O(T), dwarfing the time-domain loss for long sequences.
+
+        Args:
+            pred:   [N, T, C]
+            target: [N, T, C]  (must have T ≥ 2)
+        Returns:
+            Scalar spectral MSE (scale-normalised by T).
+        """
+        T = pred.shape[1]
+        pred_fft = torch.fft.rfft(pred, dim=1)    # [N, T//2+1, C] complex
+        tgt_fft  = torch.fft.rfft(target, dim=1)  # [N, T//2+1, C] complex
+        return F.mse_loss(pred_fft.abs(), tgt_fft.abs()) / T
+
+    @staticmethod
+    def _pearson_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Pearson correlation loss: mean(1 − r) across nodes and channels.
+
+        Directly optimises the temporal *pattern* matching component of R².
+        Unlike MSE/Huber (which penalise absolute deviations), this loss is
+        scale-invariant: it only cares that peaks and troughs in pred align
+        with those in target.
+
+        R² = 1 − SS_res/SS_tot ≈ r² for linear predictions, so maximising
+        Pearson correlation is equivalent to maximising R².
+
+        Args:
+            pred, target: [N, T, C]  (T ≥ 2 required)
+        Returns:
+            Scalar loss in [0, 2]  (0 = perfect positive correlation).
+        """
+        N, T, C = pred.shape
+        p = pred.reshape(N * C, T)    # [N*C, T]
+        t = target.reshape(N * C, T)  # [N*C, T]
+        # Centre
+        p = p - p.mean(dim=1, keepdim=True)
+        t = t - t.mean(dim=1, keepdim=True)
+        # Pearson r per (node, channel)
+        numer = (p * t).sum(dim=1)
+        denom = (p.norm(dim=1) * t.norm(dim=1)).clamp(min=1e-8)
+        r = (numer / denom).clamp(-1.0, 1.0)  # [N*C]
+        return (1.0 - r).mean()
+
     def __init__(
         self,
         node_types: List[str],
@@ -360,6 +421,7 @@ class GraphNativeBrainModel(nn.Module):
         use_dynamic_graph: bool = False,
         k_dynamic_neighbors: int = 10,
         num_subjects: int = 0,
+        use_spectral_loss: bool = False,
     ):
         """
         Initialize complete model.
@@ -395,6 +457,13 @@ class GraphNativeBrainModel(nn.Module):
                 At inference time, fine-tune only the subject embedding (frozen
                 encoder) for few-shot personalization.
                 0 = disabled (default, backward-compatible).
+            use_spectral_loss: Add a frequency-domain magnitude spectrum loss
+                (FFT-based) in addition to the time-domain Huber/MSE loss.
+                Encourages the model to preserve neural spectral structure
+                (EEG alpha/beta/theta; fMRI slow BOLD fluctuations), improving
+                both recon R² and pred R² for oscillatory brain signals.
+                Default False for backward compatibility; True recommended for
+                EEG-heavy experiments.
         """
         super().__init__()
         
@@ -403,6 +472,7 @@ class GraphNativeBrainModel(nn.Module):
         self.use_prediction = use_prediction
         self.loss_type = loss_type
         self.num_subjects = num_subjects
+        self.use_spectral_loss = use_spectral_loss
 
         # 被试特异性嵌入 (AGENTS.md §九 Gap 2)
         # num_subjects > 0: each subject gets a learnable [H] offset added to
@@ -620,6 +690,16 @@ class GraphNativeBrainModel(nn.Module):
                     recon_loss = F.mse_loss(recon, target)
                 
                 losses[f'recon_{node_type}'] = recon_loss
+
+                # ── Spectral reconstruction loss ─────────────────────────────
+                # Frequency-domain complement to the time-domain reconstruction
+                # loss.  For EEG especially, matching the magnitude spectrum
+                # (power in alpha/beta/theta bands) produces better pred R².
+                # Requires T_min ≥ 4 for a meaningful FFT.
+                if self.use_spectral_loss and T_min >= 4:
+                    losses[f'spectral_{node_type}'] = self._spectral_loss(
+                        recon[:, :T_min, :], target[:, :T_min, :]
+                    )
         
         # ── 潜空间自监督预测预标记任务（系统级）──────────────────────────────
         #
@@ -760,16 +840,28 @@ class GraphNativeBrainModel(nn.Module):
                         )
                         continue
                     if self.loss_type == 'huber':
-                        losses[f'pred_sig_{_nt}'] = F.huber_loss(
+                        _sig_loss = F.huber_loss(
                             _pred_sig[:, :_n, :],
                             _future_sig[:, :_n, :],
                             delta=1.0,
                         )
                     else:
-                        losses[f'pred_sig_{_nt}'] = F.mse_loss(
+                        _sig_loss = F.mse_loss(
                             _pred_sig[:, :_n, :],
                             _future_sig[:, :_n, :],
                         )
+                    # Pearson correlation component: optimises temporal pattern
+                    # matching (the shape of the predicted trajectory).  R² ≈ r²
+                    # for linear predictions, so this loss directly targets what
+                    # validate() reports as pred_r2.  Weight 0.2 keeps the
+                    # combined loss dominated by the amplitude-sensitive Huber/MSE
+                    # term while adding a robust gradient signal towards R² > 0.
+                    if _n >= 2:
+                        _corr = self._pearson_loss(
+                            _pred_sig[:, :_n, :], _future_sig[:, :_n, :]
+                        )
+                        _sig_loss = _sig_loss + 0.2 * _corr
+                    losses[f'pred_sig_{_nt}'] = _sig_loss
 
 
         
@@ -859,11 +951,17 @@ class GraphNativeTrainer:
         _sr = _aug.get('scale_range', [0.9, 1.1])
         self._aug_scale_min  = float(_sr[0]) if _sr else 1.0
         self._aug_scale_max  = float(_sr[1]) if _sr else 1.0
+        # Time masking: randomly zero out a contiguous time segment per node type.
+        # Inspired by SpecAugment (Park et al. 2019).  Ratio is the maximum fraction
+        # of T that can be masked (uniform draw in [0, ratio] each step).
+        # 0.0 = disabled (backward-compatible default).
+        self._aug_time_mask_ratio = float(_aug.get('time_mask_max_ratio', 0.0))
         if self._aug_enabled:
             logger.info(
                 f"时序数据增强已启用: "
                 f"noise_std={self._aug_noise_std}, "
-                f"scale_range=[{self._aug_scale_min}, {self._aug_scale_max}]"
+                f"scale_range=[{self._aug_scale_min}, {self._aug_scale_max}], "
+                f"time_mask_max_ratio={self._aug_time_mask_ratio}"
             )
         
         # Verify CUDA availability
@@ -1004,9 +1102,13 @@ class GraphNativeTrainer:
             # signal).  It must be registered here so the balancer weights it
             # appropriately; without registration the balancer ignores it and
             # the total_loss computation would not include it when use_adaptive_loss=True.
+            # spectral_{nt} is the frequency-domain reconstruction loss added in V5.40
+            # (FFT magnitude comparison).  Registered when use_spectral_loss=True.
             task_names = []
             for node_type in node_types:
                 task_names.append(f'recon_{node_type}')
+                if getattr(model, 'use_spectral_loss', False):
+                    task_names.append(f'spectral_{node_type}')
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
                     task_names.append(f'pred_sig_{node_type}')
@@ -1184,7 +1286,31 @@ class GraphNativeTrainer:
                     eeg_x_enhanced = self._handler_to_graph_format(eeg_x_t)
                     data['eeg'].x = eeg_x_enhanced
         
+        # _orig_tm stores original node features before time masking for restoration
+        # in the finally block.  Defined here so finally can always access it.
+        _orig_tm: Dict[str, torch.Tensor] = {}
         try:
+            # ── Time masking augmentation (SpecAugment-style) ─────────────────
+            # Randomly zero out a contiguous time segment per node type.
+            # Applied inside try so the finally block always restores originals.
+            # Saves originals in _orig_tm so data is not permanently modified.
+            if self._aug_enabled and self._aug_time_mask_ratio > 0:
+                for _nt in data.node_types:
+                    if hasattr(data[_nt], 'x') and data[_nt].x is not None:
+                        _x = data[_nt].x
+                        _T = _x.shape[1]
+                        if _T < 4:
+                            continue
+                        # Clamp mask length to [1, _T] so it never exceeds the
+                        # sequence length (avoids _mask_start always being 0 when
+                        # the random draw produces _mask_len = _T).
+                        _mask_len = min(_T, max(1, int(_T * random.uniform(0, self._aug_time_mask_ratio))))
+                        _mask_start = random.randint(0, max(0, _T - _mask_len))
+                        _x_masked = _x.clone()
+                        _x_masked[:, _mask_start:_mask_start + _mask_len, :] = 0.0
+                        _orig_tm[_nt] = _x  # save original tensor reference before masking
+                        data[_nt].x = _x_masked
+
             # ── Forward and backward pass ─────────────────────────────────────
             # Use autocast when AMP is enabled, contextlib.nullcontext otherwise.
             # This eliminates the duplicated forward+loss block that previously
@@ -1261,6 +1387,21 @@ class GraphNativeTrainer:
             # tensor — regardless of whether an exception was raised.
             if original_eeg_x is not None:
                 data['eeg'].x = original_eeg_x
+            # Restore time-masked node features to avoid permanently zeroing out
+            # segments in the cached graph objects.
+            # Restoration logic for EEG:
+            # - original_eeg_x is set (EEG handler was active): restoring from
+            #   original_eeg_x gives the pre-enhancement, pre-mask signal — which
+            #   IS correct.  We always restore to the original cached signal, not
+            #   to any intermediate enhanced version, because EEG enhancement is
+            #   meant to only affect the current forward pass (not to accumulate
+            #   across epochs in the cached graph).
+            # - original_eeg_x is None (EEG handler inactive): _orig_tm['eeg']
+            #   restores the unmasked original signal below.
+            for _nt_r, _x_orig_r in _orig_tm.items():
+                if _nt_r == 'eeg' and original_eeg_x is not None:
+                    continue  # EEG already restored to original_eeg_x above
+                data[_nt_r].x = _x_orig_r
     
     def train_epoch(self, data_list: List[HeteroData], epoch: int = None, total_epochs: int = None) -> float:
         """

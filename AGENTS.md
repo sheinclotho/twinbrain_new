@@ -916,12 +916,35 @@ for nt in list(pred_enc.node_types):
 
 **规则**：**任何"端到端"的训练目标（如 pred_r2）必须有一条等价的训练损失路径。** 仅在中间表示（潜空间）监督，而在输出空间（信号空间）评估，必然产生训练-评估分布偏移。正确模式是同时计算中间监督（快收敛）+ 端到端监督（对齐评估）。
 
-## 十、数字孪生脑架构状态（持续更新）
+---
+
+### [2026-02-28] pred_r2_eeg 改善：频域监督 + 相关性分量 + 时序遮蔽
+
+**背景**：V5.39 加入了信号空间预测损失（pred_sig）以修复训练-评估脱节。V5.40 在此基础上增加频域监督和相关性监督，直接优化 pred_r2 所测量的三个分量（幅度、频率结构、时序形状）。
+
+**思维误区**：以为"时域 Huber 损失足够，只要幅度对了 R² 就会高"。
+
+**实际情况**：R² = 1 - SS_res/SS_tot，包含三个组成部分：
+1. **幅度精度**（均值和方差匹配）← Huber 监督
+2. **频率结构**（power spectrum 匹配）← 仅 Huber 不够，需要 FFT 损失
+3. **时序形状**（temporal pattern / Pearson r）← 仅 Huber 不够，需要相关性损失
+
+三个分量缺一不可。仅使用 Huber 的模型可以达到低 MSE 但低 R²（通过预测接近均值的平坦信号）。
+
+**修复（V5.40）**：
+1. `_spectral_loss()`：FFT 幅度谱 MSE（/T 归一化），作为独立 `spectral_{nt}` 任务注册
+2. `pred_sig_{nt}` 加入 Pearson 相关分量：`sig_loss += 0.2 × (1 - r)`
+3. `time_mask_max_ratio: 0.1`：随机遮蔽时序窗口，迫使模型学习上下文推断能力
+4. `use_dynamic_graph: true`（默认）：动态图拓扑实时适应当前脑状态
+
+**规则**：评估指标由多个分量组成时，训练损失必须覆盖所有分量。「R² 高 ↔ Huber 低」的假设仅在模型输出方差接近目标方差时成立；当模型倾向于预测"平均脑状态"（安全的均值预测）时，Huber 低但 R² 仍可为负。
+
+
 
 | 维度 | 状态 | 实现版本 |
 |------|------|---------|
 | 个性化（被试特异性嵌入） | ✅ 已实现 | V5.19–V5.20 |
-| 动态拓扑（DynamicGraphConstructor） | ✅ 已实现 | V5.14 |
+| 动态拓扑（DynamicGraphConstructor，默认开启） | ✅ 已实现 | V5.14 / V5.40 |
 | 系统级预测传播（GraphPredictionPropagator） | ✅ 已实现 | V5.25 |
 | 梯度累积（gradient_accumulation_steps） | ✅ 已实现 | V5.28 |
 | 随机权重平均（SWA） | ✅ 已实现（可选） | V5.28 |
@@ -930,7 +953,7 @@ for nt in list(pred_enc.node_types):
 | 相关性跨模态边（NVC 感知，top-k |r|） | ✅ 已实现 | V5.30 |
 | 训练曲线可视化（loss + R² PNGs） | ✅ 已实现 | V5.30 |
 | 断点续训（--resume） | ✅ 已实现 | V5.30 |
-| 时序数据增强（noise + scale，可选） | ✅ 已实现（默认关闭） | V5.30 |
+| 时序数据增强（noise + scale，默认开启） | ✅ 已实现 | V5.30 / V5.40 |
 | NPI 风格 context_length 可配置 | ✅ 已实现 | V5.31 |
 | HierarchicalPredictor NPI 兼容（prediction_steps=1 整数除法） | ✅ 已修复 | V5.31 |
 | validate() 真因果 pred_R²（因果编码） | ✅ 已修复 | V5.31 |
@@ -956,6 +979,10 @@ for nt in list(pred_enc.node_types):
 | 信号空间预测损失 pred_sig_{nt}（训练-评估对齐，pred_r2 改善） | ✅ 已实现 | V5.39 |
 | pred_sig_{nt} 注册进 AdaptiveLossBalancer | ✅ 已修复 | V5.39 |
 | prediction_steps 默认值 10→30（覆盖 EEG alpha 周期/fMRI 血动力学）| ✅ 已更新 | V5.39 |
+| 频域重建损失 spectral_{nt}（FFT 幅度谱 MSE，改善 pred_r2_eeg） | ✅ 已实现 | V5.40 |
+| pred_sig Pearson 相关分量（直接优化 pred_r2，weight=0.2） | ✅ 已实现 | V5.40 |
+| 时序遮蔽增强（time masking，SpecAugment 风格，默认开启 10%）| ✅ 已实现 | V5.40 |
+| 动态图 use_dynamic_graph 默认 false→true | ✅ 已更新 | V5.40 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 

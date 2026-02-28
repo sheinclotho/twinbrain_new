@@ -930,6 +930,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
         use_dynamic_graph=config['model'].get('use_dynamic_graph', False),
         k_dynamic_neighbors=config['model'].get('k_dynamic_neighbors', 10),
         num_subjects=num_subjects,
+        use_spectral_loss=config['model'].get('use_spectral_loss', False),
     )
 
     if num_subjects > 0:
