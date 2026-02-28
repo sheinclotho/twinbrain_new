@@ -192,6 +192,7 @@ class GraphPredictionPropagator(nn.Module):
         num_prop_layers: int = 2,
         dropout: float = 0.1,
         use_gradient_checkpointing: bool = False,
+        temporal_chunk_size: Optional[int] = None,
     ):
         """
         Args:
@@ -205,6 +206,8 @@ class GraphPredictionPropagator(nn.Module):
             use_gradient_checkpointing: Free intermediate activations inside
                 each ST-GCN propagate() call to reduce peak GPU memory during
                 backward.  Mirrors the same flag on the main encoder.
+            temporal_chunk_size: Passed to SpatialTemporalGraphConv; bounds
+                peak GPU memory during backward recomputation per chunk.
         """
         super().__init__()
         self.node_types = node_types
@@ -226,6 +229,7 @@ class GraphPredictionPropagator(nn.Module):
                     use_spectral_norm=True,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     dropout=dropout,
+                    temporal_chunk_size=temporal_chunk_size,
                 )
             self.prop_layers.append(nn.ModuleDict(conv_dict))
             self.layer_norms.append(nn.ModuleDict({
@@ -451,6 +455,7 @@ class GraphNativeBrainModel(nn.Module):
         k_dynamic_neighbors: int = 10,
         num_subjects: int = 0,
         use_spectral_loss: bool = False,
+        temporal_chunk_size: Optional[int] = None,
     ):
         """
         Initialize complete model.
@@ -493,6 +498,10 @@ class GraphNativeBrainModel(nn.Module):
                 both recon R² and pred R² for oscillatory brain signals.
                 Default False for backward compatibility; True recommended for
                 EEG-heavy experiments.
+            temporal_chunk_size: Number of timesteps processed per propagate()
+                call in SpatialTemporalGraphConv.  Bounds peak GPU memory during
+                backward recomputation.  None = full T (original behaviour).
+                Set to 64 to cut peak message-tensor memory by ~4× vs T=300.
         """
         super().__init__()
         
@@ -523,6 +532,7 @@ class GraphNativeBrainModel(nn.Module):
             dropout=dropout,
             use_dynamic_graph=use_dynamic_graph,
             k_dynamic_neighbors=k_dynamic_neighbors,
+            temporal_chunk_size=temporal_chunk_size,
         )
         
         # Decoder: Reconstruct temporal signals
@@ -563,6 +573,7 @@ class GraphNativeBrainModel(nn.Module):
                 num_prop_layers=pred_cfg.get('num_prop_layers', 2),
                 dropout=dropout,
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                temporal_chunk_size=temporal_chunk_size,
             )
     
     def forward(
