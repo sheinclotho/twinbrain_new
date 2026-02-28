@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
 import httpx
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +151,9 @@ def _s3_download_file(
     dest: Path,
     timeout: float = 600.0,
     max_retries: int = 10,
+    file_label: str = "",
 ) -> None:
-    """从 S3 下载单个文件（流式传输，支持断点重试）。"""
+    """从 S3 下载单个文件（流式传输，支持断点重试，含字节级进度条）。"""
     url = f"{_S3_BASE_URL}/{key}"
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -158,9 +161,21 @@ def _s3_download_file(
         try:
             with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as resp:
                 resp.raise_for_status()
-                with open(dest, "wb") as fh:
-                    for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
-                        fh.write(chunk)
+                total_bytes = int(resp.headers["content-length"]) if "content-length" in resp.headers else None
+                label = file_label or dest.name
+                with tqdm(
+                    total=total_bytes,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=label,
+                    leave=False,
+                    dynamic_ncols=True,
+                ) as bar:
+                    with open(dest, "wb") as fh:
+                        for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
+                            fh.write(chunk)
+                            bar.update(len(chunk))
             return
         except Exception as exc:  # noqa: BLE001
             if attempt == max_retries:
@@ -207,19 +222,30 @@ def _download_subject_via_s3(
     # dataset_id 部分已包含在 key 中，下载到 target_dir/{dataset_id}/... 下
     dataset_prefix = f"{dataset_id}/"
     downloaded = 0
-    for key, _size in files:
-        if not key.startswith(dataset_prefix):
-            logger.warning("S3 返回的对象键不符合预期格式，已跳过: %s", key)
-            continue
-        rel = key[len(dataset_prefix):]
-        dest = target_dir / rel
-        if dest.exists() and dest.stat().st_size == _size:
-            logger.debug("跳过已存在文件: %s", rel)
-            downloaded += 1
-            continue
-        logger.debug("下载: %s", rel)
-        _s3_download_file(key, dest, timeout=600.0, max_retries=max_retries)
-        downloaded += 1
+    with logging_redirect_tqdm():
+        with tqdm(
+            total=len(files),
+            unit="file",
+            desc=subject_prefix,
+            dynamic_ncols=True,
+        ) as file_bar:
+            for key, _size in files:
+                if not key.startswith(dataset_prefix):
+                    logger.warning("S3 返回的对象键不符合预期格式，已跳过: %s", key)
+                    file_bar.update(1)
+                    continue
+                rel = key[len(dataset_prefix):]
+                dest = target_dir / rel
+                file_bar.set_postfix_str(rel, refresh=True)
+                if dest.exists() and dest.stat().st_size == _size:
+                    logger.debug("跳过已存在文件: %s", rel)
+                    downloaded += 1
+                    file_bar.update(1)
+                    continue
+                logger.debug("下载: %s", rel)
+                _s3_download_file(key, dest, timeout=600.0, max_retries=max_retries, file_label=rel)
+                downloaded += 1
+                file_bar.update(1)
 
     return downloaded
 
@@ -360,18 +386,26 @@ def download_subjects(
         元数据查询超时秒数。
     """
     failed: List[str] = []
-    for subject in subjects:
-        try:
-            download_subject(
-                subject=subject,
-                target_dir=target_dir,
-                dataset_id=dataset_id,
-                max_retries=max_retries,
-                metadata_timeout=metadata_timeout,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("下载 sub-%s 失败 (%s): %s", subject, type(exc).__name__, exc)
-            failed.append(subject)
+    with logging_redirect_tqdm():
+        with tqdm(
+            subjects,
+            unit="subject",
+            desc="被试下载进度",
+            dynamic_ncols=True,
+        ) as subject_bar:
+            for subject in subject_bar:
+                subject_bar.set_postfix_str(f"sub-{subject}", refresh=True)
+                try:
+                    download_subject(
+                        subject=subject,
+                        target_dir=target_dir,
+                        dataset_id=dataset_id,
+                        max_retries=max_retries,
+                        metadata_timeout=metadata_timeout,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("下载 sub-%s 失败 (%s): %s", subject, type(exc).__name__, exc)
+                    failed.append(subject)
 
     if failed:
         logger.warning("以下被試下载失败: %s", failed)
