@@ -1,8 +1,46 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-02-28  
-**版本**：V5.41  
+**版本**：V5.41.1  
 **状态**：生产就绪
+
+---
+
+## [V5.41.1] 2026-02-28 — V5.41 审查修复：cuda_clear_interval LCM 陷阱 + prediction_steps 窗口对齐
+
+### 背景
+
+对 V5.41 进行严格的"假设所有地方都有问题"审查，发现两个交互 bug。
+
+### Bug 1：cuda_clear_interval + gradient_accumulation_steps → LCM 陷阱（P1）
+
+**症状**：`cuda_clear_interval=50` 与 `gradient_accumulation_steps=4` 共存时，碎片防护**完全无效**。
+
+**根因**：旧条件 `is_accum_boundary AND (i+1)%50==0` 要求 (i+1) 是 LCM(4,50)=100 的倍数。
+在典型 80 步/epoch（8被试×10窗口）场景下，i 最大=79，从不满足 → 零次触发。
+
+**修复**：`graph_native_system.py` 移除 `is_accum_boundary` 门控，只保留 `(i+1)%interval==0`。
+- 安全性：`gc.collect()`/`empty_cache()` 仅回收**已释放**块，不影响 autograd 活跃梯度张量
+- 效果：80步epoch中，50步处触发一次，碎片积累量从 80×44MB=3.5GB → 50×44MB=2.2GB
+
+### Bug 2：prediction_steps=30 > fMRI T_fut=17（P1 算力浪费）
+
+**症状**：训练时 43% 的预测步（步骤 18-30）有前向计算但无监督梯度。
+
+**根因**：fMRI 窗口 T=50，`_PRED_CONTEXT_RATIO=2/3` → T_fut=17。`prediction_steps=30`
+导致 `aligned_steps = min(30,17) = 17`，多余的 13 步白白消耗算力和显存。
+
+**修复**：
+- `configs/default.yaml`: `prediction_steps: 30 → 15`（匹配 T_fut=17，零浪费）
+- `models/graph_native_system.py`: `compute_loss()` 新增 debug 日志，当 `prediction_steps > T_fut` 时提示调参方向
+- `configs/default.yaml`: GPU 速查表新增各窗口对应的最优 prediction_steps
+
+### 配置变更对照
+
+| 参数 | V5.41 | V5.41.1 | 说明 |
+|------|-------|---------|------|
+| `model.prediction_steps` | `30` | `15` | 匹配 fMRI 窗口 T_fut=17，0% 浪费 |
+| `cuda_clear_interval 触发条件` | `is_accum_boundary AND (i+1)%50==0` | `(i+1)%50==0` | 修复 LCM 陷阱 |
 
 ---
 

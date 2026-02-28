@@ -821,6 +821,14 @@ class GraphNativeBrainModel(nn.Module):
                     )
                     continue
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
+                if aligned_steps < pred_mean.shape[1]:
+                    logger.debug(
+                        f"pred_{node_type}: prediction_steps={pred_mean.shape[1]} > "
+                        f"T_fut={future_target.shape[1]}; supervising only "
+                        f"{aligned_steps} steps. "
+                        f"Reduce prediction_steps to <= int(T_window * 1/3) "
+                        f"to eliminate unsupervised prediction steps."
+                    )
                 if aligned_steps > 0:
                     if self.loss_type == 'huber':
                         pred_loss = F.huber_loss(
@@ -1595,12 +1603,16 @@ class GraphNativeTrainer:
             # epoch 末尾的某一步请求较大连续块时可能 OOM，即使 reserved>>allocated。
             # 每 50 步清理一次可将空闲列表碎片控制在 50 步的积累量以内，
             # 代价约 2-5ms/次，对总训练时间影响可忽略不计。
-            # 此清理仅在 gradient accumulation 边界后执行（优化器已 step 完成），
-            # 避免在梯度累积中途清理导致活跃梯度张量被误当垃圾回收。
+            #
+            # ⚠ 注意：不要加 is_accum_boundary 条件。
+            # 原始设计曾用 `is_accum_boundary AND (i+1)%interval==0`，
+            # 但这使得实际触发步为 LCM(ga, interval) 而非 interval：
+            # ga=4, interval=50 → LCM=100，80步/epoch 从不触发（完全无效）。
+            # gc.collect() + empty_cache() 仅回收**已释放**的 CUDA 块，
+            # 不会影响仍在 autograd 图中的梯度张量，故在非边界步也安全。
             if (
                 self._device_type == 'cuda'
                 and self._cuda_clear_interval > 0
-                and is_accum_boundary
                 and (i + 1) % self._cuda_clear_interval == 0
             ):
                 gc.collect()

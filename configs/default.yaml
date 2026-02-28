@@ -166,10 +166,22 @@ model:
   use_prediction: true
   
   # 预测步数（T_future = T × 1/3 与此参数的最小值）
-  # 建议：30（fMRI 30 TRs = 60s，覆盖完整血动力学响应周期；
-  #          EEG 30 pts = 120ms，覆盖 alpha 节律整周期，比旧默认值 10 有更多训练信号）。
-  # V5.39 起默认从 10 调整为 30，以与 signal-space 预测损失配合获得更好的预测质量。
-  prediction_steps: 30
+  # ─────────────────────────────────────────────────────────────
+  # 科学含义：
+  #   fMRI（TR=2s）：15 步 × 2s = 30s，覆盖完整血动力学响应峰值（~5-6s）
+  #   EEG（250Hz）：15 步 × 4ms = 60ms，覆盖 alpha/gamma 节律主要分量
+  #
+  # ★ 为什么从 30 降回 15（V5.41.1）？
+  #   windowed_sampling 开启时 fMRI 窗口 T=50 TRs，T_fut = int(50 × 1/3) = 17 TRs。
+  #   prediction_steps=30 时 aligned_steps = min(30, 17) = 17 — 13 个预测步
+  #   有前向 pass 计算但无监督梯度（43% 算力浪费）。
+  #   prediction_steps=15 时 aligned_steps = min(15, 17) = 15 — 完全匹配，0% 浪费。
+  #
+  # 通用规则：prediction_steps ≤ T_window × (1 - _PRED_CONTEXT_RATIO) = T × 1/3
+  #   fmri_window_size=50  → 推荐 prediction_steps ≤ 15
+  #   fmri_window_size=80  → 推荐 prediction_steps ≤ 26
+  #   fmri_window_size=100 → 推荐 prediction_steps ≤ 33
+  prediction_steps: 15
   
   # Dropout 比率
   # 建议：0.1。小数据集可提高到 0.2–0.3 以增强正则化。
@@ -614,19 +626,30 @@ output:
 #   model.hidden_channels: 128
 #   model.temporal_chunk_size: 64        ← 可提高
 #   windowed_sampling.fmri_window_size: 80   ← 可加大窗口
+#   model.prediction_steps: 26           ← floor(80×1/3)
 #   → 支持 8-16 被试
 #
 # 32GB GPU（RTX 3090 / A6000 / etc.）：
 #   model.hidden_channels: 256           ← 更大模型
 #   model.temporal_chunk_size: null      ← 无需分块
 #   windowed_sampling.fmri_window_size: 100
+#   model.prediction_steps: 33           ← floor(100×1/3)
 #   → 支持 16+ 被试
 #
 # 如果 OOM：
 #   1. 减小 windowed_sampling.fmri_window_size（50 → 30）
+#      ⚠ 同步调整 prediction_steps = floor(fmri_window_size × 1/3) = floor(30×1/3) = 10
 #   2. 减小 model.temporal_chunk_size（32 → 16）
 #   3. 减小 model.hidden_channels（128 → 64）
 #   4. 减小 model.k_dynamic_neighbors（10 → 5）
+#
+# 调整 fmri_window_size 后必须同步更新 prediction_steps：
+#   prediction_steps 有效上界 = floor(fmri_window_size × 1/3)
+#   fmri_window_size=30  → prediction_steps ≤ 10
+#   fmri_window_size=50  → prediction_steps ≤ 15 （当前默认）
+#   fmri_window_size=80  → prediction_steps ≤ 26
+#   fmri_window_size=100 → prediction_steps ≤ 33
+#   超过上界的步骤无监督梯度，43%+算力浪费（见 AGENTS.md §三）
 # ─────────────────────────────────────────────────────────────────────────
 device:
   # 设备类型："cuda"（GPU）/ "cpu"（CPU）/ "cuda:0"（指定 GPU）

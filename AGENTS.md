@@ -66,14 +66,79 @@
 - 修复：在 reshape 前先 `permute(1,0,2).contiguous()` 将布局变为 `[T, N, H]`，使 `flat[t*N+n] = x[n,t]` ✓。
 
 **修复（V5.41）**：
-1. **时序分块 `temporal_chunk_size=64`**：将 T 切成 chunk_size 块，每块独立 propagate()。峰值从 263 MB 降至 88 MB（64/190 × 263），减少碎片大小 3×。
+1. **时序分块 `temporal_chunk_size=32`**（从 64 降至 32）：峰值从 88MB 降至 44MB（32/190 × 263），支持 8GB GPU 运行 4-8 被试。
 2. **每 epoch 调用 `gc.collect() + empty_cache()`**（非仅验证时）：将空闲列表在每个 epoch 结束后归零，彻底阻断累积机制。
-3. **OOM 警告文本升级**：明确提示 `temporal_chunk_size` 和 `use_dynamic_graph` 作为调参方向。
+3. **windowed_sampling 默认开启**：每步只处理 T=50 而非 T=190，峰值张量降低 6×。
+4. **OOM 警告文本升级**：明确提示 `temporal_chunk_size` 和 `use_dynamic_graph` 作为调参方向。
 
 **规则**：
 - **"每次修复后 OOM 推后"是累积问题的明确信号**，不能只看单步峰值，必须问：这块内存被反复分配释放吗？垃圾回收频率够吗？
 - **大块张量（>100 MB）的分配/释放必须配合 `empty_cache()`**，否则 CUDA 分配器碎片在多 epoch 训练后必然累积。
 - **向量化（T×E 单次）和梯度检查点（省内存）配合时，峰值是 `chunk_size×E×H` 而非 `E×H`**——只有配合分块才能真正降低峰值。
+
+---
+
+### [2026-02-28] cuda_clear_interval + gradient_accumulation_steps 交互陷阱（V5.41 发现）
+
+**思维误区**：以为 `is_accum_boundary AND (i+1)%interval==0` 等价于"每 interval 步在优化器边界清理"，没有追问两个独立周期同时为真的概率。
+
+**根因**：
+- `is_accum_boundary` 在 `i=ga-1, 2*ga-1, ...`（每 ga 步一次）为 True
+- `(i+1) % interval == 0` 在 `i=interval-1, 2*interval-1, ...`（每 interval 步一次）为 True
+- AND 联合要求 (i+1) 同时是 ga 和 interval 的倍数 = LCM(ga, interval) 的倍数
+- `ga=4, interval=50` → `LCM(4,50)=100`，实际每 **100 步**才清理一次
+- 典型 epoch = 80 步（8被试 × 10窗口）→ **一次都不触发**，完全无效化碎片防护
+
+**验证**：
+```python
+import math
+ga, interval = 4, 50
+print(math.lcm(ga, interval))  # 100
+fires = [i for i in range(80) if (i+1)%ga==0 and (i+1)%interval==0]
+print(fires)  # [] — 80步epoch中零次触发
+```
+
+**修复（V5.41.1）**：移除 `is_accum_boundary` 条件，保留 `(i+1)%interval==0`。
+- `gc.collect()`：只释放 Python 对象引用循环，不影响 autograd 图中受 C++ 保护的梯度张量
+- `empty_cache()`：只回收**已释放**的 CUDA 块（在空闲列表中），不影响任何活跃张量
+- 因此在梯度累积中途调用也**完全安全**，不存在"梯度被误回收"的风险
+
+**规则**：
+- **两个独立条件用 AND 联合时，有效周期 = LCM（而非较小值）**。`is_accum_boundary AND (i+1)%50==0` 用 AND 连接，是一个将 50 步清理变成 LCM(ga,50) 步清理的隐性 bug。
+- **每当引入"条件 A AND 条件 B"控制某功能时，必须计算 A 和 B 同时为真的实际频率**，验证它与设计意图一致。
+
+---
+
+### [2026-02-28] prediction_steps 与 fMRI 窗口大小不匹配（V5.41 发现）
+
+**思维误区**：以为"prediction_steps=30 只是预测 30 步，能监督多少就监督多少"，没有追问这对算力利用率和模型训练质量的影响。
+
+**根因**：
+- fMRI 窗口 T=50 TRs，`_PRED_CONTEXT_RATIO=2/3` → T_ctx=33，T_fut=50-33=**17 TRs**
+- `prediction_steps=30 > T_fut=17` → `aligned_steps = min(30,17) = 17`
+- 预测步 18-30（共 13 步）：前向 pass 生成、显存占用、但**零监督梯度**
+- 浪费比例：13/30 = **43% 算力用于无梯度的预测步**
+- 同样影响 signal-space 预测损失（只有 17 步有效 future signal 可对齐）
+
+**量化**：
+| prediction_steps | fMRI supervised_steps | 浪费率 | EEG supervised_steps |
+|---|---|---|---|
+| 30 | 17 | 43% | 30 (0% waste) |
+| 15 | 15 | 0% | 15 (0% waste) |
+
+**修复（V5.41.1）**：`prediction_steps: 30 → 15`。
+- fMRI: 15 步 × TR=2s = 30s，覆盖血动力学响应峰值（完全在 T_fut=17 范围内）
+- EEG: 15 步 × 4ms = 60ms，覆盖 alpha/gamma 主要分量（EEG T_fut=167 >> 15）
+- 选择依据：`prediction_steps ≤ floor(fmri_window_size × (1 - _PRED_CONTEXT_RATIO))`
+  = floor(50 × 1/3) = 16，选 15 保留 2 步缓冲
+
+**规则**：
+- **prediction_steps 不是越大越好**。有效上界 = `T_window × (1 - _PRED_CONTEXT_RATIO)`。
+  超过此值的步骤有正向计算开销但无训练信号（梯度为零）。
+- **windowed_sampling 改变了 prediction_steps 的有效上界**。每次修改窗口大小，
+  必须同步检查 `prediction_steps ≤ T_fut = T_window × (1-context_ratio)`。
+- **通用检查公式**（代码可直接用）：
+  `max_effective_steps = int(window_size * (1 - _PRED_CONTEXT_RATIO))`
 
 ---
 
@@ -1019,6 +1084,13 @@ for nt in list(pred_enc.node_types):
 | pred_sig Pearson 相关分量（直接优化 pred_r2，weight=0.2） | ✅ 已实现 | V5.40 |
 | 时序遮蔽增强（time masking，SpecAugment 风格，默认开启 10%）| ✅ 已实现 | V5.40 |
 | 动态图 use_dynamic_graph 默认 false→true | ✅ 已更新 | V5.40 |
+| windowed_sampling 默认开启（支持 4-8 被试 / 8GB GPU） | ✅ 已实现 | V5.41 |
+| temporal_chunk_size 默认 64→32（44MB/step，内存再降半） | ✅ 已更新 | V5.41 |
+| gradient_accumulation_steps 默认 1→4（小数据集梯度质量） | ✅ 已更新 | V5.41 |
+| cuda_clear_interval 新增（epoch 内周期碎片清理） | ✅ 已实现 | V5.41 |
+| cuda_clear_interval is_accum_boundary 门控 bug 修复（LCM 陷阱）| ✅ 已修复 | V5.41.1 |
+| prediction_steps 默认值 30→15（匹配 fMRI 窗口 T_fut=17，零浪费）| ✅ 已更新 | V5.41.1 |
+| compute_loss pred_loss 超出 T_fut 的 debug 提示 | ✅ 已实现 | V5.41.1 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 
