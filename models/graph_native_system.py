@@ -371,8 +371,14 @@ class GraphNativeBrainModel(nn.Module):
             Scalar spectral MSE (scale-normalised by T).
         """
         T = pred.shape[1]
-        pred_fft = torch.fft.rfft(pred, dim=1)    # [N, T//2+1, C] complex
-        tgt_fft  = torch.fft.rfft(target, dim=1)  # [N, T//2+1, C] complex
+        # cuFFT in half precision (float16/AMP) only supports power-of-two
+        # signal sizes.  Cast to float32 to support arbitrary lengths such
+        # as T=300 used by default.  The resulting scalar loss is then
+        # compatible with the float16 computation graph via autocast.
+        pred_f = pred.float()
+        tgt_f  = target.float()
+        pred_fft = torch.fft.rfft(pred_f, dim=1)   # [N, T//2+1, C] complex
+        tgt_fft  = torch.fft.rfft(tgt_f,  dim=1)   # [N, T//2+1, C] complex
         return F.mse_loss(pred_fft.abs(), tgt_fft.abs()) / T
 
     @staticmethod
@@ -393,8 +399,16 @@ class GraphNativeBrainModel(nn.Module):
             Scalar loss in [0, 2]  (0 = perfect positive correlation).
         """
         N, T, C = pred.shape
-        p = pred.reshape(N * C, T)    # [N*C, T]
-        t = target.reshape(N * C, T)  # [N*C, T]
+        # Cast to float32 before computing Pearson correlation.
+        # In AMP training (float16), the clamp(min=1e-8) guard below is
+        # ineffective: 1e-8 is below the float16 minimum representable
+        # positive normal value (~6.1e-5) and rounds to 0, so the clamp
+        # becomes clamp(min=0) and does not prevent division by zero.
+        # Near-zero norms (common in early training when the model outputs
+        # almost-zero predictions) then produce NaN → training divergence.
+        # float32 has sufficient precision so 1e-8 is correctly enforced.
+        p = pred.float().reshape(N * C, T)    # [N*C, T]
+        t = target.float().reshape(N * C, T)  # [N*C, T]
         # Centre
         p = p - p.mean(dim=1, keepdim=True)
         t = t - t.mean(dim=1, keepdim=True)
