@@ -60,6 +60,59 @@ else:
 
 ---
 
+### [2026-03-02] V5.47 引入的双重回归：temporal_chunk_size=64 + InfoNCE temperature=0.1
+
+**用户观察**：V5.47 相较前一个版本（V5.46）更慢（430s/epoch vs 之前更快），且 pred_r2_h1_fmri 随 epoch 下降（0.162→0.042→-0.010），GPU 仍只用 0.18GB / 8GB = 2%。
+
+**根因（两个独立回归叠加）**：
+
+**回归 1 — temporal_chunk_size: null → 64 重引入了 V5.45 修复的 Python overhead**
+
+V5.45 设默认 temporal_chunk_size=null，并在代码中实现：
+- checkpointing=True + null → chunk_size=T（单次 gradient_checkpoint 调用）
+- checkpointing=False → chunk_size=T（V5.45 fix，完全不分块）
+
+V5.47 为"配合 checkpointing=True 的内存节省"改为 temporal_chunk_size=64，但：
+- checkpointing=True + chunk=64 → EEG 8 块，4层×3边×8块=96 forward + 96 backward recompute = **192 次 propagate() 调用**
+- vs V5.46 (null+checkpointing=True)：4层×3边×1块=12 forward + 12 recompute = **24 次调用**
+- 192/24 = **8× 更多 Python 调用** → 训练从 ~100s/epoch → ~430s/epoch（~4-5× 变慢）
+
+V5.47 的出发点是好的（checkpointing+分块 = 真正节省内存），但用户 GPU 只用了 0.18GB，根本不需要内存节省，代价是 8× 的速度损失。
+
+**回归 2 — InfoNCE temperature=0.1 在 warmup 期间压制预测准确度（pred_r2_h1_fmri 下降）**
+
+V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
+- fMRI: n_items = N×S = 190×17 = 3230 → 初始 loss_scale ≈ log(3230)/0.1 ≈ **81**
+- pred_sig 损失（直接优化 pred_r2）的初始 loss_scale ≈ 1.0
+- warmup_epochs=10 期间权重固定：InfoNCE effective 梯度 = 4.0×81=**324** vs pred_sig=6.0×1=**6** → InfoNCE **50× 压制**预测准确度训练信号
+- 结果：predictor 学会"区分未来"但不学会"准确预测未来" → pred_r2_h1_fmri 随 epoch 持续下降
+
+这是 AGENTS.md 规则"添加新任务损失时必须问：这个数据集规模能否支持额外的梯度预算？"的直接违反。
+
+### 修复（V5.48）：
+1. `temporal_chunk_size: 64 → null`（恢复 V5.45/V5.46 行为，8× 提速）
+2. `use_gradient_checkpointing: true → false`（额外 2× 提速，GPU 利用率仅 2% 无需节省内存）
+3. `info_nce_temperature: 0.1 → 0.5`（loss_scale 从 81 降至 16，与 pred_sig 同量级，恢复梯度平衡）
+4. `task_priorities.pred_nce: 4.0 → 2.0`（warmup 期 InfoNCE effective 梯度比从 50:1 → 5:1，消除 pred_r2 < 0 告警）
+
+**快速诊断规则（发现"GPU 利用率 <10% 但训练很慢"时的排查顺序）**：
+1. 检查 `temporal_chunk_size` × `use_gradient_checkpointing` 组合
+   - chunk=null 或 checkpointing=false → 单次 propagate，最快
+   - chunk=64 + checkpointing=true → 8× Python overhead，需要吗？查 GPU allocated
+2. 若 GPU allocated < GPU_TOTAL × 20%，关闭 checkpointing 并设 chunk=null
+3. 若 OOM 再开启（先 checkpointing=true，再 chunk=64，再 chunk=32）
+
+**InfoNCE 温度调优规则（小数据集，4-8 被试）**：
+- n_items = N × prediction_steps（如 190×17=3230 for fMRI）
+- 初始 loss_scale ≈ log(n_items) / temperature
+- 目标：InfoNCE effective 梯度 ≤ 10× pred_sig，避免 warmup 期预测准确度被压制
+  - effective_nce = pred_nce_priority × loss_scale = pred_nce_priority × log(n_items) / temperature
+  - effective_pred = pred_priority × pred_sig_scale ≈ 6.0 × 1.0 = 6
+  - 推荐配置：pred_nce=2.0, temperature=0.5 → effective_nce = 2.0×16 = 32 vs 6 → 5:1（可接受）
+- 若仍出现 pred_r2 下降，设 use_info_nce: false（明确禁用优于错误配置）
+
+---
+
 ### [2026-03-01] EEG/fMRI 时间异质性：预测物理约束与文献支持的 R² 标准
 
 **用户观察**：pred_r2_eeg=0.051，明显低于 pred_r2_fmri=0.205，询问是否实现有问题；
@@ -1275,6 +1328,10 @@ for nt in list(pred_enc.node_types):
 | _r2_rating() 分模态描述 + 中文说明文字 | ✅ 已实现 | V5.46 |
 | 可视化 R² 参考线更新（0.10/0.20/0.30 三条线）| ✅ 已更新 | V5.46 |
 | AGENTS.md 和 USERGUIDE.md 文献引用（7 篇论文，EEG/fMRI 物理约束支撑）| ✅ 已更新 | V5.46 |
+| temporal_chunk_size: null → 64（V5.47 回归，已在 V5.48 修复回 null）| ✅ 已修复 | V5.48 |
+| use_gradient_checkpointing: true → false（GPU 利用率仅 2%，无需重计算）| ✅ 已更新 | V5.48 |
+| info_nce_temperature: 0.1 → 0.5（防 warmup 期 InfoNCE 压制预测梯度）| ✅ 已更新 | V5.48 |
+| task_priorities.pred_nce: 4.0 → 2.0（warmup 期 InfoNCE:pred_sig 比从 50:1→5:1，消除 pred_r2<0 告警）| ✅ 已更新 | V5.48 |
 
 ### 被试特异性嵌入全链路（V5.19–V5.20）
 

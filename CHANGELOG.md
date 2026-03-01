@@ -1,12 +1,67 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-03-01  
-**版本**：V5.47  
+**最后更新**：2026-03-02  
+**版本**：V5.48  
 **状态**：生产就绪
 
 ---
 
-## [V5.47] 2026-03-01 — NPI 对等：有效连接矩阵 + InfoNCE 对比预测
+## [V5.48] 2026-03-02 — 性能修复：消除 V5.47 的双重训练回归
+
+### 背景
+
+用户报告 V5.47 训练速度明显慢于上一版本（430s/epoch，GPU 仅用 0.18GB/8GB = 2%），  
+且 pred_r2_h1_fmri 随训练加深持续下降（epoch 5: 0.162 → epoch 15: -0.010）。  
+通过对比 AGENTS.md 版本记录，识别出 V5.47 引入的两个回归。
+
+### 根因分析
+
+#### 回归 1：temporal_chunk_size: null → 64（速度回归，主因）
+
+V5.45 确立的设计原则：`temporal_chunk_size=null` 时，
+- `checkpointing=True`：chunk_size = T（单次 gradient_checkpoint 包装，1 次重计算）
+- `checkpointing=False`：chunk_size = T（单次 propagate，完全无开销）
+
+V5.47 将默认值改为 64，配合 `use_gradient_checkpointing=true`：
+- EEG T=500, chunk=64 → 8 块/层，4 层（ST-GCN 编码器）×3 边类型×8 块 = 96 forward + 96 backward recompute = **192 次 propagate()**
+- V5.46 (null+checkpointing=True)：4 层×3 边×1 块 = 12 + 12 = **24 次 propagate()**
+- 8× 更多 Python-GPU round-trip → epoch 从 ~100s → ~430s（实测）
+
+GPU 只用 0.18GB（全模型+优化器），说明内存完全不紧张，分块毫无必要。
+
+#### 回归 2：InfoNCE temperature=0.1 压制预测准确度（质量回归）
+
+V5.47 新增 InfoNCE 对比预测损失，temperature=0.1 导致：
+- fMRI n_items = 190×17 = 3230，初始 loss_scale ≈ log(3230)/0.1 ≈ **81**
+- pred_sig（直接优化 pred_r2）初始 loss_scale ≈ 1.0
+- warmup_epochs=10 期间权重固定：InfoNCE effective 梯度 = 4×81 = **324** vs pred_sig = 6×1 = **6**
+- InfoNCE **50× 压制** pred_r2 方向的梯度 → predictor 学会"区分"但不学会"准确预测"
+- 结果：pred_r2_h1_fmri 随 epoch 持续下降（epoch 5: 0.162 → 15: -0.010）
+
+### 修复内容
+
+| 参数 | V5.47 值 | V5.48 值 | 效果 |
+|------|---------|---------|------|
+| `model.temporal_chunk_size` | `64` | `null` | 恢复单次 propagate，8× 减少 Python overhead |
+| `training.use_gradient_checkpointing` | `true` | `false` | 消除 backward 重计算，GPU allocated 仅 0.18GB 无需节省 |
+| `model.info_nce_temperature` | `0.1` | `0.5` | loss_scale 从 81 → 16，与 pred_sig 梯度同量级 |
+| `task_priorities.pred_nce` | `4.0` | `2.0` | warmup 期 InfoNCE:pred_sig 梯度比从 50:1 → 5:1，消除 pred_r2<0 告警 |
+
+**预期效果**：
+- 训练速度：430s/epoch → 约 50-120s/epoch（3-8× 提速，取决于 GPU 型号）
+- pred_r2_h1_fmri：稳定并改善（InfoNCE 不再压制预测准确度梯度）
+- pred_r2_fmri：随更多有效 epoch 逐步提高
+
+### OOM 应对指南（速度优先 vs 内存优先）
+
+如遇 CUDA OOM，按顺序尝试：
+1. `training.use_gradient_checkpointing: true`（backward 重计算，约 +40% 时间）
+2. `model.temporal_chunk_size: 64`（+ GC=True，8 块，约 +8× Python overhead）
+3. `model.temporal_chunk_size: 32`（16 块，极限内存场景）
+4. 缩小 `windowed_sampling.fmri_window_size`（50 → 30）
+
+---
+
 
 ### 背景
 

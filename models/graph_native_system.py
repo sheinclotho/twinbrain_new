@@ -813,6 +813,37 @@ class GraphNativeBrainModel(nn.Module):
             return run_embed
         return subject_embed  # may be None
 
+    def _decode_latents_to_signal(
+        self,
+        pred_dict: Dict[str, torch.Tensor],
+        error_context: str = "",
+    ) -> Dict[str, torch.Tensor]:
+        """Decode a dict of latent tensors {node_type: [N, steps, H]} to signal space.
+
+        Shared helper used by ``simulate_intervention``,
+        ``compute_effective_connectivity``, and ``compute_loss``.  Avoids the
+        formerly-triplicated HeteroData construction + try/except wrapping.
+
+        Args:
+            pred_dict: Mapping from node type to latent tensor [N, steps, H].
+            error_context: Optional prefix for debug log messages on failure.
+
+        Returns:
+            Mapping from node type to decoded signal [N, steps, C], or an empty
+            dict if ``pred_dict`` is empty or the decoder raises an exception.
+        """
+        if not pred_dict:
+            return {}
+        hd = HeteroData()
+        for nt, v in pred_dict.items():
+            hd[nt].x = v
+        try:
+            return self.decoder(hd)
+        except Exception as e:
+            if error_context:
+                logger.debug(f"{error_context}: {e}")
+            return {}
+
     def forward(
         self,
         data: HeteroData,
@@ -1010,20 +1041,12 @@ class GraphNativeBrainModel(nn.Module):
                 pred_perturbed = self.prediction_propagator(pred_perturbed, data)
 
         # 5. Decode predictions to signal space
-        def _decode(pred_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-            if not pred_dict:
-                return {}
-            hd = HeteroData()
-            for nt, v in pred_dict.items():
-                hd[nt].x = v
-            try:
-                return self.decoder(hd)
-            except Exception as e:
-                logger.debug(f"simulate_intervention decoder failed: {e}")
-                return {}
-
-        sig_baseline = _decode(pred_baseline)
-        sig_perturbed = _decode(pred_perturbed)
+        sig_baseline = self._decode_latents_to_signal(
+            pred_baseline, error_context="simulate_intervention decoder"
+        )
+        sig_perturbed = self._decode_latents_to_signal(
+            pred_perturbed, error_context="simulate_intervention decoder"
+        )
 
         # 6. Causal effect = perturbed − baseline
         causal_effect: Dict[str, torch.Tensor] = {}
@@ -1127,18 +1150,7 @@ class GraphNativeBrainModel(nn.Module):
             if pred_baseline:
                 pred_baseline = self.prediction_propagator(pred_baseline, data)
 
-        def _decode_to_signal(pred_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-            if not pred_dict:
-                return {}
-            hd = HeteroData()
-            for nt, v in pred_dict.items():
-                hd[nt].x = v
-            try:
-                return self.decoder(hd)
-            except Exception:
-                return {}
-
-        sig_baseline = _decode_to_signal(pred_baseline)
+        sig_baseline = self._decode_latents_to_signal(pred_baseline)
 
         # Accumulate EC column by column (each column = one perturbed region)
         ec_matrix = torch.zeros(N, N, device=device)
@@ -1165,7 +1177,7 @@ class GraphNativeBrainModel(nn.Module):
                 if pred_pert:
                     pred_pert = self.prediction_propagator(pred_pert, data)
 
-            sig_pert = _decode_to_signal(pred_pert)
+            sig_pert = self._decode_latents_to_signal(pred_pert)
 
             # Causal effect at modality: perturbed - baseline
             if modality in sig_pert and modality in sig_baseline:
@@ -1436,22 +1448,14 @@ class GraphNativeBrainModel(nn.Module):
             # Training both the decoder (for predicted-latent decoding) and the
             # predictor (for signal-quality alignment) in a single backward pass.
             if pred_means and T_ctx_dict:
-                # Build a minimal HeteroData containing only predicted latents.
-                # The decoder (GraphNativeDecoder) accesses only encoded_data[nt].x
-                # and runs 1-D temporal convolutions — it does NOT use edge_index or
-                # edge_attr.  A node-feature-only HeteroData is therefore sufficient.
-                _pred_dec = HeteroData()
-                for _nt, _pred_lat in pred_means.items():
-                    _pred_dec[_nt].x = _pred_lat   # [N, pred_steps, H]
-                try:
-                    _pred_sigs = self.decoder(_pred_dec)
-                except Exception as _e:
-                    logger.debug(
-                        f"pred_sig decoder call failed for "
-                        f"node_types={list(pred_means.keys())} — "
-                        f"pred shapes={[tuple(v.shape) for v in pred_means.values()]}: {_e}"
-                    )
-                    _pred_sigs = {}
+                # The decoder (GraphNativeDecoder) only needs encoded_data[nt].x
+                # and runs 1-D temporal convolutions; no edge_index/edge_attr needed.
+                _ctx = (
+                    f"pred_sig decoder failed for "
+                    f"node_types={list(pred_means.keys())} — "
+                    f"pred shapes={[tuple(v.shape) for v in pred_means.values()]}"
+                )
+                _pred_sigs = self._decode_latents_to_signal(pred_means, error_context=_ctx)
                 for _nt, _pred_sig in _pred_sigs.items():
                     _T_ctx = T_ctx_dict.get(_nt)
                     if _T_ctx is None or _nt not in data.node_types:

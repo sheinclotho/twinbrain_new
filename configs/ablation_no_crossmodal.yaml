@@ -1,0 +1,30 @@
+# ──────────────────────────────────────────────────────────────────────────
+# 消融配置 B: 多模态独立（无跨模态边）
+# ──────────────────────────────────────────────────────────────────────────
+#
+# 使用方法:
+#   python main.py --config configs/ablation_no_crossmodal.yaml
+#
+# 目的:
+#   在保留两路信号（EEG + fMRI）的前提下，禁用 EEG→fMRI 跨模态图卷积边。
+#   各模态独立编码，无消息传递耦合。
+#
+# 与完整多模态（默认 default.yaml，模式 A）的对比可量化：
+#   "跨模态图卷积" 的独立贡献（在数据量相同的条件下）
+#
+# 解读：
+#   pred_r2_fmri(A) > pred_r2_fmri(B)  → 跨模态图卷积有正向贡献
+#   pred_r2_fmri(A) ≈ pred_r2_fmri(B)  → 贡献不显著（可能数据量不足，或 EEG/fMRI 时间未对齐）
+#   pred_r2_fmri(A) < pred_r2_fmri(B)  → 跨模态连接引入梯度干扰（小数据集常见）
+#                                          建议检查 default.yaml 中的多任务学习超参数：
+#                                          loss 权重平衡（use_adaptive_loss, task_priorities）、
+#                                          学习率、或减少跨模态边密度（k_cross_modal）
+#
+# 注意: 此文件仅覆盖与 default.yaml 不同的字段（_base 深度合并）。
+#       完整默认值请参考 configs/default.yaml。
+
+ablation:
+  disable_cross_modal_edges: true
+
+output:
+  experiment_name: "twinbrain_ablation_no_crossmodal"
