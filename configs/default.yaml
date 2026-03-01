@@ -273,11 +273,17 @@ model:
   #   64   → EEG 8 块 / fMRI 1 块，适合 6-8GB GPU
   #   32   → EEG 16 块 / fMRI 1 块，适合 4-6GB GPU（极端 OOM）
   #
-  # 显存估算（windowed 模式，float16）：
-  #   EEG  T=500, E≈2520, H=128: 峰值 ≈ 161MB（null 时）
-  #   fMRI T=50,  E≈5700, H=128: 峰值 ≈  73MB（null 时）
-  #   → 8GB GPU 完全安全，无需分块
-  temporal_chunk_size: null  # 不分块：仅 use_gradient_checkpointing=True 时才需要设置
+  # 显存估算（windowed 模式，float16；E 为实际有向边数，随数据和阈值变化）：
+  #   EEG  T=500, E≈1260（静态单向边，use_dynamic_graph=false）: 峰值 ≈ 155MB/张量
+  #   EEG  T=500, E≈1890（含动态 k=10 单向边，use_dynamic_graph=true）: 峰值 ≈ 230MB/张量
+  #   fMRI T=50,  E≈5700, H=128: 峰值 ≈  73MB/张量（null 时）
+  #   ⚠ 消息函数中 3-4 个大张量同时存在（x_j, msg, alpha, msg×alpha）：
+  #     use_dynamic_graph=true 时总峰值约 230MB × 3-4 ≈ 700-900MB（仅消息计算部分）
+  #   + Adam 优化器状态（第一个 optimizer.step() 后，约 200MB 永久占用）
+  #   → epoch 2 可能 OOM：optimizer 状态 + 消息张量 + 其他激活超出 8GB
+  #   → use_gradient_checkpointing=True + temporal_chunk_size=64 可将单张量峰值降至
+  #     ~29MB/块（230MB × 64/500），每块 3-4 张量共 ~120MB，留足 8GB 余量
+  temporal_chunk_size: 64  # 与 use_gradient_checkpointing=true 配合使用；EEG 8块/fMRI 1块
 
   # 跨模态潜空间对齐损失（Cross-Modal Latent Alignment，V5.43 新增）
   # ─────────────────────────────────────────────────────────────────────────
@@ -360,13 +366,23 @@ training:
   # 代价：约 30–50% 训练速度下降（backward 需重新执行 forward）。
   #
   # ★ temporal_chunk_size 与此参数组合效果：
-  #   两者均启用时，EEG T=500 的 backward 需额外重计算所有 chunk，代价翻倍。
-  #   显存充足（GPU Memory allocated << 1 GB）时两者均可关闭以获得最快速度。
+  #   两者均启用时（GC=True, chunk=64）：
+  #   • forward：T/chunk_size 次独立 propagate() 调用（EEG 8次），峰值 ≈ chunk_size×E×H
+  #   • backward：gradient_checkpoint 重计算每块 forward，省去整段 T 的激活存储
+  #   速度代价：GC 约 +40% backward 时间（重计算）+ 每 chunk 增加少量 Python 开销
+  #             EEG T=500, chunk=64：4层×3边×8块=96次 propagate()（vs 12次无分块）
+  #             → 总 epoch 时间约慢 2-3×（主要来自 Python-GPU round-trip overhead）
+  #             fMRI T=50, chunk=64：T<chunk，仍1次调用，几乎无额外开销
+  #   ⚠ 为何 temporal_chunk_size 在 use_gradient_checkpointing=false 时无效：
+  #     PyTorch autograd 无论如何都存储全部 T 步的前向激活；分块只是将 1 次大的
+  #     propagate() 拆成多次小调用，每次的激活仍然累积，总显存不减。
+  #     因此无 GC 时分块仅增加 Python overhead，无任何内存收益（V5.45 设计意图）。
   #
   # 建议：
-  #   显存充足（allocated < 1 GB）→ false（最快，与 temporal_chunk_size=null 搭配）
-  #   遭遇 CUDA OOM → 先尝试 temporal_chunk_size=64，再启用此项
-  use_gradient_checkpointing: false
+  #   显存充足（16GB+ GPU）→ false（最快，temporal_chunk_size=null 搭配）
+  #   8GB GPU 或遭遇 CUDA OOM → true（需同时设 temporal_chunk_size=64 才能真正分块）
+  #   遭遇 OOM 时必须先启用本项，再通过 temporal_chunk_size 控制分块大小。
+  use_gradient_checkpointing: true
 
   # 最大序列长度（单样本模式，windowed_sampling.enabled: false）
   # ─────────────────────────────────────────────────────────────
@@ -503,11 +519,12 @@ training:
 #   截断 → 丢弃数据，1 样本/run，EEG 连通性估计仅 1.2s（统计不可靠）
 #   窗口 → 利用全部数据，N 样本/run，连通性来自完整 run（稳定可靠）
 #
-# GPU 内存需求估算（fMRI: N=190, E=5700, H=128, float16, temporal_chunk_size=null）：
-#   窗口模式（fmri_window_size=50）: 峰值 ≈ 73MB/step  → 4-8 被试 ✅ 8GB GPU
-#   单样本模式（max_seq_len=300）:   峰值 ≈ 263MB/step → ≤2 被试 ⚠️ 8GB GPU
-#   EEG（T=500, E≈2520, temporal_chunk_size=null）:  峰值 ≈ 161MB/step → ✅ 8GB GPU
-#   （OOM 时：设 temporal_chunk_size=64→32 逐步降低峰值，代价是速度下降 8-16×）
+# GPU 内存需求估算（fMRI: N=190, E=5700, H=128, float16, temporal_chunk_size=64）：
+#   窗口模式（fmri_window_size=50, chunk_size=64≥T）: 峰值 ≈ 73MB/张量 → 4-8 被试 ✅ 8GB GPU
+#   单样本模式（max_seq_len=300）:   峰值 ≈ 263MB/张量 → ≤2 被试 ⚠️ 8GB GPU
+#   EEG（T=500, E≈1890（含动态 k=10），chunk_size=64）: 峰值 ≈ 29MB/块/张量 ✅ 8GB GPU
+#   EEG（T=500, temporal_chunk_size=null, use_dynamic_graph=true）: 峰值 ≈ 230MB+/张量 ⚠️ 8GB GPU OOM
+#   （OOM 时：确认 temporal_chunk_size=64 已启用，并开启 use_gradient_checkpointing）
 #
 # 推荐配置（启用时将 max_seq_len 设为 null）：
 #   fmri_window_size: 50   → 50 TRs × TR=2s = 100s ≈ 一个静息脑状态周期
@@ -757,34 +774,42 @@ output:
 # 七、设备配置
 # ──────────────────────────────────────────────────────────────────────────
 #
-# ★ GPU 内存配置速查表（V5.44 更新）
+# ★ GPU 内存配置速查表（V5.46 更新）
 # ─────────────────────────────────────────────────────────────────────────
-# 速度优先原则（2-8 被试，windowed 模式，GPU 显存充足时）：
+# 速度最优原则（16GB+ GPU，显存充足时）：
 #   model.temporal_chunk_size: null           ← 最快（无分块循环）
 #   training.use_gradient_checkpointing: false ← 最快（无重计算）
 #
-# 以下组合经测试可在对应 GPU 上稳定支持不同被试规模训练：
-#
-# 8GB GPU（RTX 3070 / RTX 4070 / etc.），显存充足时（allocated << 总显存）：
-#   model.hidden_channels: 128
-#   model.temporal_chunk_size: 32            ← 默认（V5.41 起，兼顾速度与 OOM 防护）
-#   training.use_gradient_checkpointing: false ← 速度最优（当前默认）
+# ⚠ 8GB GPU（RTX 3070 / RTX 4070 等）默认配置（OOM 防护，当前默认）：
+#   model.temporal_chunk_size: 64            ← 默认（每块 52MB，EEG 8块/fMRI 1块）
+#   training.use_gradient_checkpointing: true ← 默认（释放中间激活，防止 epoch 2 OOM）
 #   windowed_sampling.enabled: true（已启用）
 #   windowed_sampling.fmri_window_size: 50
 #   training.gradient_accumulation_steps: 4
 #   → 支持 4-8 被试 × 约 5 窗口/被试 ≈ 20-40 样本/epoch
-#   → 典型 epoch 时间：20-40s（EEG T=500，具体取决于 GPU 型号和系统负载）
-#   → 速度最优（不分块）可设 model.temporal_chunk_size: null，但多 epoch 后存在 OOM 风险
+#   → 代价：GC 本身约 +40% backward 时间；加上 EEG 分块 8 次 propagate() 调用的
+#           Python overhead，总体训练时间约慢 2-3×（fMRI 因 T≤chunk 无额外开销）
 #
-# 8GB GPU，遭遇 CUDA OOM 时（逐步回退，下列速度影响均针对 EEG T=500 场景）：
-#   1. 确认 model.temporal_chunk_size: 32（已是默认值）
-#   2. 先启用 training.use_gradient_checkpointing: true（约 +40% 时间，峰值显存约 -40%）
-#   3. 再设 model.temporal_chunk_size: 16    （约 +32× 时间，约 -32× 峰值）
-#   注：fMRI T=50 时分块代价极小（ceil(50/chunk)≈1-2 次调用），主要影响 EEG T=500
+# ⚠ 为何 8GB GPU 不能用 null/false（V5.45 之前的默认值）：
+#   use_dynamic_graph=true（默认）使 EEG 有向边数从 ~1260 增至 ~1890（+630 动态边）。
+#   单次 propagate() 同时创建多个大张量（lin_msg + att 权重 + msg×alpha），
+#   合计约 700-900MB（EEG T=500，依实际边数和数据而定）。
+#   第一个 epoch 后 Adam 优化器状态（~200MB）永久占用显存，
+#   导致 epoch 2 的同一分配失败（CUDA OOM）。
+#   → 8GB GPU 必须启用 GC + 分块（64）以将每块峰值降至约 120MB（可接受）。
+#
+# 8GB GPU，仍 OOM 时（逐步回退，优先尝试对速度影响小的策略）：
+#   1. 已启用 training.use_gradient_checkpointing: true（当前默认）
+#      + model.temporal_chunk_size: 64（当前默认）
+#   2. 减小 model.k_dynamic_neighbors（10 → 5）：边数 -33%，速度几乎不变
+#   3. 设 model.use_dynamic_graph: false：去除所有动态边，速度几乎不变
+#   4. 设 model.temporal_chunk_size: 32（EEG 16块，约 +2× 更多 Python 调用）
+#   注：fMRI T=50 时分块代价极小（ceil(50/64)=1 次调用），主要影响 EEG T=500
 #
 # 16GB GPU（RTX 3080 Ti / RTX 4080 / etc.）：
 #   model.hidden_channels: 128
 #   model.temporal_chunk_size: null
+#   training.use_gradient_checkpointing: false
 #   windowed_sampling.fmri_window_size: 80   ← 可加大窗口
 #   model.prediction_steps: 26           ← floor(80×1/3)
 #   → 支持 8-16 被试
@@ -792,13 +817,14 @@ output:
 # 32GB GPU（RTX 3090 / A6000 / etc.）：
 #   model.hidden_channels: 256           ← 更大模型
 #   model.temporal_chunk_size: null
+#   training.use_gradient_checkpointing: false
 #   windowed_sampling.fmri_window_size: 100
 #   model.prediction_steps: 33           ← floor(100×1/3)
 #   → 支持 16+ 被试
 #
 # 如果 OOM（速度影响针对 EEG T=500；fMRI T=50 时分块代价远小于此）：
 #   1. 启用 training.use_gradient_checkpointing: true（约 +40% 时间，峰值显存约 -40%）
-#   2. 设 model.temporal_chunk_size: 64（约 +8× 时间，约 -8× 峰值）
+#   2. 设 model.temporal_chunk_size: 64（约 +8× 时间，约 -8× 峰值）← 此为新默认
 #   3. 设 model.temporal_chunk_size: 32（约 +16× 时间，约 -16× 峰值）
 #   4. 减小 windowed_sampling.fmri_window_size（50 → 30）
 #      ⚠ 同步调整 prediction_steps = floor(fmri_window_size × 1/3) = floor(30×1/3) = 10
