@@ -867,10 +867,10 @@ def build_graphs(config: dict, logger: logging.Logger):
     else:
         logger.info(f"成功构建 {len(graphs)} 个图")
 
-    return graphs, mapper, subject_to_idx
+    return graphs, mapper, subject_to_idx, run_idx_counter
 
 
-def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
+def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, num_runs: int = 0):
     """创建模型
 
     Args:
@@ -879,6 +879,11 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
         num_subjects: 数据集中的总被试数（由 build_graphs 返回的 subject_to_idx 推导）。
             > 0 时在模型中创建 nn.Embedding(num_subjects, hidden_channels) 实现
             个性化被试嵌入（AGENTS.md §九 Gap 2）。
+            0 = 禁用（默认，兼容旧行为）。
+        num_runs: 数据集中的总 run/session 数（由 build_graphs 返回的 run_idx_counter）。
+            > 0 时在模型中创建 nn.Embedding(num_runs, hidden_channels) 实现
+            会话级嵌入，捕捉跨会话的漂移（扫描器噪声、疲劳、认知状态变化），
+            支持跨会话知识迁移（V5.44）。
             0 = 禁用（默认，兼容旧行为）。
     """
     logger.info("=" * 60)
@@ -913,6 +918,9 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
 
     # 输入通道
     in_channels_dict = {modality: 1 for modality in node_types}
+
+    # 会话嵌入开关：由 config 控制是否启用（默认关闭以保持向后兼容）
+    effective_num_runs = num_runs if config['model'].get('use_run_embed', False) else 0
     
     # 创建模型
     model = GraphNativeBrainModel(
@@ -935,12 +943,18 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
         temporal_chunk_size=config['model'].get('temporal_chunk_size', None),
         use_cross_modal_align=config['model'].get('use_cross_modal_align', True),
         pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
+        num_runs=effective_num_runs,
     )
 
     if num_subjects > 0:
         logger.info(
             f"被试特异性嵌入已启用: {num_subjects} 个被试 × "
             f"{config['model']['hidden_channels']} 维 (AGENTS.md §九 Gap 2)"
+        )
+    if effective_num_runs > 0:
+        logger.info(
+            f"会话/run 嵌入已启用: {effective_num_runs} 条 run × "
+            f"{config['model']['hidden_channels']} 维 (V5.44 跨会话预测)"
         )
     logger.info(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
     
@@ -1824,7 +1838,7 @@ def main():
     try:
         # 步骤1-2: 加载数据 & 构建图（缓存感知，命中时跳过原始数据加载）
         # subject_to_idx: {subject_id_str → int_idx}，传给 create_model 以创建正确大小的 Embedding
-        graphs, mapper, subject_to_idx = build_graphs(config, logger)
+        graphs, mapper, subject_to_idx, num_runs = build_graphs(config, logger)
 
         # 持久化 subject_to_idx 映射，确保推理时能将被试 ID 还原到 Embedding 索引。
         # 不保存此文件则无法在训练后推理时恢复正确的 subject_idx，
@@ -1839,7 +1853,7 @@ def main():
                 logger.warning(f"保存 subject_to_idx 失败 ({sidx_path}): {_e}")
 
         # 步骤3: 创建模型
-        model = create_model(config, logger, num_subjects=len(subject_to_idx))
+        model = create_model(config, logger, num_subjects=len(subject_to_idx), num_runs=num_runs)
         
         # 启动前打印一次人类可读的配置核对表，方便快速验证参数
         log_training_summary(config, graphs, model, logger)

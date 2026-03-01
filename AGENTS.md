@@ -1147,8 +1147,12 @@ for nt in list(pred_enc.node_types):
 | 跨模态潜空间对齐损失 cross_modal_align（cosine similarity，CMC 风格）| ✅ 已实现 | V5.43 |
 | 预测步指数加权 pred_step_weight_gamma（远期步权重更高）| ✅ 已实现 | V5.43 |
 | 修复误导性 is_causal=False 注释（compute_loss + validate）| ✅ 已修复 | V5.43 |
-| 跨会话预测 | ⚡ 部分（within-run） | — |
-| 干预响应、自我演化 | ❌ Future work | — |
+| 跨会话预测（run_embed，会话级嵌入）| ✅ 已实现 | V5.44 |
+| 干预响应仿真（simulate_intervention，TMS 数字孪生）| ✅ 已实现 | V5.44 |
+| 少样本个性化推理（adapt_to_subject，O(H) 参数更新）| ✅ 已实现 | V5.44 |
+| 梯度归因可解释性（compute_attribution，功能指纹）| ✅ 已实现 | V5.44 |
+| 检查点自动推理（TwinBrainDigitalTwin.from_checkpoint）| ✅ 已实现 | V5.44 |
+| 自我演化（多会话在线学习）| ❌ Future work | — |
 
 ### 被试特异性嵌入全链路（V5.19–V5.20）
 

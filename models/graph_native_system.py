@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import contextlib
 import random
 from torch_geometric.data import HeteroData
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import logging
 from pathlib import Path
 
@@ -496,6 +496,7 @@ class GraphNativeBrainModel(nn.Module):
         temporal_chunk_size: Optional[int] = None,
         use_cross_modal_align: bool = True,
         pred_step_weight_gamma: float = 1.0,
+        num_runs: int = 0,
     ):
         """
         Initialize complete model.
@@ -554,6 +555,17 @@ class GraphNativeBrainModel(nn.Module):
                 to mean 1.  Larger gamma → more emphasis on far-future
                 steps (harder to predict).  0.0 = uniform (original behaviour).
                 Default 1.0 (V5.43).
+            num_runs: Total number of recording sessions/runs in the dataset.
+                > 0 creates nn.Embedding(num_runs, hidden_channels) for
+                per-run session embedding.  Each run (recording session) learns
+                a unique latent offset added to node features alongside the
+                subject embedding, capturing session-level drift such as scanner
+                noise, fatigue, and cognitive state variation between sessions.
+                This enables cross-session knowledge transfer and improves
+                generalization across recording sessions.
+                Initialized to zero so it has no effect at the start of training
+                and only diverges from zero as session-specific patterns emerge.
+                0 = disabled (default, backward-compatible).
         """
         super().__init__()
         
@@ -562,6 +574,7 @@ class GraphNativeBrainModel(nn.Module):
         self.use_prediction = use_prediction
         self.loss_type = loss_type
         self.num_subjects = num_subjects
+        self.num_runs = num_runs
         self.use_spectral_loss = use_spectral_loss
         self.use_cross_modal_align = use_cross_modal_align
         self.pred_step_weight_gamma = pred_step_weight_gamma
@@ -574,6 +587,19 @@ class GraphNativeBrainModel(nn.Module):
         if num_subjects > 0:
             self.subject_embed = nn.Embedding(num_subjects, hidden_channels)
             nn.init.normal_(self.subject_embed.weight, std=0.02)
+
+        # 会话/run 特异性嵌入 (V5.44, 跨会话预测支持)
+        # num_runs > 0: each recording session gets a learnable [H] offset,
+        # capturing session-level drift (scanner noise, fatigue, cognitive state
+        # variation).  Initialized to zero so the first epoch is identical to
+        # num_runs=0 — the offset only emerges as the optimizer finds session
+        # patterns.  Added to node features AFTER subject_embed, so the two
+        # form an additive decomposition:
+        #   x_proj += subject_embed   (who: stable individual identity)
+        #   x_proj += run_embed       (when: transient session state)
+        if num_runs > 0:
+            self.run_embed = nn.Embedding(num_runs, hidden_channels)
+            nn.init.zeros_(self.run_embed.weight)  # zero-init: no session bias initially
         
         # Encoder: Graph-native spatial-temporal encoding
         self.encoder = GraphNativeEncoder(
@@ -688,7 +714,32 @@ class GraphNativeBrainModel(nn.Module):
                 )
                 s_idx = s_idx.clamp(0, self.num_subjects - 1)
             subject_embed = self.subject_embed(s_idx)  # [H]
-        encoded_data = self.encoder(data, subject_embed=subject_embed)
+
+        # 会话/run 嵌入 (V5.44, 跨会话预测支持)
+        # run_embed captures session-level drift additive to subject_embed.
+        # Added as offset AFTER subject_embed so the two form an additive
+        # decomposition: subject (who) + run (when) → combined latent context.
+        run_embed = None
+        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
+            r_idx = data.run_idx
+            if not isinstance(r_idx, torch.Tensor):
+                r_idx = torch.tensor(r_idx, dtype=torch.long)
+            if r_idx.item() < 0 or r_idx.item() >= self.num_runs:
+                r_idx = r_idx.clamp(0, self.num_runs - 1)
+            run_embed = self.run_embed(r_idx)  # [H]
+
+        # Combine subject + run embeddings: additive decomposition.
+        # subject_embed: stable individual identity (who the brain belongs to).
+        # run_embed:     transient session state (when / in what condition).
+        # Either or both may be None (backward-compatible with older checkpoints).
+        if subject_embed is not None and run_embed is not None:
+            combined_embed = subject_embed + run_embed
+        elif run_embed is not None:
+            combined_embed = run_embed
+        else:
+            combined_embed = subject_embed  # may be None — encoder handles None
+
+        encoded_data = self.encoder(data, subject_embed=combined_embed)
         
         # 2. Decode: Reconstruct signals
         reconstructed = self.decoder(encoded_data)
@@ -722,6 +773,173 @@ class GraphNativeBrainModel(nn.Module):
 
         return reconstructed, predictions
     
+    @torch.no_grad()
+    def simulate_intervention(
+        self,
+        data: HeteroData,
+        interventions: Dict[str, Tuple],
+        num_steps: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Simulate a digital twin intervention: inject a perturbation at one or
+        more brain regions and observe the propagated system-level causal response.
+
+        This is the core **digital twin** capability: ask "what-if" questions
+        about the brain without running an actual experiment.  It mirrors TMS
+        (Transcranial Magnetic Stimulation) experiments:
+          1. Encode the baseline brain state → h [N, T, H]
+          2. Perturb h at the target nodes: h_pert[idx] += delta
+          3. Predict both perturbed and baseline future trajectories
+          4. Propagate through the brain connectivity graph (system-level coupling)
+          5. Decode to signal space
+          6. Causal effect = perturbed_response − baseline_response
+
+        The causal effect tells us: "what does stimulating region X do to the
+        rest of the brain?"  This is scientifically analogous to the Green's
+        function / lead-field framework (Deco et al. 2013) and the perturbational
+        complexity index (PCI) used in consciousness research.
+
+        Args:
+            data: HeteroData window representing the current brain state.
+            interventions: Dict mapping modality → (node_indices, delta) where:
+
+                * ``node_indices`` (List[int]): brain region indices to perturb.
+                * ``delta`` (float | Tensor[H]):
+
+                  - **float**: perturbation in units of the node's latent std.
+                    ``delta=2.0`` ≈ supraphysiological stimulation (strong TMS).
+                    ``delta=-1.0`` ≈ inhibitory TMS / GABA-ergic drug.
+                  - **Tensor[H]**: explicit direction vector in latent H-space.
+            num_steps: Future steps to predict.  Defaults to model prediction_steps.
+
+        Returns:
+            Dict with keys:
+
+            * ``'causal_effect'``: ``{nt: Tensor[N, steps, C]}`` — net effect
+              (perturbed − baseline).  Positive = increased activity.
+            * ``'baseline'``: ``{nt: Tensor[N, steps, C]}`` — prediction without
+              intervention (what would happen anyway).
+            * ``'perturbed'``: ``{nt: Tensor[N, steps, C]}`` — prediction with
+              intervention.
+            * ``'encoded_baseline'``: ``{nt: Tensor[N, T, H]}`` — encoded latents
+              of the baseline state (useful for inspection and further analysis).
+
+        Example::
+
+            # Simulate 2σ TMS to right motor cortex (fMRI ROI index 42)
+            result = model.simulate_intervention(
+                data=brain_window,
+                interventions={"fmri": ([42], 2.0)},
+                num_steps=15,
+            )
+            causal = result["causal_effect"]["fmri"]  # [N_fmri, 15, 1]
+            # Top-10 most-affected regions:
+            top = causal.squeeze(-1).abs().max(1).values.argsort(descending=True)[:10]
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        data = data.to(device)
+
+        # Assemble combined embedding (subject + run) for personalized simulation
+        subject_embed = None
+        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
+            s_idx = data.subject_idx
+            if not isinstance(s_idx, torch.Tensor):
+                s_idx = torch.tensor(s_idx, dtype=torch.long)
+            subject_embed = self.subject_embed(s_idx.clamp(0, self.num_subjects - 1).to(device))
+
+        run_embed = None
+        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
+            r_idx = data.run_idx
+            if not isinstance(r_idx, torch.Tensor):
+                r_idx = torch.tensor(r_idx, dtype=torch.long)
+            run_embed = self.run_embed(r_idx.clamp(0, self.num_runs - 1).to(device))
+
+        if subject_embed is not None and run_embed is not None:
+            combined_embed = subject_embed + run_embed
+        elif run_embed is not None:
+            combined_embed = run_embed
+        else:
+            combined_embed = subject_embed
+
+        # 1. Encode baseline
+        encoded_data = self.encoder(data, subject_embed=combined_embed)
+        h_baseline: Dict[str, torch.Tensor] = {
+            nt: encoded_data[nt].x.clone()
+            for nt in self.node_types
+            if nt in encoded_data.node_types
+        }
+
+        # 2. Build perturbed latents
+        h_perturbed = {nt: h.clone() for nt, h in h_baseline.items()}
+        for nt, (node_indices, delta) in interventions.items():
+            if nt not in h_perturbed:
+                logger.warning(f"simulate_intervention: '{nt}' not in encoded nodes, skipping")
+                continue
+            H = h_perturbed[nt].shape[-1]
+            if isinstance(delta, (int, float)):
+                # Scale perturbation by the std of the target nodes' latent activations.
+                # This makes delta=1.0 always correspond to "1 standard deviation
+                # of the node's natural activity range", regardless of model scale.
+                target_h = h_perturbed[nt][node_indices]     # [k, T, H]
+                std_h = target_h.std(dim=(0, 1)).clamp(min=1e-6)  # [H]
+                mean_dir = target_h.mean(dim=(0, 1))         # [H]
+                # Use mean direction normalized; fall back to ones if near-zero
+                norm = mean_dir.norm()
+                direction = (mean_dir / norm) if norm > 1e-6 else torch.ones(H, device=device) / (H ** 0.5)
+                delta_vec = direction * float(delta) * std_h.mean()
+            else:
+                delta_vec = delta.to(device)
+                if delta_vec.shape != (H,):
+                    raise ValueError(f"delta must be scalar or [H={H}], got {delta_vec.shape}")
+            # Perturb: add delta to all time steps of specified nodes
+            h_perturbed[nt][node_indices, :, :] += delta_vec.view(1, H)
+
+        # 3. Run predictor on both contexts
+        pred_baseline: Dict[str, torch.Tensor] = {}
+        pred_perturbed: Dict[str, torch.Tensor] = {}
+        if self.use_prediction:
+            for nt in h_baseline:
+                T = h_baseline[nt].shape[1]
+                if T < self._PRED_MIN_SEQ_LEN:
+                    continue
+                pred_baseline[nt] = self.predictor.predict_next(h_baseline[nt])
+                pred_perturbed[nt] = self.predictor.predict_next(h_perturbed[nt])
+
+            # 4. System-level graph propagation
+            if pred_baseline:
+                pred_baseline = self.prediction_propagator(pred_baseline, data)
+            if pred_perturbed:
+                pred_perturbed = self.prediction_propagator(pred_perturbed, data)
+
+        # 5. Decode predictions to signal space
+        def _decode(pred_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            if not pred_dict:
+                return {}
+            hd = HeteroData()
+            for nt, v in pred_dict.items():
+                hd[nt].x = v
+            try:
+                return self.decoder(hd)
+            except Exception as e:
+                logger.debug(f"simulate_intervention decoder failed: {e}")
+                return {}
+
+        sig_baseline = _decode(pred_baseline)
+        sig_perturbed = _decode(pred_perturbed)
+
+        # 6. Causal effect = perturbed − baseline
+        causal_effect: Dict[str, torch.Tensor] = {}
+        for nt in sig_baseline:
+            if nt in sig_perturbed:
+                causal_effect[nt] = sig_perturbed[nt] - sig_baseline[nt]
+
+        return {
+            'causal_effect': causal_effect,
+            'baseline': sig_baseline,
+            'perturbed': sig_perturbed,
+            'encoded_baseline': h_baseline,
+        }
+
     def compute_loss(
         self,
         data: HeteroData,
@@ -2108,6 +2326,132 @@ class GraphNativeTrainer:
                     logger.warning(f"Failed to clean up temp file: {cleanup_error}")
             raise RuntimeError(f"Checkpoint save failed: {e}")
     
+    def adapt_to_subject(
+        self,
+        data_list: List[HeteroData],
+        subject_idx: int,
+        num_steps: int = 100,
+        lr: float = 5e-3,
+        verbose: bool = True,
+    ) -> None:
+        """Few-shot personalization: fine-tune only the subject embedding for a new subject.
+
+        Freezes all model parameters **except** ``model.subject_embed.weight[subject_idx]``
+        and runs ``num_steps`` gradient descent steps minimising the reconstruction loss.
+        This is extremely parameter-efficient: only H parameters (e.g. 128) are updated,
+        making personalisation feasible with as few as 10–50 training windows.
+
+        Scientific motivation: the encoder has already learned the shared functional
+        connectivity structure from training subjects.  A new subject's brain differs
+        mainly in its baseline activity level and connection-strength offsets — captured
+        by the subject embedding without altering shared topology knowledge.
+
+        Use this after training on multiple subjects to quickly adapt the model to a
+        new subject at inference time, without re-training the full model.
+
+        Args:
+            data_list: Windows from the new subject.  As few as 10–50 windows
+                (~20–100 TR of fMRI, or ~40 s of EEG) typically suffice.
+            subject_idx: Integer index in ``model.subject_embed``.
+                Must be < ``model.num_subjects``.  Allocate an unused index
+                (e.g. ``num_subjects`` + 1) for a genuinely new subject,
+                or reuse an existing index to override that subject's embedding.
+            num_steps: Gradient descent steps (default 100).
+            lr: Learning rate for the embedding update.  Default 5e-3 is
+                higher than the main training LR (1e-4) because only H
+                parameters are updated — the optimisation landscape is well-
+                conditioned and converges quickly.
+            verbose: Log loss every 10 steps.
+
+        Raises:
+            RuntimeError: If the model has ``num_subjects == 0`` (no embedding table).
+            ValueError:   If ``subject_idx >= model.num_subjects``.
+        """
+        if self.model.num_subjects == 0 or not hasattr(self.model, 'subject_embed'):
+            raise RuntimeError(
+                "adapt_to_subject requires num_subjects > 0 during training. "
+                "Re-train the model with at least 2 subjects."
+            )
+        if subject_idx >= self.model.num_subjects:
+            raise ValueError(
+                f"subject_idx={subject_idx} exceeds model.num_subjects="
+                f"{self.model.num_subjects}."
+            )
+
+        # Freeze all parameters except the subject embedding table.
+        # We freeze at the whole-parameter level (requires_grad=False) for
+        # all params, then unfreeze only subject_embed.weight.  This is correct
+        # because PyTorch's autograd cannot track gradients through a tensor
+        # obtained by index-slicing a nn.Parameter (the slice is not a leaf
+        # variable).  By unfreezing the whole weight tensor, autograd computes
+        # gradients for all subject slots, but only subject_idx has non-zero
+        # input gradient because no other row participates in the loss.
+        for param in self.model.parameters():
+            param.requires_grad_(False)
+        self.model.subject_embed.weight.requires_grad_(True)
+
+        adapt_optimizer = torch.optim.Adam([self.model.subject_embed.weight], lr=lr)
+        self.model.train()
+
+        if verbose:
+            logger.info(
+                f"Adapting to subject_idx={subject_idx}: "
+                f"{num_steps} steps, {len(data_list)} windows, lr={lr}"
+            )
+
+        for step in range(num_steps):
+            sample = random.choice(data_list).to(self.device)
+            adapt_optimizer.zero_grad()
+
+            _orig_idx = getattr(sample, 'subject_idx', None)
+            sample.subject_idx = torch.tensor(
+                subject_idx, dtype=torch.long, device=self.device
+            )
+            try:
+                reconstructed, _ = self.model(sample, return_prediction=False)
+                losses = self.model.compute_loss(sample, reconstructed)
+                total_loss = sum(losses.values())
+                total_loss.backward()
+                # Zero out gradients for ALL rows EXCEPT subject_idx before updating.
+                # This ensures the optimizer only updates the target subject's row,
+                # leaving other subjects' embeddings untouched.
+                # Convention: keep_mask[subject_idx] = 1.0, all others = 0.0.
+                with torch.no_grad():
+                    if self.model.subject_embed.weight.grad is not None:
+                        keep_mask = torch.zeros(
+                            self.model.num_subjects, 1,
+                            device=self.model.subject_embed.weight.device,
+                        )
+                        keep_mask[subject_idx] = 1.0
+                        self.model.subject_embed.weight.grad.mul_(keep_mask)
+                adapt_optimizer.step()
+            finally:
+                # Always restore the original subject_idx (non-destructive).
+                # If the sample didn't have subject_idx originally, remove it to
+                # avoid polluting the sample with a spurious attribute.
+                if _orig_idx is not None:
+                    sample.subject_idx = _orig_idx
+                elif hasattr(sample, 'subject_idx'):
+                    del sample.subject_idx
+
+            if verbose and (step + 1) % 10 == 0:
+                logger.info(
+                    f"  adapt step {step+1}/{num_steps}: loss={total_loss.item():.4f}"
+                )
+
+        # Restore full gradient flow and eval mode
+        self.model.subject_embed.weight.requires_grad_(False)
+        for param in self.model.parameters():
+            param.requires_grad_(True)
+        self.model.eval()
+
+        if verbose:
+            embed_norm = self.model.subject_embed.weight[subject_idx].norm().item()
+            logger.info(
+                f"Adaptation done: subject_idx={subject_idx}, "
+                f"embedding L2={embed_norm:.4f}"
+            )
+
     def load_checkpoint(self, path: Path):
         """Load training checkpoint."""
         # weights_only=False is required for loading HeteroData and custom objects

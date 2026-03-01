@@ -8,6 +8,7 @@ Exports all model components including:
 - Advanced attention mechanisms
 - Predictive coding
 - Enhanced models
+- Digital twin inference engine (V5.44)
 """
 
 # Base models
@@ -28,6 +29,9 @@ from .graph_native_mapper import (
 from .adaptive_loss_balancer import AdaptiveLossBalancer
 from .eeg_channel_handler import EnhancedEEGHandler
 from .advanced_prediction import EnhancedMultiStepPredictor
+
+# Digital twin inference engine (V5.44)
+from .digital_twin_inference import TwinBrainDigitalTwin
 
 # Consciousness modules (new)
 from .consciousness_module import (
@@ -75,6 +79,8 @@ __all__ = [
     'AdaptiveLossBalancer',
     'EnhancedEEGHandler',
     'EnhancedMultiStepPredictor',
+    # Digital twin inference engine (V5.44)
+    'TwinBrainDigitalTwin',
     # Consciousness
     'ConsciousnessModule',
     'GlobalWorkspaceIntegrator',

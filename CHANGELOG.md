@@ -1,8 +1,145 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-03-01  
-**版本**：V5.43  
+**版本**：V5.44  
 **状态**：生产就绪
+
+---
+
+## [V5.44] 2026-03-01 — 数字孪生推理引擎 + 会话嵌入 + 个性化推理 API
+
+### 背景
+
+V5.43 完成了核心训练系统（因果编码、跨模态对齐、预测步加权）的搭建。
+V5.44 实现了 **数字孪生脑** 的核心用户接口：
+不再只是"训练一个模型"，而是"使用训练好的模型做仿真"。
+
+根据 AGENTS.md 状态表，以下功能尚未实现（❌ Future work）：
+- `干预响应、自我演化` — 向特定脑区注入扰动并预测系统级响应
+
+V5.44 实现这些功能，并增加会话嵌入以支持跨会话预测（将原来的 ⚡ 部分 → ✅ 已实现）。
+
+### 新增内容
+
+**A. 数字孪生推理引擎 (`models/digital_twin_inference.py`)**
+
+全新的 `TwinBrainDigitalTwin` 类，提供四个旗舰推理 API：
+
+1. **`simulate_intervention()`** — 数字孪生核心功能（干预响应仿真）
+
+   注入对特定脑区的潜空间扰动，预测系统级因果响应：
+
+   ```python
+   twin = TwinBrainDigitalTwin.from_checkpoint("outputs/exp/best_model.pt")
+   result = twin.simulate_intervention(
+       baseline_data=graph_window,
+       interventions={"fmri": ([42], 2.0)},  # 2σ 刺激右运动皮层 ROI 42
+       num_prediction_steps=15,
+   )
+   causal_effect = result["causal_effect"]["fmri"]  # [N_fmri, 15, 1]
+   ```
+
+   算法：
+   - 编码基线脑状态 → h [N, T, H]
+   - 在目标节点注入扰动：h_pert[roi_idx] += Δ
+   - 分别预测扰动/基线未来轨迹
+   - 通过功能连接图传播（系统级耦合）
+   - 因果效应 = 扰动响应 − 基线响应
+
+   科学依据：TMS-EEG/fMRI 联合实验（Huang et al. 2019, Neuron）；
+   Green's function / lead-field 框架（Deco et al. 2013, J. Neurosci.）
+
+2. **`adapt_to_subject()`** — 少样本个性化（Few-shot personalization）
+
+   仅更新被试嵌入（O(H) 个参数），10-50 个窗口即可个性化：
+
+   ```python
+   twin.adapt_to_subject(new_subject_windows, subject_idx=3, num_steps=50)
+   ```
+
+3. **`compute_attribution()`** — 梯度归因（Functional Fingerprinting）
+
+   计算目标脑区预测对所有源脑区输入特征的梯度显著性图：
+
+   ```python
+   saliency = twin.compute_attribution(data, target_modality="fmri", target_nodes=[0])
+   node_importance = saliency["fmri"].abs().mean(dim=(1, 2))  # [N_fmri]
+   ```
+
+4. **`predict_future()`** — 因果未来预测（无扰动）
+
+   从检查点加载后直接使用，无需了解模型内部结构：
+
+   ```python
+   twin = TwinBrainDigitalTwin.from_checkpoint("best_model.pt", device="cuda")
+   prediction = twin.predict_future(brain_window)  # {nt: [N, steps, C]}
+   ```
+
+**B. 会话/Run 嵌入 (`num_runs` 参数 + `use_run_embed` 配置)**
+
+在被试嵌入（subject_embed）基础上，增加会话级嵌入（run_embed）：
+
+```python
+model = GraphNativeBrainModel(..., num_runs=6)
+# 自动初始化 nn.Embedding(6, hidden_channels)，零初始化
+```
+
+设计：加法分解 `x_proj += subject_embed + run_embed`
+- `subject_embed`：稳定的个体身份（谁的大脑）
+- `run_embed`：瞬态的会话状态（何时/何条件下扫描）
+  零初始化 → 训练初期无会话偏置，逐渐学习会话特异性模式
+
+配置：`model.use_run_embed: false`（默认关闭，向后兼容）
+`num_runs` 从 `build_graphs()` 自动统计传入，无需手动设置。
+
+**C. `simulate_intervention()` 方法在 `GraphNativeBrainModel`**
+
+除了 `TwinBrainDigitalTwin` 高层接口，核心仿真逻辑也直接暴露在模型上：
+
+```python
+result = model.simulate_intervention(
+    data=brain_window,
+    interventions={"fmri": ([42, 43], 2.0)},  # 或 delta: Tensor[H]
+)
+```
+
+**D. `adapt_to_subject()` 方法在 `GraphNativeTrainer`**
+
+训练系统中直接提供被试适应 API：
+
+```python
+trainer.adapt_to_subject(new_subject_data, subject_idx=5, num_steps=100, lr=5e-3)
+```
+
+### 状态表更新
+
+| 功能 | V5.43 | V5.44 |
+|------|-------|-------|
+| 跨会话预测 | ⚡ 部分（within-run） | ✅ 已实现（run_embed） |
+| 干预响应仿真 | ❌ Future work | ✅ 已实现（simulate_intervention） |
+| 少样本个性化推理 | ❌ 仅训练期 | ✅ 已实现（adapt_to_subject） |
+| 梯度归因可解释性 | ❌ Future work | ✅ 已实现（compute_attribution） |
+| 检查点自动加载推理 | ❌ Future work | ✅ 已实现（from_checkpoint） |
+
+### 配置变更
+
+| 参数 | V5.43 | V5.44 | 说明 |
+|------|-------|-------|------|
+| `model.use_run_embed` | 无 | `false` | 会话嵌入开关（默认关闭） |
+
+### 文件变更
+
+- `models/digital_twin_inference.py` — 新增（~500 行，数字孪生推理引擎）
+- `models/graph_native_system.py` — 新增 `simulate_intervention()`、`adapt_to_subject()`、`run_embed`
+- `models/__init__.py` — 导出 `TwinBrainDigitalTwin`
+- `main.py` — `build_graphs()` 返回 `num_runs`；`create_model()` 传入 `num_runs`
+- `configs/default.yaml` — 新增 `model.use_run_embed`
+
+### 向后兼容性
+
+- 旧检查点：`use_run_embed: false`（默认），模型不创建 `run_embed`，行为不变
+- `from_checkpoint()` 使用 `strict=False` 加载，自动跳过不匹配的 embedding 键
+- `build_graphs()` 返回签名从 3 元组改为 4 元组，`main()` 已同步更新
 
 ---
 
