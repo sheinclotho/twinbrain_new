@@ -99,7 +99,7 @@ V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
 1. 检查 `temporal_chunk_size` × `use_gradient_checkpointing` 组合
    - chunk=null 或 checkpointing=false → 单次 propagate，最快
    - chunk=64 + checkpointing=true → 8× Python overhead，需要吗？查 GPU allocated
-2. 若 GPU allocated < GPU_TOTAL × 20%，关闭 checkpointing 并设 chunk=null
+2. 若 GPU allocated < GPU_TOTAL × 20%，**不要**直接关闭 checkpointing——`allocated` 是步间稳定状态，backward 峰值可能远高于此（参见下方 V5.49 错误记录中的峰值公式）
 3. 若 OOM 再开启（先 checkpointing=true，再 chunk=64，再 chunk=32）
 
 **InfoNCE 温度调优规则（小数据集，4-8 被试）**：
@@ -110,6 +110,42 @@ V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
   - effective_pred = pred_priority × pred_sig_scale ≈ 6.0 × 1.0 = 6
   - 推荐配置：pred_nce=2.0, temperature=0.5 → effective_nce = 2.0×16 = 32 vs 6 → 5:1（可接受）
 - 若仍出现 pred_r2 下降，设 use_info_nce: false（明确禁用优于错误配置）
+
+---
+
+### [2026-03-02] V5.49 错误：「GPU allocated=0.18GB → GC=false 安全」推断错误导致 backward OOM
+
+**用户反馈**：将 `use_gradient_checkpointing: false` 后在反向传播中发生 CUDA OOM，"光是 fMRI 和 EEG 数据就占了很多内存"。
+
+**思维误区**：看到 `GPU allocated=0.18 GB`（epoch 间稳定状态读数）就得出"无内存压力、GC 是浪费"的结论，**完全忘记询问 backward 峰值与稳定状态读数是两个不同的量**。
+
+**根因**：
+- `torch.cuda.memory_allocated()` 是在 epoch 结束后（backward 完成、所有中间激活已释放后）的读数
+- backward 过程中，PyTorch autograd 必须同时持有所有 propagate() 调用的中间激活（用于链式法则）
+- 具体计算（EEG T=500, fMRI T=50, H=128, 4层, 3边，k_eeg=10+10, k_fmri=20+10）：
+  - EEG intra ×4层 ≈ 7,741 MB
+  - fMRI intra ×4层 ≈ 3,502 MB
+  - Cross-modal ×4层 ≈ 584 MB
+  - **合计 ≈ 11,827 MB = 11.6 GB** → 8GB GPU 必然 OOM ❌
+- 与之对比，GC=True + chunk=null：
+  - backward 每次只重计算 **1 个 propagate()**，峰值 = max(EEG intra per layer) + boundary ≈ **2.1 GB** ✅
+
+**正确结论**：
+| 配置 | backward 峰值 | 8GB GPU | 速度代价 |
+|------|--------------|---------|---------|
+| GC=False + chunk=null | ~11.6 GB | ❌ OOM | 无 |
+| GC=True + chunk=null | ~2.1 GB | ✅ 安全 | +40% backward |
+| GC=True + chunk=64 | ~0.4 GB | ✅ 最安全 | +320% (8× Python) |
+
+**修复（V5.49）**：`use_gradient_checkpointing: false → true`（已回退，保持 V5.46 行为）
+
+**根本规则**：
+1. **`memory_allocated()` 是稳定状态，不是 backward 峰值**。评估 GC 必要性时，必须计算 backward 峰值 = Σ(所有 propagate() 激活)，而非读取训练间隙的显存状态。
+2. **backward 峰值公式（GC=False）**：`4层 × 3边 × max(T×E×H per edge type) × 6 ≈ 11.6+ GB`
+   （×6：每次 propagate() autograd 保留约 6 个 [T×E, H] 张量：x_j、x_i、x_t、alpha、output、dropout mask）
+3. **backward 峰值公式（GC=True, chunk=null）**：`max(T×E×H per edge type) × 6 + boundary ≈ 2.1 GB`
+   （boundary：GC 边界处保留的两端节点特征张量，作为重计算时的输入；约 [T×N, H] × 2 ≈ 192 MB）
+4. 只有当 backward 峰值 < GPU 总显存 × 70% 时，才可以安全关闭 GC。
 
 ---
 
