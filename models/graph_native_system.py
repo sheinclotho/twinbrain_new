@@ -115,7 +115,7 @@ class GraphNativeDecoder(nn.Module):
                     ))
                 
                 if i < num_layers - 1:
-                    layers.append(nn.BatchNorm1d(out_dim))
+                    layers.append(nn.GroupNorm(1, out_dim))
                     layers.append(nn.ReLU())
                 
                 current_dim = out_dim
@@ -1027,6 +1027,170 @@ class GraphNativeBrainModel(nn.Module):
             'encoded_baseline': h_baseline,
         }
 
+    @torch.no_grad()
+    def compute_effective_connectivity(
+        self,
+        data: HeteroData,
+        modality: str = 'fmri',
+        perturbation_strength: float = 1.0,
+        signed: bool = True,
+        normalize: bool = True,
+        batch_size: int = 1,
+    ) -> torch.Tensor:
+        """Compute whole-brain Effective Connectivity (EC) matrix via the NPI paradigm.
+
+        Systematically perturbs each brain region and measures the causal propagated
+        response across all other regions, producing a directed N×N EC matrix.
+
+        This implements the core algorithm from:
+            Luo et al. (2025) "Mapping effective connectivity by virtually perturbing
+            a surrogate brain." *Nature Methods*.
+
+        Algorithm:
+            For each source region i ∈ [0, N):
+                1. Encode baseline brain state → h [N, T, H]
+                2. Apply unit perturbation at region i:
+                   h_pert[i] += direction_i × strength × std(h[i])
+                3. Predict perturbed and baseline futures; propagate through graph
+                4. Decode to signal space; compute causal effect = perturbed − baseline
+                5. EC[:, i] = mean-abs causal effect across time at each region
+
+        Compared to NPI (fMRI-only RNN), TwinBrain's EC mapping offers:
+          • Graph-native encoding (preserves small-world topology)
+          • Multi-modal: can compute EEG-EC, fMRI-EC, and cross-modal EEG→fMRI EC
+          • Subject-specific: personalized via subject_embed
+
+        Args:
+            data: HeteroData brain state window (a single time window).
+            modality: Node type to perturb and measure ('fmri' or 'eeg').
+            perturbation_strength: Perturbation amplitude in units of the node's
+                latent standard deviation.  1.0 = 1 σ (physiologically mild),
+                2.0 = 2 σ (supraphysiological, as in strong TMS).
+            signed: If True, return signed EC (positive = excitatory, negative =
+                inhibitory, based on net mean causal effect direction).
+                If False, return absolute EC magnitude only.
+            normalize: Normalize EC matrix to [0, 1] by dividing by max absolute value.
+            batch_size: Number of regions to perturb in parallel.  Higher values
+                use more memory but are faster on GPU.
+
+        Returns:
+            ec_matrix: Float tensor [N, N].
+                ec_matrix[j, i] = causal influence of region i on region j.
+                Row j = "who influences j?"; Column i = "where does i project to?".
+                Diagonal represents self-loops (auto-modulation); typically small.
+        """
+        self.eval()
+        device = next(self.parameters()).device
+        data = data.to(device)
+
+        if modality not in data.node_types:
+            raise ValueError(f"Modality '{modality}' not found in data. "
+                             f"Available: {list(data.node_types)}")
+
+        N = data[modality].x.shape[0]
+        T = data[modality].x.shape[1]
+        if T < self._PRED_MIN_SEQ_LEN:
+            raise ValueError(
+                f"Sequence too short for EC computation: T={T} < {self._PRED_MIN_SEQ_LEN}. "
+                f"Use a longer time window."
+            )
+
+        # Build subject/run embeddings once (shared across all perturbations)
+        combined_embed = None
+        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
+            s_idx = data.subject_idx
+            if not isinstance(s_idx, torch.Tensor):
+                s_idx = torch.tensor(s_idx, dtype=torch.long)
+            subject_embed = self.subject_embed(s_idx.clamp(0, self.num_subjects - 1).to(device))
+            combined_embed = subject_embed
+
+        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
+            r_idx = data.run_idx
+            if not isinstance(r_idx, torch.Tensor):
+                r_idx = torch.tensor(r_idx, dtype=torch.long)
+            run_embed = self.run_embed(r_idx.clamp(0, self.num_runs - 1).to(device))
+            combined_embed = (combined_embed + run_embed) if combined_embed is not None else run_embed
+
+        # Encode baseline once
+        encoded_data = self.encoder(data, subject_embed=combined_embed)
+        h_baseline: Dict[str, torch.Tensor] = {
+            nt: encoded_data[nt].x.clone()
+            for nt in self.node_types
+            if nt in encoded_data.node_types
+        }
+
+        # Predict baseline future
+        pred_baseline: Dict[str, torch.Tensor] = {}
+        if self.use_prediction:
+            for nt, h in h_baseline.items():
+                if h.shape[1] >= self._PRED_MIN_SEQ_LEN:
+                    pred_baseline[nt] = self.predictor.predict_next(h)
+            if pred_baseline:
+                pred_baseline = self.prediction_propagator(pred_baseline, data)
+
+        def _decode_to_signal(pred_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+            if not pred_dict:
+                return {}
+            hd = HeteroData()
+            for nt, v in pred_dict.items():
+                hd[nt].x = v
+            try:
+                return self.decoder(hd)
+            except Exception:
+                return {}
+
+        sig_baseline = _decode_to_signal(pred_baseline)
+
+        # Accumulate EC column by column (each column = one perturbed region)
+        ec_matrix = torch.zeros(N, N, device=device)
+
+        # Compute per-node perturbation direction: unit vector along mean latent
+        h_mod = h_baseline[modality]                   # [N, T, H]
+        node_stds = h_mod.std(dim=(1,)).clamp(min=1e-6)  # [N, H]
+        node_means = h_mod.mean(dim=1)                   # [N, H]
+        norms = node_means.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # [N, 1]
+        node_directions = node_means / norms             # [N, H]  unit direction
+
+        for i in range(N):
+            # Perturb region i: add delta in the node's principal direction
+            h_pert = {nt: h.clone() for nt, h in h_baseline.items()}
+            delta_vec = node_directions[i] * perturbation_strength * node_stds[i].mean()
+            h_pert[modality][i, :, :] += delta_vec.view(1, -1)  # broadcast over T
+
+            # Predict perturbed future
+            pred_pert: Dict[str, torch.Tensor] = {}
+            if self.use_prediction:
+                for nt, h in h_pert.items():
+                    if h.shape[1] >= self._PRED_MIN_SEQ_LEN:
+                        pred_pert[nt] = self.predictor.predict_next(h)
+                if pred_pert:
+                    pred_pert = self.prediction_propagator(pred_pert, data)
+
+            sig_pert = _decode_to_signal(pred_pert)
+
+            # Causal effect at modality: perturbed - baseline
+            if modality in sig_pert and modality in sig_baseline:
+                effect = sig_pert[modality] - sig_baseline[modality]  # [N, steps, C]
+                # Mean over time and channels → scalar per region [N]
+                ec_column = effect.mean(dim=(1, 2))  # [N]
+                if signed:
+                    ec_matrix[:, i] = ec_column
+                else:
+                    ec_matrix[:, i] = ec_column.abs()
+            elif modality in sig_pert:
+                # Baseline was empty (e.g. use_prediction=False); use raw encoded diff
+                h_pert_mod = h_pert[modality].mean(dim=(1, 2))   # [N]
+                h_base_mod = h_baseline[modality].mean(dim=(1, 2))
+                ec_column = h_pert_mod - h_base_mod
+                ec_matrix[:, i] = ec_column.abs()
+
+        if normalize:
+            max_val = ec_matrix.abs().max()
+            if max_val > 1e-8:
+                ec_matrix = ec_matrix / max_val
+
+        return ec_matrix
+
     def compute_loss(
         self,
         data: HeteroData,
@@ -1336,8 +1500,31 @@ class GraphNativeBrainModel(nn.Module):
                         _sig_loss = _sig_loss + 0.5 * _corr
                     losses[f'pred_sig_{_nt}'] = _sig_loss
 
+        # ── InfoNCE contrastive prediction loss (V5.47) ──────────────────────────
+        # Complements the MSE/Huber regression losses by forcing the predictor to
+        # produce *discriminative* representations.  Pure regression can be minimised
+        # by predicting the unconditional mean (flat output), which yields low MSE
+        # but negative pred_r2.  InfoNCE requires identifying the correct future
+        # timestep from all (node × step) negative examples, which is only possible
+        # if the predicted representation carries unique information about that window.
+        # Reference: Oord et al. (2018) CPC; Baevski et al. (2020) wav2vec 2.0.
+        if self.use_info_nce and encoded is not None and self.use_prediction and pred_means:
+            for _nce_nt, _nce_pred in pred_means.items():
+                if _nce_nt not in future_targets:
+                    continue
+                _nce_target = future_targets[_nce_nt]
+                _nce_aligned = min(_nce_pred.shape[1], _nce_target.shape[1])
+                # Need at least 2 (node×step) pairs for contrastive loss.
+                if _nce_aligned < 1 or _nce_pred.shape[0] * _nce_aligned < 2:
+                    continue
+                if _nce_pred.shape[0] != _nce_target.shape[0]:
+                    continue
+                losses[f'pred_nce_{_nce_nt}'] = self._info_nce_loss(
+                    _nce_pred[:, :_nce_aligned, :],
+                    _nce_target[:, :_nce_aligned, :],
+                    temperature=self.info_nce_temperature,
+                )
 
-        
         return losses
 
 
@@ -1620,6 +1807,8 @@ class GraphNativeTrainer:
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
                     task_names.append(f'pred_sig_{node_type}')
+                if getattr(model, 'use_info_nce', False):
+                    task_names.append(f'pred_nce_{node_type}')
             # cross_modal_align is added in V5.43: aligns mean EEG and fMRI
             # latent representations via cosine similarity.  Registered only
             # when the model flag is on AND both modalities are present.

@@ -944,6 +944,8 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         use_cross_modal_align=config['model'].get('use_cross_modal_align', True),
         pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
         num_runs=effective_num_runs,
+        use_info_nce=config['model'].get('use_info_nce', True),
+        info_nce_temperature=config['model'].get('info_nce_temperature', 0.1),
     )
 
     if num_subjects > 0:

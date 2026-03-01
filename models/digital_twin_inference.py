@@ -583,6 +583,134 @@ class TwinBrainDigitalTwin:
 
         return saliency
 
+    def compute_effective_connectivity(
+        self,
+        data_windows: Union['HeteroData', List['HeteroData']],
+        modality: str = 'fmri',
+        perturbation_strength: float = 1.0,
+        signed: bool = True,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Compute whole-brain Effective Connectivity (EC) matrix.
+
+        Implements the NPI algorithm (Luo et al. 2025, Nature Methods):
+        systematically perturbs each brain region and measures the causal
+        propagated response, producing a directed N×N EC matrix.
+
+        Compared to Granger causality and dynamic causal modelling (DCM),
+        this approach:
+          • Captures nonlinear dynamics via the trained surrogate model
+          • Is data-driven (no hand-crafted biophysical priors)
+          • Provides whole-brain coverage at once
+          • Supports both excitatory and inhibitory connectivity
+
+        Args:
+            data_windows: One or more HeteroData windows to average over.
+                Averaging over multiple windows reduces estimation noise
+                (analogous to averaging across trials in TMS-EEG studies).
+            modality: Brain signal modality to compute EC for.
+            perturbation_strength: Perturbation amplitude in latent std units.
+                1.0 (default): mild, comparable to spontaneous fluctuations.
+                2.0: supraphysiological (strong TMS equivalent).
+            signed: Return signed EC (True, default) or absolute magnitude only.
+            normalize: Normalize EC to [0, 1].
+
+        Returns:
+            ec_matrix: [N, N] EC matrix.
+                ec_matrix[j, i] = causal influence of region i on region j.
+        """
+        if not isinstance(data_windows, list):
+            data_windows = [data_windows]
+
+        ec_sum = None
+        count = 0
+        for window in data_windows:
+            try:
+                ec = self.model.compute_effective_connectivity(
+                    window,
+                    modality=modality,
+                    perturbation_strength=perturbation_strength,
+                    signed=signed,
+                    normalize=False,   # normalize at the end after averaging
+                )
+                ec_sum = ec if ec_sum is None else ec_sum + ec
+                count += 1
+            except Exception as e:
+                logger.warning(f"EC computation failed for window: {e}")
+                continue
+
+        if ec_sum is None or count == 0:
+            raise RuntimeError("EC computation failed for all windows.")
+
+        ec_mean = ec_sum / count
+
+        if normalize:
+            max_val = ec_mean.abs().max()
+            if max_val > 1e-8:
+                ec_mean = ec_mean / max_val
+
+        return ec_mean
+
+    def compute_model_fc(
+        self,
+        data_windows: Union['HeteroData', List['HeteroData']],
+        modality: str = 'fmri',
+    ) -> torch.Tensor:
+        """Compute model Functional Connectivity (FC) from predicted latents.
+
+        FC is computed as the Pearson correlation matrix of the predicted
+        future latent activations across brain regions.  High model FC
+        correlation with empirical FC validates the surrogate brain quality
+        (NPI validation strategy, Luo et al. 2025).
+
+        Unlike EC (directed, causal), FC is symmetric and correlational.
+        The comparison FC vs EC reveals the additional information that causal
+        modelling provides beyond simple correlation.
+
+        Args:
+            data_windows: One or more HeteroData windows to average over.
+            modality: Brain signal modality to compute FC for.
+
+        Returns:
+            fc_matrix: [N, N] symmetric correlation matrix, values in [-1, 1].
+        """
+        import torch.nn.functional as F
+        if not isinstance(data_windows, list):
+            data_windows = [data_windows]
+
+        all_latents = []
+        device = next(self.model.parameters()).device
+
+        for window in data_windows:
+            window = window.to(device)
+            with torch.no_grad():
+                _, _, encoded = self.model(window, return_encoded=True)
+            if modality in encoded:
+                h = encoded[modality]  # [N, T, H]
+                # Mean-pool H → [N, T] activation time series
+                act = h.mean(dim=-1)   # [N, T]
+                all_latents.append(act)
+
+        if not all_latents:
+            raise RuntimeError(f"No valid windows for FC computation of '{modality}'.")
+
+        # Concatenate across windows: [N, T_total]
+        latent_ts = torch.cat(all_latents, dim=-1)   # [N, T_total]
+        T_total = latent_ts.shape[1]
+        if T_total < 2:
+            raise ValueError(
+                f"Need at least 2 timesteps for FC computation; got T_total={T_total}. "
+                "Provide more windows or longer windows."
+            )
+        # Z-score each node's time series
+        mu = latent_ts.mean(dim=-1, keepdim=True)
+        std = latent_ts.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        latent_z = (latent_ts - mu) / std            # [N, T_total]
+        # Pearson correlation matrix [N, N]
+        fc = torch.matmul(latent_z, latent_z.T) / (T_total - 1)
+        fc = fc.clamp(-1.0, 1.0)
+        return fc
+
     # ── Private helpers ───────────────────────────────────────────────────
 
     def _get_combined_embed(
