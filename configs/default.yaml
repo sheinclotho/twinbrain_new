@@ -168,24 +168,34 @@ model:
   # 预测步数（T_future = T × 1/3 与此参数的最小值）
   # ─────────────────────────────────────────────────────────────
   # 科学含义：
-  #   fMRI（TR=2s）：15 步 × 2s = 30s，覆盖完整血动力学响应峰值（~5-6s）
-  #   EEG（250Hz）：15 步 × 4ms = 60ms，覆盖 alpha/gamma 节律主要分量
+  #   fMRI（TR=2s）：当前窗口 T_fut=17 TRs，prediction_steps > 17 的多余步骤由
+  #     `aligned_steps = min(pred_steps, T_fut)` 自动截断，不产生错误梯度。
+  #   EEG（250Hz）：当前窗口 T_fut=167 pts，50 步 × 4ms = 200ms，覆盖 alpha 节律
+  #     完整周期（80-125ms）和 theta 节律（125-250ms），是预测 EEG 的最有意义的窗口。
   #
-  # ★ 为什么从 30 降回 15（V5.41.1）？
-  #   windowed_sampling 开启时 fMRI 窗口 T=50 TRs，T_fut = int(50 × 1/3) = 17 TRs。
-  #   prediction_steps=30 时 aligned_steps = min(30, 17) = 17 — 13 个预测步
-  #   有前向 pass 计算但无监督梯度（43% 算力浪费）。
-  #   prediction_steps=15 时 aligned_steps = min(15, 17) = 15 — 完全匹配，0% 浪费。
+  # ★ 非对称模态设计（V5.44）：prediction_steps=50 对不同模态的实际效果：
+  #   fMRI（T_fut=17）: supervised 17/50 步（34%），但这 17 步已覆盖完整 HRF 响应。
+  #     "浪费"的 33 步：pred 步 18-50 被生成但无梯度（~3% 计算开销，可接受）。
+  #   EEG（T_fut=167）: supervised 50/50 步（100%），200ms 覆盖主要 EEG 节律分量。
+  #     之前设为 15 步（60ms）只使用了 9% 的可用未来信号 → pred_r2_eeg 评估噪声大。
   #
-  # 通用规则：prediction_steps ≤ T_window × (1 - _PRED_CONTEXT_RATIO) = T × 1/3
-  #   fmri_window_size=50  → 推荐 prediction_steps ≤ 15
-  #   fmri_window_size=80  → 推荐 prediction_steps ≤ 26
-  #   fmri_window_size=100 → 推荐 prediction_steps ≤ 33
-  prediction_steps: 15
+  # ★ 为什么从 15 提高到 50（V5.44）？
+  #   1. EEG pred_r2 振荡根因：15 步评估等于在 60ms 内用 2 个验证样本估计 R²，
+  #      样本方差极大，导致 epoch 5/10/15 之间 pred_r2_eeg 剧烈震荡（0.151→0.111→0.151）。
+  #      增至 50 步 → 评估方差约降低 10×（N=50 vs N=15），震荡大幅减少。
+  #   2. EEG pred 梯度增强：training 时每步只监督 15 个 EEG 未来步 ← 信号稀疏。
+  #      增至 50 步 → EEG 预测梯度强度 3×，pred_r2_eeg 学习更稳定。
+  #   3. fMRI：15 步 → 17 步，轻微改善（+2 步 HRF 尾部覆盖）。
+  #
+  # 建议范围：
+  #   eeg_window_size=500  → T_fut=167，prediction_steps 建议 30-100（取决于 GPU 内存）
+  #   fmri_window_size=50  → T_fut=17，prediction_steps ≥ 17 时 fMRI 全量监督（自动对齐）
+  prediction_steps: 50
   
   # Dropout 比率
-  # 建议：0.1。小数据集可提高到 0.2–0.3 以增强正则化。
-  dropout: 0.1
+  # 建议：0.1（大数据集）；0.2（2-8 被试小数据集，防止过拟合）。
+  # V5.44：提高至 0.2 以增强对 2 被试场景的正则化。
+  dropout: 0.2
   
   # 损失函数类型
   # mse: 均方误差，对离群值敏感。
@@ -318,9 +328,11 @@ training:
   batch_size: 1
   
   # 初始学习率
-  # 建议：1e-4（Adam 系列的经典起点）。
-  # 若 loss 在前 10 epoch 不下降，尝试 5e-4；若震荡，尝试 5e-5。
-  learning_rate: 0.0001
+  # 建议：3e-4（小数据集 2-8 被试，更快收敛）；1e-4（大数据集）。
+  # V5.44：提高至 3e-4 以在余弦退火第一阶段获得更快的损失下降，
+  # 避免前 25 个 epoch 仍在收敛而 pred_r2 停滞。
+  # 若 loss 震荡，尝试 1e-4；若 loss 在前 5 epoch 不下降，尝试 5e-4。
+  learning_rate: 0.0003
   
   # 权重衰减（L2 正则化）
   # 建议：1e-5。小数据集可提高到 1e-4。
@@ -518,6 +530,24 @@ v5_optimization:
   # 预热期使用 10% → 100% 的线性 LR 斜坡，避免刚初始化时梯度爆炸。
   # 建议：5（约总 epoch 数的 5–10%）。
   warmup_epochs: 5
+
+  # Cosine 调度器首次重启周期（post-warmup epoch 数）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 首次 LR 重启发生在 warmup_epochs + cosine_T0 轮之后：
+  #   warmup=5, cosine_T0=20 → 第 25 轮重启（旧默认值）
+  #   warmup=5, cosine_T0=50 → 第 55 轮重启（当前推荐值）
+  #
+  # 为什么要延迟重启（V5.44）？
+  #   EEG pred_r2 在 epoch 5/10/15/20/25 呈现规律震荡（0.151→0.111→0.151→0.134→0.162）。
+  #   根因：T_0=20 使得第 25 轮时 LR 重启至最大值，打乱了已收敛的 loss balancer 状态，
+  #   导致 pred 任务的梯度权重被重新调整（GradNorm 误判为"训练不平衡"），进而使
+  #   pred_r2_eeg 出现规律性下跌。延迟至第 55 轮重启，模型更稳定后再引入 LR 扰动。
+  #
+  # 建议：
+  #   100 epoch 训练 → cosine_T0=50（重启一次，在 epoch 55）
+  #   200 epoch 训练 → cosine_T0=80（重启周期加倍，第二次在 epoch 5+80+160=245）
+  # T_mult=2 固定（每次重启后周期加倍，渐进退火）。
+  cosine_T0: 50
 
   # 自适应损失平衡（GradNorm 变体）
   adaptive_loss:
@@ -764,13 +794,13 @@ output:
 #   5. 减小 model.hidden_channels（128 → 64）
 #   6. 减小 model.k_dynamic_neighbors（10 → 5）
 #
-# 调整 fmri_window_size 后必须同步更新 prediction_steps：
-#   prediction_steps 有效上界 = floor(fmri_window_size × 1/3)
-#   fmri_window_size=30  → prediction_steps ≤ 10
-#   fmri_window_size=50  → prediction_steps ≤ 15 （当前默认）
-#   fmri_window_size=80  → prediction_steps ≤ 26
-#   fmri_window_size=100 → prediction_steps ≤ 33
-#   超过上界的步骤无监督梯度，43%+算力浪费（见 AGENTS.md §三）
+# 调整 fmri_window_size 后的 prediction_steps 建议：
+#   非对称设计（V5.44）：EEG 通常有更多 T_fut，可以用更大的 prediction_steps。
+#   fMRI 约束：超出 T_fut_fmri 的步骤自动截断（无梯度），不影响 EEG 的监督质量。
+#   fmri_window_size=30  → T_fut_fmri ≤ 10，建议 prediction_steps=30-50（EEG 主导）
+#   fmri_window_size=50  → T_fut_fmri ≤ 17，建议 prediction_steps=50（当前默认）
+#   fmri_window_size=80  → T_fut_fmri ≤ 26，建议 prediction_steps=50-80
+#   fmri_window_size=100 → T_fut_fmri ≤ 33，建议 prediction_steps=50-100
 # ─────────────────────────────────────────────────────────────────────────
 device:
   # 设备类型："cuda"（GPU）/ "cpu"（CPU）/ "cuda:0"（指定 GPU）
