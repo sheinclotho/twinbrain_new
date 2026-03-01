@@ -1138,6 +1138,15 @@ for nt in list(pred_enc.node_types):
 | cuda_clear_interval is_accum_boundary 门控 bug 修复（LCM 陷阱）| ✅ 已修复 | V5.41.1 |
 | prediction_steps 默认值 30→15（匹配 fMRI 窗口 T_fut=17，零浪费）| ✅ 已更新 | V5.41.1 |
 | compute_loss pred_loss 超出 T_fut 的 debug 提示 | ✅ 已实现 | V5.41.1 |
+| TemporalAttention is_causal=False → True（P0 训练-验证偏差根本修复）| ✅ 已修复 | V5.42 |
+| use_spectral_loss 默认 true → false（保留 pred 梯度预算）| ✅ 已更新 | V5.42 |
+| pred_sig Pearson 权重 0.2 → 0.5（加强 pred_r2 信号）| ✅ 已更新 | V5.42 |
+| task_priorities.pred 3.0 → 6.0（预测任务梯度优先级）| ✅ 已更新 | V5.42 |
+| adaptive_loss.warmup_epochs 5 → 10（延迟自适应调整）| ✅ 已更新 | V5.42 |
+| pred_weight_floor=0.5（防止 GradNorm 饿死预测任务）| ✅ 已实现 | V5.42 |
+| 跨模态潜空间对齐损失 cross_modal_align（cosine similarity，CMC 风格）| ✅ 已实现 | V5.43 |
+| 预测步指数加权 pred_step_weight_gamma（远期步权重更高）| ✅ 已实现 | V5.43 |
+| 修复误导性 is_causal=False 注释（compute_loss + validate）| ✅ 已修复 | V5.43 |
 | 跨会话预测 | ⚡ 部分（within-run） | — |
 | 干预响应、自我演化 | ❌ Future work | — |
 
