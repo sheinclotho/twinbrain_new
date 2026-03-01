@@ -775,7 +775,52 @@ graph:
   k_cross_modal: 5
 
 # ──────────────────────────────────────────────────────────────────────────
-# 六、输出配置
+# 六、消融实验配置（Ablation Study）
+# ──────────────────────────────────────────────────────────────────────────
+# 消融实验用于量化每个设计决策的贡献，回答"多模态是否真的优于单模态？"
+# 建议按以下三种配置分别训练并比较 pred_r2 / decorr_score 指标：
+#
+#   模式 A（完整多模态，当前默认）：
+#     data.modalities: ["eeg", "fmri"]
+#     ablation.disable_cross_modal_edges: false
+#     → 两路信号 + 跨模态图卷积消息传递，TwinBrain 完整能力
+#
+#   模式 B（多模态独立，无跨模态连接）：
+#     data.modalities: ["eeg", "fmri"]
+#     ablation.disable_cross_modal_edges: true
+#     → 两路信号独立编码，无 EEG→fMRI 消息传递
+#     → 对比 A vs B 可量化跨模态图卷积的贡献
+#     → 使用覆盖配置: python main.py --config configs/ablation_no_crossmodal.yaml
+#
+#   模式 C（单模态 fMRI）：
+#     data.modalities: ["fmri"]
+#     ablation.disable_cross_modal_edges: false   # 无跨模态边（只有一个模态）
+#     → 纯 fMRI，无 EEG 辅助
+#     → 对比 A vs C 可量化 EEG 模态的贡献（含跨模态图卷积）
+#     → 使用覆盖配置: python main.py --config configs/ablation_fmri_only.yaml
+#
+# 如何解读消融结果（pred_r2_fmri 对比）：
+#   A > B：跨模态图卷积本身有贡献（EEG 的时频信息通过图边传入 fMRI 编码器）
+#   A > C：EEG 模态有贡献（即使不加跨模态边，共享训练也能提升 fMRI 预测）
+#   A ≈ B ≈ C：跨模态设计无明显增益，可能是数据量不足或 EEG/fMRI 时间对齐误差所致
+#   B ≈ C > A：多模态反而有害（梯度干扰，小数据集常见），建议检查多任务学习超参数：
+#              loss 权重平衡（use_adaptive_loss, task_priorities）、学习率、
+#              k_cross_modal（减少跨模态边密度）
+#
+# 注意：即使 A ≈ B，多模态设计仍有独立价值：
+#   1. 一次训练同时输出 EEG 和 fMRI 重建/预测（用户不需跑两个模型）
+#   2. 跨模态对齐损失（cross_modal_align）提供了 EEG-fMRI NVC 的可解释性
+#   3. TwinBrain 的数字孪生干预模拟（simulate_intervention）依赖跨模态耦合
+#
+ablation:
+  # 禁用跨模态边（EEG→fMRI graph edges）
+  # false（默认）：正常建立跨模态边，完整多模态图卷积
+  # true：data.modalities 仍可包含多个模态，但模态间无消息传递（独立编码）
+  #        用于量化跨模态图卷积的贡献（对比"多模态联合"与"多模态独立"）
+  disable_cross_modal_edges: false
+
+# ──────────────────────────────────────────────────────────────────────────
+# 七、输出配置
 # ──────────────────────────────────────────────────────────────────────────
 output:
   output_dir: "outputs"
@@ -785,7 +830,7 @@ output:
   log_level: "INFO"
 
 # ──────────────────────────────────────────────────────────────────────────
-# 七、设备配置
+# 八、设备配置
 # ──────────────────────────────────────────────────────────────────────────
 #
 # ★ GPU 内存配置速查表（V5.46 更新）

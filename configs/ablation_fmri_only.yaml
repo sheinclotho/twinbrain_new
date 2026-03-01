@@ -1,0 +1,33 @@
+# ──────────────────────────────────────────────────────────────────────────
+# 消融配置 C: 单模态 fMRI（无 EEG）
+# ──────────────────────────────────────────────────────────────────────────
+#
+# 使用方法:
+#   python main.py --config configs/ablation_fmri_only.yaml
+#
+# 目的:
+#   只加载和训练 fMRI 数据，完全不使用 EEG 信号。
+#   无跨模态边（只有单一模态，自动无跨模态连接）。
+#
+# 与完整多模态（默认 default.yaml，模式 A）的对比可量化：
+#   "EEG 模态 + 跨模态图卷积" 的总贡献
+#   （注意：此贡献包含 EEG 信号本身 + 跨模态连接两部分，
+#    进一步分离请同时运行消融配置 B）
+#
+# 典型消融实验设计（三组对比）：
+#   模式 A: default.yaml      → pred_r2_fmri_A（完整多模态）
+#   模式 B: ablation_no_crossmodal.yaml → pred_r2_fmri_B（多模态独立）
+#   模式 C: ablation_fmri_only.yaml → pred_r2_fmri_C（单模态 fMRI）
+#
+#   A > B > C: 跨模态图卷积 + EEG 模态均有贡献，TwinBrain 多模态设计完全合理
+#   A > B ≈ C: 跨模态图卷积有贡献，但 EEG 单独加入帮助不大
+#   A ≈ B > C: 将两路数据放入同一模型（共享训练）有益，但消息传递贡献不显著
+#   A ≈ B ≈ C: 当前数据量或对齐质量不足以体现多模态优势，需更多被试
+#
+# 注意: 此文件仅覆盖与 default.yaml 不同的字段（_base 深度合并）。
+
+data:
+  modalities: ["fmri"]
+
+output:
+  experiment_name: "twinbrain_ablation_fmri_only"

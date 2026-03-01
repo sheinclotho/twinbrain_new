@@ -615,7 +615,9 @@ def build_graphs(config: dict, logger: logging.Logger):
                     #   2. 用户调整跨模态连接策略后，看不到任何效果（仍用旧边）。
                     # 每次加载时重建可以保证：无论缓存来自哪个版本，
                     # 跨模态边始终由当前配置（k_cross_modal, eeg_connectivity_method）决定。
-                    if 'fmri' in full_graph.node_types and 'eeg' in full_graph.node_types:
+                    # ablation.disable_cross_modal_edges=true 时跳过，实现消融实验。
+                    _disable_cross = config.get('ablation', {}).get('disable_cross_modal_edges', False)
+                    if not _disable_cross and 'fmri' in full_graph.node_types and 'eeg' in full_graph.node_types:
                         _cross = mapper.create_simple_cross_modal_edges(
                             full_graph,
                             k_cross_modal=config['graph'].get('k_cross_modal', 5),
@@ -819,7 +821,9 @@ def build_graphs(config: dict, logger: logging.Logger):
                 # 设计理念：EEG 电极（较少节点）向 fMRI ROI（较多节点）投射信号。
                 # create_simple_cross_modal_edges 返回 (edge_index, edge_attr)，
                 # 其中 edge_attr 为均匀权重（1.0），保持与同模态边一致的加权语义。
-                if 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
+                # ablation.disable_cross_modal_edges=true 时跳过，实现消融实验。
+                _disable_cross = config.get('ablation', {}).get('disable_cross_modal_edges', False)
+                if not _disable_cross and 'fmri' in built_graph.node_types and 'eeg' in built_graph.node_types:
                     cross_result = mapper.create_simple_cross_modal_edges(
                         built_graph,
                         k_cross_modal=config['graph'].get('k_cross_modal', 5),
@@ -968,11 +972,19 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
     # EEG 电极（通常 32–64 通道）节点数 < fMRI ROI（如 Schaefer200 的 200 个），
     # 因此由 EEG 向 fMRI 投射消息符合"少节点向多节点传播"的图卷积语义。
     # 使用模态名而非位置索引，保证不受 config['data']['modalities'] 顺序影响。
-    if 'eeg' in node_types and 'fmri' in node_types:
-        edge_types.append(('eeg', 'projects_to', 'fmri'))
-    elif len(node_types) > 1:
-        # 非 EEG/fMRI 模态组合的通用回退
-        edge_types.append((node_types[0], 'projects_to', node_types[1]))
+    # ablation.disable_cross_modal_edges=true 时不注册该边类型（消融实验）。
+    _disable_cross = config.get('ablation', {}).get('disable_cross_modal_edges', False)
+    if not _disable_cross:
+        if 'eeg' in node_types and 'fmri' in node_types:
+            edge_types.append(('eeg', 'projects_to', 'fmri'))
+        elif len(node_types) > 1:
+            # 非 EEG/fMRI 模态组合的通用回退
+            edge_types.append((node_types[0], 'projects_to', node_types[1]))
+    else:
+        logger.info(
+            "🔬 消融模式: disable_cross_modal_edges=true — "
+            "跨模态边已禁用，各模态独立编码（无 EEG→fMRI 消息传递）"
+        )
 
     # DTI 结构连通性边（可选）
     # 当 dti_structural_edges: true 时，编码器预先注册 ('fmri','structural','fmri')
@@ -1052,6 +1064,33 @@ def log_training_summary(
     logger.info(sep)
     logger.info("📋 训练配置核对表 (Training Configuration Summary)")
     logger.info(sep)
+
+    # ── 消融实验模式提示 ──────────────────────────────────────────
+    _ablation = config.get('ablation', {})
+    _disable_cross = _ablation.get('disable_cross_modal_edges', False)
+    _modalities = config['data'].get('modalities', [])
+    if _disable_cross:
+        logger.info(
+            "🔬 【消融模式 B: 多模态独立】modalities=%s, "
+            "disable_cross_modal_edges=true — 各模态独立编码，无 EEG→fMRI 消息传递。"
+            " 与完整多模态（模式 A）对比可量化跨模态图卷积的贡献。",
+            _modalities,
+        )
+    elif len(_modalities) == 1:
+        _absent = [m for m in ('eeg', 'fmri') if m != _modalities[0]]
+        _absent_str = ', '.join(_absent) if _absent else '其他模态'
+        logger.info(
+            "🔬 【消融模式 C: 单模态 %s】只使用 %s 数据，无跨模态连接。"
+            " 与完整多模态（模式 A）对比可量化 %s 模态的贡献。",
+            _modalities[0],
+            _modalities[0],
+            _absent_str,
+        )
+    else:
+        logger.info(
+            "✅ 【完整多模态模式 A】modalities=%s, 跨模态图卷积已启用。",
+            _modalities,
+        )
 
     # ── 从第一个图提取运行时实际值 ──────────────────────────────
     g = graphs[0] if graphs else None
