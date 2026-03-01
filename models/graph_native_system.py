@@ -912,14 +912,16 @@ class GraphNativeBrainModel(nn.Module):
                     # Pearson correlation component: optimises temporal pattern
                     # matching (the shape of the predicted trajectory).  R² ≈ r²
                     # for linear predictions, so this loss directly targets what
-                    # validate() reports as pred_r2.  Weight 0.2 keeps the
-                    # combined loss dominated by the amplitude-sensitive Huber/MSE
-                    # term while adding a robust gradient signal towards R² > 0.
+                    # validate() reports as pred_r2.  Weight 0.5 (up from 0.2)
+                    # makes the pattern-matching signal strong enough to overcome
+                    # the amplitude-only Huber/MSE term that can be minimised by
+                    # predicting a flat (mean-like) signal, which yields negative
+                    # pred_r2 even at low MSE.
                     if _n >= 2:
                         _corr = self._pearson_loss(
                             _pred_sig[:, :_n, :], _future_sig[:, :_n, :]
                         )
-                        _sig_loss = _sig_loss + 0.2 * _corr
+                        _sig_loss = _sig_loss + 0.5 * _corr
                     losses[f'pred_sig_{_nt}'] = _sig_loss
 
 
@@ -1215,8 +1217,9 @@ class GraphNativeTrainer:
                 update_frequency=al_cfg.get('update_frequency', 10),
                 learning_rate=al_cfg.get('learning_rate', 0.025),
                 warmup_epochs=al_cfg.get('warmup_epochs', 5),
-                modality_energy_ratios=al_cfg.get('modality_energy_ratios', {'eeg': 0.02, 'fmri': 1.0}),
+                modality_energy_ratios=al_cfg.get('modality_energy_ratios', {'eeg': 1.0, 'fmri': 1.0}),
                 task_priorities=al_cfg.get('task_priorities'),
+                pred_weight_floor=al_cfg.get('pred_weight_floor', 0.5),
             )
         
         # EEG enhancement

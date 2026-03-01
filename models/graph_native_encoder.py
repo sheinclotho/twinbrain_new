@@ -446,14 +446,31 @@ class TemporalAttention(nn.Module):
     
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Apply temporal attention with Flash Attention optimization.
-        
+        Apply CAUSAL temporal attention with Flash Attention optimization.
+
+        Causal masking (is_causal=True) ensures position t can only attend to
+        positions 0..t.  This is critical for prediction quality:
+
+        Training-validation consistency (root-cause fix for pred_r2 degradation):
+          Without causal masking, h[T_ctx-1] in training attends to ALL T future
+          timesteps via global attention — far more than the ±1-step Conv1d leakage
+          documented previously.  The predictor then learns a shortcut: "recall"
+          future information already encoded in h[T_ctx-1] rather than truly
+          predicting it.  At validation time, the encoder is re-run on only T_ctx
+          raw signal steps (V5.31 causal fix), so the shortcut is unavailable and
+          pred_r2 collapses.  This training-validation gap GROWS over epochs as the
+          encoder gets better at exploiting global attention.
+
+          Making attention causal guarantees h[t] = f(x[0..t]) in BOTH training
+          and validation, completely eliminating the gap.
+
         Uses PyTorch's scaled_dot_product_attention (2.0+) for 2-4x speedup
         and 50% memory reduction. Falls back to standard attention for older versions.
         
         Args:
             x: Node features [N, T, H]
-            mask: Attention mask [T, T] (optional)
+            mask: Attention mask [T, T] (optional, ignored when is_causal=True
+                  in the Flash Attention path since causal mask is applied internally)
             
         Returns:
             Attended features [N, T, H]
@@ -472,18 +489,28 @@ class TemporalAttention(nn.Module):
         
         # Try Flash Attention (PyTorch 2.0+), fallback to standard attention
         if hasattr(F, 'scaled_dot_product_attention'):
-            # Use Flash Attention - automatically uses optimal kernel based on hardware
+            # is_causal=True: position t can only attend to 0..t.
+            # This eliminates future-information leakage through global attention.
+            # attn_mask is not passed when is_causal=True (PyTorch raises an error
+            # if both are provided simultaneously).
             attended = F.scaled_dot_product_attention(
                 Q, K, V,
-                attn_mask=mask,
+                attn_mask=None,
                 dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=False,
+                is_causal=True,
             )
         else:
-            # Standard attention fallback for PyTorch < 2.0
+            # Standard attention fallback for PyTorch < 2.0.
+            # Explicit upper-triangular causal mask: -inf above the diagonal
+            # prevents position t from attending to positions t+1, t+2, ...
             scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+            causal_mask = torch.triu(
+                torch.full((T, T), float('-inf'), device=x.device, dtype=scores.dtype),
+                diagonal=1,
+            )
+            scores = scores + causal_mask
             if mask is not None:
-                scores = scores.masked_fill(mask == 0, float('-inf'))
+                scores = scores + mask
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = self.dropout(attn_weights)
             attended = torch.matmul(attn_weights, V)

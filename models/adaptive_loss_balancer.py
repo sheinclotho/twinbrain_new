@@ -18,6 +18,7 @@ References:
     - Multi-Task Learning Using Uncertainty to Weigh Losses (Kendall et al., 2018)
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +50,7 @@ class AdaptiveLossBalancer(nn.Module):
         task_priorities: Optional[Dict[str, float]] = None,
         min_weight: float = 0.01,
         max_weight: float = 10.0,
+        pred_weight_floor: float = 0.5,
     ):
         """
         Initialize adaptive loss balancer.
@@ -68,14 +70,14 @@ class AdaptiveLossBalancer(nn.Module):
             learning_rate: Learning rate for weight updates.
             warmup_epochs: Number of epochs before enabling adaptation.
             modality_energy_ratios: Relative signal energy per modality.
-                Default: {'eeg': 0.02, 'fmri': 1.0} (fMRI ≈50× more energy than EEG).
+                Default: {'eeg': 1.0, 'fmri': 1.0} (equal after z-score normalisation).
             task_priorities: Initial relative importance per task *type*.
                 Keys are task-name prefixes; the matching rule is
                 ``task_name.startswith(key + '_')``.
                 Built-in prefixes and recommended values:
                   'pred'     — future-signal prediction tasks (pred_*, pred_sig_*).
                                Higher → model focuses on predicting future brain activity.
-                               Default 3.0.
+                               Default 6.0.
                   'recon'    — reconstruction tasks (recon_*).
                                Default 1.0 (baseline).
                   'spectral' — frequency-domain reconstruction tasks (spectral_*).
@@ -84,6 +86,15 @@ class AdaptiveLossBalancer(nn.Module):
                 implemented — no code changes required.
             min_weight: Minimum allowed weight.
             max_weight: Maximum allowed weight.
+            pred_weight_floor: Minimum allowed weight for prediction tasks expressed as
+                a log-space offset from their initial value.  After warmup, the GradNorm
+                update can reduce pred weights if the latent-space pred losses converge
+                faster than reconstruction.  However, low pred loss in latent space does
+                NOT guarantee positive pred_r2 in signal space; the floor prevents the
+                adaptation mechanism from inadvertently starving the prediction objective.
+                Default 0.5: pred task log_weight never drops below
+                log(initial_weight) - 0.5, i.e. weight ≥ initial_weight * exp(-0.5) ≈
+                initial_weight * 0.6.  Set to 0.0 to disable (original behaviour).
         """
         super().__init__()
         
@@ -95,6 +106,7 @@ class AdaptiveLossBalancer(nn.Module):
         self.warmup_epochs = warmup_epochs
         self.min_weight = min_weight
         self.max_weight = max_weight
+        self.pred_weight_floor = pred_weight_floor
 
         # ── Energy-aware + priority-weighted initial task weights ─────────────
         # Formula per task:  w ∝ task_priority / modality_energy
@@ -108,7 +120,7 @@ class AdaptiveLossBalancer(nn.Module):
         # modality_energy handles amplitude differences between EEG and fMRI
         # (mostly equal after per-channel z-score normalisation).
         _priorities: Dict[str, float] = task_priorities or {
-            'pred': 3.0,      # prediction is primary objective
+            'pred': 6.0,      # prediction is primary objective
             'recon': 1.0,     # reconstruction is auxiliary
             'spectral': 0.5,  # spectral is a secondary reconstruction supplement
         }
@@ -150,6 +162,24 @@ class AdaptiveLossBalancer(nn.Module):
             name: nn.Parameter(torch.log(torch.tensor(initial_weights.get(name, 1.0))))
             for name in task_names
         })
+
+        # Record the initial log-space weight for each task so that
+        # pred_weight_floor can be applied as an absolute lower bound.
+        # Stored as a plain Python dict (not a buffer/Parameter) so that it is
+        # NOT included in the state_dict — the floor is always anchored to the
+        # constructor's priority-weighted initial values, even after checkpoint
+        # restore (which would overwrite the learned log_weights but not this).
+        self._initial_log_weights: Dict[str, float] = {
+            name: math.log(initial_weights.get(name, 1.0))
+            for name in task_names
+        }
+
+        # Identify which task names are "prediction" tasks (pred_* / pred_sig_*).
+        # These are the tasks subject to the pred_weight_floor constraint.
+        # Use a set for O(1) membership testing in update_weights().
+        self._pred_task_names: set = {
+            name for name in task_names if name.startswith('pred')
+        }
 
         # Track training dynamics
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
@@ -292,6 +322,16 @@ class AdaptiveLossBalancer(nn.Module):
                 max_log = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
                 min_log = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
                 self.log_weights[name].data.clamp_(min_log, max_log)
+
+                # Pred weight floor: prevent prediction tasks from being reduced
+                # below (initial_log_weight - pred_weight_floor).  This ensures
+                # the GradNorm mechanism cannot starve the primary objective even
+                # when latent-space pred losses converge quickly (which does NOT
+                # imply good signal-space pred_r2).
+                if self.pred_weight_floor > 0 and name in self._pred_task_names:
+                    floor_log = self._initial_log_weights.get(name, 0.0) - self.pred_weight_floor
+                    if self.log_weights[name].data.item() < floor_log:
+                        self.log_weights[name].data.fill_(floor_log)
         
         if logger.isEnabledFor(logging.DEBUG):
             weights = {name: torch.exp(self.log_weights[name]).item()
