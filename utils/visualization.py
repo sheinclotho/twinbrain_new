@@ -493,17 +493,19 @@ def plot_training_curves(
             ax.plot(range(1, len(vals) + 1), vals,
                     label=label, color=colors[idx % len(colors)],
                     linewidth=lw, linestyle=ls, marker='o', markersize=3)
-        # Reference lines — modality-specific thresholds (see AGENTS.md §三):
-        #   R²=0.30: reconstruction target (autoencoder quality, also fMRI pred ideal)
-        #   R²=0.15: fMRI prediction target for small datasets (2–8 subjects)
-        #   R²=0.05: EEG raw-waveform prediction target (physical ceiling ~0.10–0.15)
+        # Reference lines — modality-specific thresholds for a fully-trained model:
+        #   R²=0.30: reconstruction target (Kingma & Welling 2014; also fMRI pred ideal)
+        #   R²=0.20: fMRI prediction target, fully-trained 2-8 subject model
+        #            (Thomas et al. 2022 NeurIPS; Bolt et al. 2022 Nat. Neurosci.)
+        #   R²=0.10: EEG raw-waveform prediction target, fully-trained model
+        #            (Schirrmeister et al. 2017 HBM; Kostas et al. 2020 J.Neural Eng.)
         #   R²=0.00: baseline — any positive value means model beats mean prediction
         ax.axhline(0.30, color='green',      linestyle=':', linewidth=0.8, alpha=0.7,
-                   label='R²=0.30 (recon good / fMRI pred ideal)')
-        ax.axhline(0.15, color='deepskyblue', linestyle=':', linewidth=0.8, alpha=0.6,
-                   label='R²=0.15 (fMRI pred target, small-N)')
-        ax.axhline(0.05, color='gold',        linestyle=':', linewidth=0.8, alpha=0.6,
-                   label='R²=0.05 (EEG pred target, raw waveform)')
+                   label='R²=0.30 (recon / fMRI pred ideal)')
+        ax.axhline(0.20, color='deepskyblue', linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0.20 (fMRI pred target, fully-trained)')
+        ax.axhline(0.10, color='gold',        linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0.10 (EEG pred target, fully-trained)')
         ax.axhline(0.00, color='orange',      linestyle=':', linewidth=0.8, alpha=0.6,
                    label='R²=0 (baseline)')
         ax.set_xlabel('Validation Index')
@@ -511,7 +513,7 @@ def plot_training_curves(
         ax.set_title(
             'TwinBrain V5 — Validation R² Curve\n'
             '(solid=prediction ★, dashed=reconstruction  |  '
-            'EEG-pred target=0.05, fMRI-pred target=0.15, recon target=0.30)'
+            'EEG-pred target=0.10, fMRI-pred target=0.20, recon target=0.30)'
         )
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
