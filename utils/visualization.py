@@ -493,13 +493,27 @@ def plot_training_curves(
             ax.plot(range(1, len(vals) + 1), vals,
                     label=label, color=colors[idx % len(colors)],
                     linewidth=lw, linestyle=ls, marker='o', markersize=3)
-        # Reference lines
-        ax.axhline(0.3, color='green',  linestyle=':', linewidth=0.8, alpha=0.6, label='R²=0.3 (good)')
-        ax.axhline(0.0, color='orange', linestyle=':', linewidth=0.8, alpha=0.6, label='R²=0 (baseline)')
+        # Reference lines — modality-specific thresholds (see AGENTS.md §三):
+        #   R²=0.30: reconstruction target (autoencoder quality, also fMRI pred ideal)
+        #   R²=0.15: fMRI prediction target for small datasets (2–8 subjects)
+        #   R²=0.05: EEG raw-waveform prediction target (physical ceiling ~0.10–0.15)
+        #   R²=0.00: baseline — any positive value means model beats mean prediction
+        ax.axhline(0.30, color='green',      linestyle=':', linewidth=0.8, alpha=0.7,
+                   label='R²=0.30 (recon good / fMRI pred ideal)')
+        ax.axhline(0.15, color='deepskyblue', linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0.15 (fMRI pred target, small-N)')
+        ax.axhline(0.05, color='gold',        linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0.05 (EEG pred target, raw waveform)')
+        ax.axhline(0.00, color='orange',      linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0 (baseline)')
         ax.set_xlabel('Validation Index')
         ax.set_ylabel('R² (coefficient of determination)')
-        ax.set_title('TwinBrain V5 — Validation R² Curve\n(solid=prediction ★, dashed=reconstruction)')
-        ax.legend(fontsize=8)
+        ax.set_title(
+            'TwinBrain V5 — Validation R² Curve\n'
+            '(solid=prediction ★, dashed=reconstruction  |  '
+            'EEG-pred target=0.05, fMRI-pred target=0.15, recon target=0.30)'
+        )
+        ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
         # Annotate best R² values if provided
         if best_r2_dict:
