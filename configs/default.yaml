@@ -221,9 +221,11 @@ model:
   # 比较幅度谱（绝对值），不约束相位（相位噪声大，强约束会破坏训练稳定性）。
   # 损失值按 T 归一化，保证与时域损失同数量级（Parseval 定理：Σ|X[k]|² = T·σ²）。
   #
-  # true（推荐）：同时使用时域 + 频域损失，对震荡信号预测效果更好。
-  # false：仅使用时域损失（与旧版本行为一致）。
-  use_spectral_loss: true
+  # true：同时使用时域 + 频域损失，对震荡信号预测效果更好（但会增加梯度竞争）。
+  # false（推荐）：仅使用时域损失。
+  # 注意：在小样本数据集（4-8 被试）上，spectral 任务与 pred 任务竞争梯度预算，
+  # 经验表明关闭 spectral loss 后 pred_r2 反而更稳定。如需频域监督，可设为 true。
+  use_spectral_loss: false
 
   # 时序分块大小（时序消息传递峰值显存控制）
   # ─────────────────────────────────────────────────────────────────────────
@@ -470,7 +472,8 @@ v5_optimization:
     # 新值 80 → 每 epoch 约 1 次更新，避免单 epoch 内的过度震荡。
     update_frequency: 80
     # 预热 epoch 数（预热期权重固定为初始值，保证模型先有稳定梯度）
-    warmup_epochs: 5
+    # 提高至 10（原值 5）：延迟自适应调整的开始，避免模型在早期不稳定时改变预测任务权重。
+    warmup_epochs: 10
     # EEG/fMRI 信号能量比（用于初始化权重）
     # 注意：EEG 在 map_eeg_to_graph() 中已逐通道 z-score 归一化，与 fMRI 尺度相同；
     # 因此设为 1:1 即可。若使用未归一化的 EEG 数据，可调低 eeg 值（如 0.02）。
@@ -486,13 +489,20 @@ v5_optimization:
     # 无需修改代码。
     #
     # 当前推荐设置（数字越大 = 该类任务初始梯度比重越高）：
-    #   侧重预测（数字孪生脑，默认）: pred: 3.0, recon: 1.0, spectral: 0.5
-    #   平衡模式（预测与重建并重）:   pred: 2.0, recon: 2.0, spectral: 0.5
+    #   侧重预测（数字孪生脑，默认）: pred: 6.0, recon: 1.0, spectral: 0.5
+    #   平衡模式（预测与重建并重）:   pred: 3.0, recon: 2.0, spectral: 0.5
     #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0, spectral: 1.0
+    # pred 提高至 6.0（原值 3.0）：预测任务是数字孪生脑的核心指标（pred_r2），
+    # 在有限梯度预算下须明确优先，防止重建任务随训练积累而挤占预测梯度。
     task_priorities:
-      pred: 3.0
+      pred: 6.0
       recon: 1.0
       spectral: 0.5
+    # 预测任务权重下限（log空间偏移量，防止自适应机制过度削减预测梯度）
+    # pred 任务的 log_weight 永远不低于 log(initial_weight) - pred_weight_floor。
+    # 即实际权重 ≥ initial_weight × exp(-pred_weight_floor) ≈ initial_weight × 0.6。
+    # 设为 0.0 可禁用此保护（恢复原始行为）。
+    pred_weight_floor: 0.5
   
   # EEG 通道增强（解决"静默通道"导致的训练退化）
   eeg_enhancement:

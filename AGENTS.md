@@ -26,6 +26,53 @@
 
 ---
 
+### [2026-03-01] pred_r2 随训练加深持续恶化：TemporalAttention 双向注意力造成训练-验证致命偏差
+
+**用户观察**：epoch 5 pred_r2_eeg=0.219（最优），之后持续恶化到 -0.163，70 epoch 时仍为 -0.02。
+同时 r2_eeg（重建 R²）也在下降（0.891 → 0.767），与通常"训练越深重建越好"的预期相反。
+用户反映"比前几个版本更差，且提供了更多训练样本"。
+
+**思维误区**：AGENTS.md 之前把训练-验证偏差归因于 Conv1d 对称 padding 的 ±1 步泄漏（"约 0.5% 的边界泄漏"），认为是可接受的"工程权衡"。
+**完全忽略了** `TemporalAttention(is_causal=False)` 的**全局双向注意力**！
+
+**根因（三叠加）**：
+
+**根因 1 — TemporalAttention 双向注意力造成全局未来信息泄漏（最严重，P0）**：
+- `TemporalAttention` 使用 `F.scaled_dot_product_attention(..., is_causal=False)`，即每个时间位置 t 可以通过注意力机制**全局**访问未来所有时间步 T_ctx..T
+- Conv1d 的 ±1 步泄漏微不足道（<1%），但 TemporalAttention 的全局双向泄漏巨大：T_ctx 位置的隐状态包含了所有 T-T_ctx 个未来步的完整注意力加权信息
+- V5.31 修复了**验证**时的因果性（re-encode only T_ctx steps），但**训练**时 encoder 仍是双向的
+- 结果：
+  - 训练时：predictor 学会"回忆"已编码在上下文中的未来信息（trivial shortcut）
+  - 验证时：因果 re-encode 使 shortcut 失效 → pred_r2 崩溃
+  - 随训练加深：encoder 越来越擅长提取双向注意力的未来信息 → shortcut 越来越强 → 验证 pred_r2 越来越差
+  - r2_eeg 下降的原因：因为 encoder 学会把未来信息"塞进"所有位置的表示，这反而降低了对局部信号的重建质量
+
+**根因 2 — V5.40 添加的 spectral_loss 在小数据集上稀释梯度预算**：
+- V5.40 新增 `spectral_eeg`、`spectral_fmri` 两个频域损失任务 + pred_sig 的 Pearson 分量
+- 共 8 个任务（recon×2 + spectral×2 + pred×2 + pred_sig×2）竞争梯度预算
+- 在 4-8 被试的小数据集上，梯度信号本就稀缺，更多任务使每个任务得到的有效梯度更少
+- 用户报告"比前几个版本更差"正是从 V5.40 开始的
+
+**根因 3 — 自适应 loss balancer 逐步削减预测任务权重**：
+- GradNorm 机制：latent 空间 pred 损失若收敛"更快"（绝对值下降更多）→ 降低 pred 权重
+- 但 latent 空间收敛快 ≠ signal 空间 pred_r2 好
+- 结果：训练 65 个 epoch 后 pred 权重最多可累积下降 exp(-0.65)≈0.52×，进一步剥夺预测梯度
+
+**修复（V5.42）**：
+1. **`TemporalAttention.forward()` 改为因果**：`is_causal=False` → `is_causal=True`，fallback 路径同步添加显式上三角因果 mask
+2. **`use_spectral_loss` 默认关闭**：`true` → `false`，恢复 V5.38 的梯度预算
+3. **`pred_sig` 损失 Pearson 权重 0.2 → 0.5**：直接加强对 pred_r2 指标的优化信号
+4. **`task_priorities.pred` 3.0 → 6.0**：确保预测任务从一开始就占据主导梯度预算
+5. **`adaptive_loss.warmup_epochs` 5 → 10**：更稳定的基线建立后再启动自适应调整
+6. **`AdaptiveLossBalancer` 新增 `pred_weight_floor=0.5`**：pred 任务 log_weight 不低于 log(初始值)-0.5，防止 GradNorm 机制将预测任务饿死
+
+**规则**：
+- **任何"因果"设计声明必须端到端核查**：验证因果（V5.31）+ 训练双向（V5.0~V5.41）= 不因果系统！
+- **添加新任务损失时必须问：这个数据集规模能否支持额外的梯度预算？** 4-8 被试的小数据集极易被多任务稀释
+- **AGENTS.md 中的 ±1 步 Conv1d 泄漏说明是错误的**：它完全没有考虑 TemporalAttention 的全局双向注意力。正确认识：TemporalAttention 无因果 mask 时的泄漏是全局性的（O(T) 量级），不是边界性的（O(1) 量级）
+
+---
+
 ### [2026-02-20] CUDA OOM：序列长度 + 时间循环两个叠加根因
 
 **思维误区**：以为"截断序列 = 内存优化"，没有追问为什么要 T 个时间步逐一调用 propagate()。
