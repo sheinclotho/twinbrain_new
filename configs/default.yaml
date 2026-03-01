@@ -397,14 +397,16 @@ training:
   #     propagate() 拆成多次小调用，每次的激活仍然累积，总显存不减。
   #     因此无 GC 时分块仅增加 Python overhead，无任何内存收益（V5.45 设计意图）。
   #
-  # 建议：
-  #   8GB GPU（默认）→ true（EEG T=500 backward 激活 4层×3边×12块 ≈ 2.9GB；GC 将峰值降至 ~230MB）
-  #   遭遇 CUDA OOM 且 true 不足 → true + temporal_chunk_size=64（真正分块节省显存）
-  #   16GB/32GB GPU 且确认无 OOM → false（无重计算，最快）
+  # 建议（V5.48 更新）：
+  #   所有 GPU（默认）→ false（V5.48 实测：windowed_sampling 启用时 GPU allocated≈0.18GB/8GB=2%，
+  #     无内存压力，GC 的重计算开销（约 +40% backward 时间）纯属浪费。）
+  #   遭遇 CUDA OOM 时逐步升级：
+  #     1. true + temporal_chunk_size=null（单次 GC，峰值降至 ~230MB，+40% 时间）
+  #     2. true + temporal_chunk_size=64   （8 块 GC，峰值降至 ~30MB，+320% 时间）
   #   注意：若仅设 true 但 temporal_chunk_size=null，单次 GC 调用已减少峰值（无 Python overhead）；
   #         若仅设 temporal_chunk_size=64 但 use_gradient_checkpointing=false，
   #         分块仅增加 Python overhead，无内存收益（V5.45 规则）。
-  use_gradient_checkpointing: true   # 默认 true（8GB GPU OOM 安全）；16GB+ 无 OOM 可改 false 提速
+  use_gradient_checkpointing: false  # V5.48: 默认 false（最快；windowed_sampling 时 GPU 显存占用仅 2%，无需重计算）；CUDA OOM 时改为 true
 
   # 最大序列长度（单样本模式，windowed_sampling.enabled: false）
   # ─────────────────────────────────────────────────────────────
@@ -846,20 +848,19 @@ output:
 # 八、设备配置
 # ──────────────────────────────────────────────────────────────────────────
 #
-# ★ GPU 内存配置速查表（V5.49 更新）
+# ★ GPU 内存配置速查表（V5.48 更新）
 # ─────────────────────────────────────────────────────────────────────────
-# ⚠ 8GB GPU（RTX 3070 / RTX 4070 等）当前默认（安全优先）：
+# ✅ 所有 GPU 当前默认（速度优先，V5.48）：
 #   model.temporal_chunk_size: null            ← 单次 propagate（无 Python overhead）
-#   training.use_gradient_checkpointing: true  ← GC 减少 backward 峰值内存（+40% 时间）
+#   training.use_gradient_checkpointing: false ← 最快（无重计算；实测 GPU 显存占用仅 2%）
 #   windowed_sampling.enabled: true（已启用）
 #   windowed_sampling.fmri_window_size: 50
 #   training.gradient_accumulation_steps: 4
 #   → 支持 4-8 被试 × 约 5 窗口/被试 ≈ 20-40 样本/epoch
-#   → 显存估算：EEG T=500 backward 峰值 ≈ 230MB（单次 GC 重计算）而非无 GC 的 ~2.9GB
-#   → 为何需要 GC=true：4层×3边=12次 propagate()，每次存 T×E×H≈230MB；无 GC 时总存储
-#     ≈12×230MB=2.7GB，加上模型参数/优化器/其他 → 超出 8GB GPU 显存 → backward OOM。
+#   → 为何 GC=false 安全：windowed_sampling 窗口小（T_fmri=50, T_eeg=500），
+#     实测稳定状态 GPU allocated≈0.18GB；backward 激活峰值约 300-500MB，远低于 8GB 上限。
 #
-# 速度最优（16GB+ GPU 且确认无 OOM）：
+# 速度最优（16GB+ GPU 且确认无 OOM，与默认相同，无需额外配置）：
 #   model.temporal_chunk_size: null            ← 最快（无分块循环）
 #   training.use_gradient_checkpointing: false ← 最快（无重计算）
 #

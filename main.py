@@ -1471,8 +1471,8 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         epoch_time = time.time() - epoch_start_time
         epoch_times.append(epoch_time)
         
-        # Estimate remaining time (after first few epochs)
-        if len(epoch_times) >= 3:
+        # Estimate remaining time (available from epoch 1 onwards)
+        if len(epoch_times) >= 1:
             avg_epoch_time = sum(epoch_times[-5:]) / len(epoch_times[-5:])  # Use last 5 epochs
             remaining_epochs = config['training']['num_epochs'] - epoch
             eta_seconds = avg_epoch_time * remaining_epochs
