@@ -92,6 +92,7 @@ V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
 ### 修复（V5.48）：
 1. `temporal_chunk_size: 64 → null`（恢复 V5.45/V5.46 行为，8× 提速）
 2. `use_gradient_checkpointing: true → false`（额外 2× 提速，GPU 利用率仅 2% 无需节省内存）
+   **⚠ 注意：V5.49 发现此修复是错误的，见下方 V5.49 记录。backward 峰值 ~12 GB，必须保持 true。**
 3. `info_nce_temperature: 0.1 → 0.5`（loss_scale 从 81 降至 16，与 pred_sig 同量级，恢复梯度平衡）
 4. `task_priorities.pred_nce: 4.0 → 2.0`（warmup 期 InfoNCE effective 梯度比从 50:1 → 5:1，消除 pred_r2 < 0 告警）
 
@@ -99,8 +100,11 @@ V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
 1. 检查 `temporal_chunk_size` × `use_gradient_checkpointing` 组合
    - chunk=null 或 checkpointing=false → 单次 propagate，最快
    - chunk=64 + checkpointing=true → 8× Python overhead，需要吗？查 GPU allocated
-2. 若 GPU allocated < GPU_TOTAL × 20%，关闭 checkpointing 并设 chunk=null
-3. 若 OOM 再开启（先 checkpointing=true，再 chunk=64，再 chunk=32）
+2. 若 GPU allocated < GPU_TOTAL × 20%，**不要**直接关闭 checkpointing——`allocated` 是步间稳定状态，backward 峰值可能远高于此（参见下方 V5.49 错误记录中的峰值公式）
+3. **若仍慢（排除 GC 配置问题）**，检查训练样本大小参数（见下方 V5.49 性能调优规则）：
+   - `eeg_window_size`: O(T²) attention, O(T×E) propagate → 最直接影响
+   - `k_nearest_fmri` / `k_dynamic_neighbors`: O(E) propagate
+4. 若 OOM 再开启（先 checkpointing=true，再 chunk=64，再 chunk=32）
 
 **InfoNCE 温度调优规则（小数据集，4-8 被试）**：
 - n_items = N × prediction_steps（如 190×17=3230 for fMRI）
@@ -110,6 +114,69 @@ V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
   - effective_pred = pred_priority × pred_sig_scale ≈ 6.0 × 1.0 = 6
   - 推荐配置：pred_nce=2.0, temperature=0.5 → effective_nce = 2.0×16 = 32 vs 6 → 5:1（可接受）
 - 若仍出现 pred_r2 下降，设 use_info_nce: false（明确禁用优于错误配置）
+
+---
+
+### [2026-03-02] V5.49 错误：「GPU allocated=0.18GB → GC=false 安全」推断错误导致 backward OOM
+
+**用户反馈**：将 `use_gradient_checkpointing: false` 后在反向传播中发生 CUDA OOM，"光是 fMRI 和 EEG 数据就占了很多内存"。
+
+**思维误区**：看到 `GPU allocated=0.18 GB`（epoch 间稳定状态读数）就得出"无内存压力、GC 是浪费"的结论，**完全忘记询问 backward 峰值与稳定状态读数是两个不同的量**。
+
+**根因**：
+- `torch.cuda.memory_allocated()` 是在 epoch 结束后（backward 完成、所有中间激活已释放后）的读数
+- backward 过程中，PyTorch autograd 必须同时持有所有 propagate() 调用的中间激活（用于链式法则）
+- 具体计算（EEG T=500, fMRI T=50, H=128, 4层, 3边，k_eeg=10+10, k_fmri=20+10）：
+  - EEG intra ×4层 ≈ 7,741 MB
+  - fMRI intra ×4层 ≈ 3,502 MB
+  - Cross-modal ×4层 ≈ 584 MB
+  - **合计 ≈ 11,827 MB = 11.6 GB** → 8GB GPU 必然 OOM ❌
+- 与之对比，GC=True + chunk=null：
+  - backward 每次只重计算 **1 个 propagate()**，峰值 = max(EEG intra per layer) + boundary ≈ **2.1 GB** ✅
+
+**正确结论**：
+| 配置 | backward 峰值 | 8GB GPU | 速度代价 |
+|------|--------------|---------|---------|
+| GC=False + chunk=null | ~11.6 GB | ❌ OOM | 无 |
+| GC=True + chunk=null | ~2.1 GB | ✅ 安全 | +40% backward |
+| GC=True + chunk=64 | ~0.4 GB | ✅ 最安全 | +320% (8× Python) |
+
+**修复（V5.49）**：`use_gradient_checkpointing: false → true`（已回退，保持 V5.46 行为）
+
+**V5.49 追加（性能优化，同 PR）**：用户报告训练极慢（524s/epoch，GPU 利用率仅 2%）。
+GC=True 的 +40% backward overhead 是已知代价，但 524s 远超预期。根因分析：
+- EEG window T=500 → TemporalAttention O(T²)=250K ops, propagate O(T×E)=945K messages
+- k_nearest_fmri=20 → fMRI 7600 edges/layer → 380K messages/layer
+- 上述参数通过减小可显著降低每步的 GPU 工作量
+
+**V5.49 性能优化配置**：
+| 参数 | 旧值 | 新值 | 效果 |
+|------|------|------|------|
+| `eeg_window_size` | 500 | 250 | TemporalAttention 4× 快；propagate 2× 快 |
+| `k_nearest_fmri` | 20 | 10 | fMRI edges 3800→1900，propagate 2× 快 |
+| `k_dynamic_neighbors` | 10 | 5 | dynamic edges 减半，DGC topk 2× 快 |
+
+**V5.49 代码优化**：
+- `SpatialTemporalGraphConv._ei_cache`: 缓存 `(ei_chunk, ea_chunk)` 扩展张量。
+  同一 run 所有窗口共享同一 `edge_index.data_ptr()` → 首次调用构建 [2,T×E] 张量，
+  后续调用直接复用，消除 N_windows 次重复的 GPU 内存分配。
+- `train_model()` 预加载数据到 GPU：训练循环前调用 `g.to(device)` 一次，
+  消除逐步 CPU→GPU 传输（即使传输量小，也有 Python 函数调用开销）。
+
+**性能调优规则（训练慢但 GC=True 不可关闭时）**：
+1. **`eeg_window_size` 是最大的性能旋钮**：O(T²) attention + O(T×E) propagate，250 → 500 约 3× 慢
+2. **`k_nearest_fmri / k_dynamic_neighbors`**：直接控制 E，边减半 → propagate 约快 2×
+3. **`eeg_window_size` 最小安全值**：250 pts × 4ms = 1s，覆盖 alpha(8-12Hz, >8 周期)/beta/gamma ✓
+4. **`k_nearest_fmri` 最小安全值**：10（平均度 20，符合小世界网络特性）
+5. **`use_dynamic_graph: false`**：完全消除 DGC 开销，并使 ei_cache 命中率从 0% → 100%（静态图下所有窗口完全命中）
+
+**根本规则**：
+1. **`memory_allocated()` 是稳定状态，不是 backward 峰值**。评估 GC 必要性时，必须计算 backward 峰值 = Σ(所有 propagate() 激活)，而非读取训练间隙的显存状态。
+2. **backward 峰值公式（GC=False）**：`4层 × 3边 × max(T×E×H per edge type) × 6 ≈ 11.6+ GB`（T=500 时）；`T=250 时 ≈ 5.8 GB`（仍超过 8GB 时建议 GC=True）
+   （×6：每次 propagate() autograd 保留约 6 个 [T×E, H] 张量：x_j、x_i、x_t、alpha、output、dropout mask）
+3. **backward 峰值公式（GC=True, chunk=null）**：`max(T×E×H per edge type) × 6 + boundary ≈ 2.1 GB`（T=500）；`≈ 1.1 GB`（T=250）
+   （boundary：GC 边界处保留的两端节点特征张量，约 [T×N, H] × 2 ≈ 192 MB）
+4. 只有当 backward 峰值 < GPU 总显存 × 70% 时，才可以安全关闭 GC。
 
 ---
 
