@@ -1,12 +1,64 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-03-02  
-**版本**：V5.48  
+**版本**：V5.49  
 **状态**：生产就绪
 
 ---
 
-## [V5.48] 2026-03-02 — 性能修复：消除 V5.47 的双重训练回归
+## [V5.49] 2026-03-02 — OOM 修复：8GB GPU backward 显存爆炸
+
+### 问题
+
+用户报告 8GB GPU 上首轮训练约 10 分钟后抛出：
+
+```
+RuntimeError: CUDA error: out of memory
+```
+
+OOM 发生在 `self.scaler.scale(total_loss).backward()` 阶段。
+
+### 根因
+
+`use_gradient_checkpointing: false`（V5.48 默认）导致 PyTorch autograd
+在 forward 阶段存储 **全部** 中间激活：
+
+- 4 层 ST-GCN 编码器 × 3 种边类型 = **12 次 propagate()** 调用
+- 每次 propagate() 存储 `T × E × H` 激活张量：
+  EEG T=500, E≈1890, H=128, float16 → **每次约 230 MB**
+- 无 GC 时总存储 ≈ 12 × 230 MB ≈ **2.8 GB**（仅 EEG 消息激活）
+- 加上模型参数、优化器状态、fMRI 激活等 → 超出 8 GB GPU 显存 → backward OOM
+
+### 修复
+
+将 `training.use_gradient_checkpointing` 默认值从 `false` 改为 **`true`**。
+
+- `temporal_chunk_size: null` 保持不变（单次 propagate()，无 Python 循环 overhead）
+- 启用 GC 后，forward 激活被即时丢弃；backward 按需重计算，
+  peak 显存从 ~2.8 GB 降至 ~230 MB（单次重计算）
+- 代价：backward 时间约 +40%（重计算 overhead）
+
+### 如果仍然 OOM
+
+按 OOM 处置阶梯（`default.yaml` 设备配置注释）逐步操作：
+1. 已启用 `use_gradient_checkpointing: true`（本版本默认）
+2. 设 `model.temporal_chunk_size: 64`（峰值降至 ~29 MB/块，但 8× Python overhead）
+3. 设 `model.temporal_chunk_size: 32`（极限场景）
+4. 减小 `model.k_dynamic_neighbors`（10 → 5）
+5. 设 `model.use_dynamic_graph: false`
+
+### 影响
+
+| 指标 | V5.48 | V5.49 |
+|------|-------|-------|
+| 8GB GPU OOM | ❌ OOM on backward | ✅ 正常完成 |
+| 每 epoch backward 时间 | 最快（无重计算）| +40%（GC 重计算）|
+| 每 epoch forward 时间 | 无变化 | 无变化 |
+| 16GB+ GPU 影响 | - | 建议改回 `false` 获最快速度 |
+
+---
+
+
 
 ### 背景
 
