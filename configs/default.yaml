@@ -173,23 +173,23 @@ model:
   #   EEG（250Hz）：当前窗口 T_fut=167 pts，50 步 × 4ms = 200ms，覆盖 alpha 节律
   #     完整周期（80-125ms）和 theta 节律（125-250ms），是预测 EEG 的最有意义的窗口。
   #
-  # ★ 非对称模态设计（V5.44）：prediction_steps=50 对不同模态的实际效果：
-  #   fMRI（T_fut=17）: supervised 17/50 步（34%），但这 17 步已覆盖完整 HRF 响应。
-  #     "浪费"的 33 步：pred 步 18-50 被生成但无梯度（~3% 计算开销，可接受）。
-  #   EEG（T_fut=167）: supervised 50/50 步（100%），200ms 覆盖主要 EEG 节律分量。
-  #     之前设为 15 步（60ms）只使用了 9% 的可用未来信号 → pred_r2_eeg 评估噪声大。
+  # ★ V5.45 模态物理一致性分析：
+  #   EEG 250Hz：
+  #     • context = T_ctx × (1/250s) = 333 × 4ms = 1.33s（覆盖 alpha 10+ 周期）
+  #     • prediction = 50 × 4ms = 200ms（1.5 个 alpha 周期，评估方差合理）
+  #     • 全量监督（50 ≤ T_fut=167）：每步梯度有效
+  #   fMRI 0.5Hz（TR=2s）：
+  #     • context = 33 × 2s = 66s（覆盖完整 HRF 响应 ~12s，含 6-8 个 BOLD 波形）
+  #     • prediction = 17 × 2s = 34s（完整 HRF 覆盖，足够评估血动力学预测）
+  #     • ★ V5.45 效率修复：compute_loss 和 validate 现在传递 num_steps=min(50, T_fut)
+  #       给 predict_next()，避免生成 33 个无监督的 fMRI 预测步（节省 ~66% fMRI 预测计算）
   #
-  # ★ 为什么从 15 提高到 50（V5.44）？
-  #   1. EEG pred_r2 振荡根因：15 步评估等于在 60ms 内用 2 个验证样本估计 R²，
-  #      样本方差极大，导致 epoch 5/10/15 之间 pred_r2_eeg 剧烈震荡（0.151→0.111→0.151）。
-  #      增至 50 步 → 评估方差约降低 10×（N=50 vs N=15），震荡大幅减少。
-  #   2. EEG pred 梯度增强：training 时每步只监督 15 个 EEG 未来步 ← 信号稀疏。
-  #      增至 50 步 → EEG 预测梯度强度 3×，pred_r2_eeg 学习更稳定。
-  #   3. fMRI：15 步 → 17 步，轻微改善（+2 步 HRF 尾部覆盖）。
-  #
-  # 建议范围：
-  #   eeg_window_size=500  → T_fut=167，prediction_steps 建议 30-100（取决于 GPU 内存）
-  #   fmri_window_size=50  → T_fut=17，prediction_steps ≥ 17 时 fMRI 全量监督（自动对齐）
+  # ★ 为什么不同模态需要不同的有效预测长度？
+  #   EEG 高频动态（ms 量级）：短程自回归（1-5 步）已很准确，
+  #     但 R² 评估需要足够的步数来区分"平均预测"和"真正学到"的模型。
+  #     50 步确保每次评估有足够的时间跨度。
+  #   fMRI 慢波动态（s 量级）：17 步 × 2s = 34s 已是合理的预测视界。
+  #     超过 34s 的预测需要更长的 context 窗口才有意义。
   prediction_steps: 50
   
   # Dropout 比率
@@ -253,32 +253,31 @@ model:
   # 峰值显存从 O(T×E×H) 降至 O(chunk_size×E×H)，与此同时每 epoch 后
   # 调用 gc.collect()+empty_cache() 防止碎片积累。
   #
-  # 示例（fMRI: T=190, E=5700, H=128, float16）：
-  #   temporal_chunk_size: null → [190×5700,128]×2=263MB 峰值（原行为）
-  #   temporal_chunk_size: 64  → [64×5700,128]×2=88MB  峰值（约3×改善）
-  #   temporal_chunk_size: 32  → [32×5700,128]×2=44MB  峰值（8GB GPU 推荐，约6×改善）
+  # ★ V5.45 重要更新：智能自适应分块策略
+  # ─────────────────────────────────────────────────────────────
+  # 旧问题：temporal_chunk_size=32 + EEG(T=500) = 每层 16 次 propagate()
+  # 调用（Python-GPU round-trip），而 GPU 只用到 0.16/8 GB = 2% 利用率。
+  # Python 循环 overhead 是训练慢（200s/epoch）的根本原因，不是 GPU 计算。
   #
-  # ★ 速度影响（重要：EEG 场景与 fMRI 场景差异巨大）：
-  #   fMRI (T=50，windowed 模式)：T/64≈1 次 propagate()，速度影响可忽略
-  #   EEG  (T=500，windowed 模式)：T/32≈16 次 propagate()，每层 16 次 Python-GPU
-  #     round-trip；4 encoder + 2 predictor = 96 次串行调用（forward）；
-  #     启用 gradient_checkpointing 时 backward 再重计算 96 次 = 共 192 次。
-  #     这是训练速度慢（~140s/epoch vs ~20s/epoch）的主要原因。
+  # 新策略（代码层面已实现，无需用户配置）：
+  #   • use_gradient_checkpointing=False（默认）：
+  #     不做分块（chunk_size = T），单次 propagate() 调用。
+  #     原因：无 checkpointing 时 autograd 无论如何都会存储全部 T 步激活，
+  #     分块不减少内存，只增加 Python 循环 overhead。
+  #     预期提速：EEG T=500 时从 16 次降至 1 次 → ~10× Python overhead 减少
+  #   • use_gradient_checkpointing=True（OOM 时启用）：
+  #     使用本参数值作为分块大小，按块重计算 backward，实现真正的内存节省。
   #
-  # GPU 显存充足（allocated << 可用）时显存不是瓶颈，Python 串行
-  # kernel 启动延迟才是。可用 `nvidia-smi` 或日志中的 GPU Memory 行确认。
+  # 配置建议（仅 use_gradient_checkpointing=True 时生效）：
+  #   null → 不分块（T 作为 chunk_size）最快但 backward 内存 = T×E×H
+  #   64   → EEG 8 块 / fMRI 1 块，适合 6-8GB GPU
+  #   32   → EEG 16 块 / fMRI 1 块，适合 4-6GB GPU（极端 OOM）
   #
-  # null = 不分块（每层 1 次 propagate()，最快）：
-  #   EEG  T=500, E≈2520: 峰值 ≈ 161MB（float16），8GB GPU 完全安全
-  #   fMRI T=50,  E≈5700: 峰值 ≈  73MB（float16，windowed 模式）
-  # 32  = 每层 16/2 次（EEG/fMRI），适合 OOM 问题场景（如 T>500 或 E>10000）
-  # 64  = 每层 8/1  次，中间方案
-  #
-  # 建议（默认值 = 32，V5.41 起）：
-  #   显存充足且速度优先 → null（最快，但多 epoch 后碎片化可能导致 OOM）
-  #   遭遇 CUDA OOM（默认）→ 32（最佳内存/速度折衷，8GB GPU 推荐）
-  #   严重 OOM → 32 + training.use_gradient_checkpointing: true
-  temporal_chunk_size: 32
+  # 显存估算（windowed 模式，float16）：
+  #   EEG  T=500, E≈2520, H=128: 峰值 ≈ 161MB（null 时）
+  #   fMRI T=50,  E≈5700, H=128: 峰值 ≈  73MB（null 时）
+  #   → 8GB GPU 完全安全，无需分块
+  temporal_chunk_size: null  # 不分块：仅 use_gradient_checkpointing=True 时才需要设置
 
   # 跨模态潜空间对齐损失（Cross-Modal Latent Alignment，V5.43 新增）
   # ─────────────────────────────────────────────────────────────────────────
@@ -316,6 +315,16 @@ model:
   # 1.0：exp(0) ~ exp(1) ≈ 1.0 ~ 2.72（V5.43 默认，温和加权）
   # 2.0：exp(0) ~ exp(2) ≈ 1.0 ~ 7.4（强调远期步，适合长序列预测）
   pred_step_weight_gamma: 1.0
+
+  # 会话/run 嵌入（V5.44 跨会话预测支持）
+  # false（默认）：禁用会话嵌入，行为与 V5.43 一致
+  # true：为每条 run（扫描会话）学习独立的潜空间偏移，捕捉跨会话漂移
+  #        （扫描器噪声、疲劳、认知状态变化）。
+  #        run_idx 从 build_graphs() 自动分配，无需手动设置。
+  #        参数量：num_runs × hidden_channels（典型 6 × 128 = 768 个参数，极小）。
+  #        适用场景：多个独立 EEG/fMRI 会话的跨会话预测和知识迁移。
+  #        注意：启用后，若需加载旧 checkpoint 需指定 strict=False。
+  use_run_embed: false
 
 # ──────────────────────────────────────────────────────────────────────────
 # 三、训练配置

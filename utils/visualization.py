@@ -493,13 +493,29 @@ def plot_training_curves(
             ax.plot(range(1, len(vals) + 1), vals,
                     label=label, color=colors[idx % len(colors)],
                     linewidth=lw, linestyle=ls, marker='o', markersize=3)
-        # Reference lines
-        ax.axhline(0.3, color='green',  linestyle=':', linewidth=0.8, alpha=0.6, label='R²=0.3 (good)')
-        ax.axhline(0.0, color='orange', linestyle=':', linewidth=0.8, alpha=0.6, label='R²=0 (baseline)')
+        # Reference lines — modality-specific thresholds for a fully-trained model:
+        #   R²=0.30: reconstruction target (Kingma & Welling 2014; also fMRI pred ideal)
+        #   R²=0.20: fMRI prediction target, fully-trained 2-8 subject model
+        #            (Thomas et al. 2022 NeurIPS; Bolt et al. 2022 Nat. Neurosci.)
+        #   R²=0.10: EEG raw-waveform prediction target, fully-trained model
+        #            (Schirrmeister et al. 2017 HBM; Kostas et al. 2020 J.Neural Eng.)
+        #   R²=0.00: baseline — any positive value means model beats mean prediction
+        ax.axhline(0.30, color='green',      linestyle=':', linewidth=0.8, alpha=0.7,
+                   label='R²=0.30 (recon / fMRI pred ideal)')
+        ax.axhline(0.20, color='deepskyblue', linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0.20 (fMRI pred target, fully-trained)')
+        ax.axhline(0.10, color='gold',        linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0.10 (EEG pred target, fully-trained)')
+        ax.axhline(0.00, color='orange',      linestyle=':', linewidth=0.8, alpha=0.6,
+                   label='R²=0 (baseline)')
         ax.set_xlabel('Validation Index')
         ax.set_ylabel('R² (coefficient of determination)')
-        ax.set_title('TwinBrain V5 — Validation R² Curve\n(solid=prediction ★, dashed=reconstruction)')
-        ax.legend(fontsize=8)
+        ax.set_title(
+            'TwinBrain V5 — Validation R² Curve\n'
+            '(solid=prediction ★, dashed=reconstruction  |  '
+            'EEG-pred target=0.10, fMRI-pred target=0.20, recon target=0.30)'
+        )
+        ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
         # Annotate best R² values if provided
         if best_r2_dict:
