@@ -1396,9 +1396,23 @@ for nt in list(pred_enc.node_types):
 | 可视化 R² 参考线更新（0.10/0.20/0.30 三条线）| ✅ 已更新 | V5.46 |
 | AGENTS.md 和 USERGUIDE.md 文献引用（7 篇论文，EEG/fMRI 物理约束支撑）| ✅ 已更新 | V5.46 |
 | temporal_chunk_size: null → 64（V5.47 回归，已在 V5.48 修复回 null）| ✅ 已修复 | V5.48 |
-| use_gradient_checkpointing: true → false（GPU 利用率仅 2%，无需重计算）| ✅ 已更新 | V5.48 |
+| use_gradient_checkpointing: true → false（V5.48 错误，V5.49 已回退）| ⚠️ 已回退 | V5.48→V5.49 |
 | info_nce_temperature: 0.1 → 0.5（防 warmup 期 InfoNCE 压制预测梯度）| ✅ 已更新 | V5.48 |
 | task_priorities.pred_nce: 4.0 → 2.0（warmup 期 InfoNCE:pred_sig 比从 50:1→5:1，消除 pred_r2<0 告警）| ✅ 已更新 | V5.48 |
+| GraphNativeDecoder BatchNorm1d → GroupNorm(1, out_dim)（短序列归一化稳定）| ✅ 已修复 | V5.47 |
+| compute_loss() pred_nce_{nt} InfoNCE 对比预测损失（防均值崩塌）| ✅ 已实现 | V5.47 |
+| GraphNativeTrainer pred_nce_{nt} 注册进 AdaptiveLossBalancer | ✅ 已实现 | V5.47 |
+| GraphNativeBrainModel.compute_effective_connectivity()（NPI 对等 EC 矩阵）| ✅ 已实现 | V5.47 |
+| TwinBrainDigitalTwin.compute_effective_connectivity()（多窗口 EC 高层接口）| ✅ 已实现 | V5.47 |
+| TwinBrainDigitalTwin.compute_model_fc()（模型 FC 矩阵，FC vs EC 对比验证）| ✅ 已实现 | V5.47 |
+| validate() ar1_r2_{nt}、decorr_{nt}、pred_r2_h1_{nt} NPI 对比科学指标 | ✅ 已实现 | V5.47 |
+| main.py 传递 use_info_nce、info_nce_temperature | ✅ 已实现 | V5.47 |
+| use_gradient_checkpointing: false → true（V5.48 错误回退，backward 峰值 ~12 GB）| ✅ 已修复 | V5.49 |
+| eeg_window_size: 500 → 250（TemporalAttention 4×，propagate 2× 快；1s 覆盖 alpha/beta/gamma）| ✅ 已更新 | V5.49 |
+| k_nearest_fmri: 20 → 10（fMRI edges 3800→1900，propagate 2× 快）| ✅ 已更新 | V5.49 |
+| k_dynamic_neighbors: 10 → 5（dynamic edges 减半，DGC topk 2× 快）| ✅ 已更新 | V5.49 |
+| SpatialTemporalGraphConv._ei_cache（edge expansion 张量缓存，消除 N_windows 次 GPU 分配）| ✅ 已实现 | V5.49 |
+| train_model() GPU 预加载（训练前 to(device)，稳定 data_ptr() 提升 cache 命中率）| ✅ 已实现 | V5.49 |
 
 ### 被试特异性嵌入全链路（V5.19–V5.20）
 
