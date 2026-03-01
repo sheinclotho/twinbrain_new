@@ -274,10 +274,11 @@ model:
   # 32  = 每层 16/2 次（EEG/fMRI），适合 OOM 问题场景（如 T>500 或 E>10000）
   # 64  = 每层 8/1  次，中间方案
   #
-  # 建议：
-  #   显存充足（GPU Memory allocated << 1 GB）→ null（最快）
-  #   遭遇 CUDA OOM → 先尝试 64，再尝试 32
-  temporal_chunk_size: null
+  # 建议（默认值 = 32，V5.41 起）：
+  #   显存充足且速度优先 → null（最快，但多 epoch 后碎片化可能导致 OOM）
+  #   遭遇 CUDA OOM（默认）→ 32（最佳内存/速度折衷，8GB GPU 推荐）
+  #   严重 OOM → 32 + training.use_gradient_checkpointing: true
+  temporal_chunk_size: 32
 
   # 跨模态潜空间对齐损失（Cross-Modal Latent Alignment，V5.43 新增）
   # ─────────────────────────────────────────────────────────────────────────
@@ -757,19 +758,20 @@ output:
 #
 # 8GB GPU（RTX 3070 / RTX 4070 / etc.），显存充足时（allocated << 总显存）：
 #   model.hidden_channels: 128
-#   model.temporal_chunk_size: null           ← 速度最优（当前默认）
+#   model.temporal_chunk_size: 32            ← 默认（V5.41 起，兼顾速度与 OOM 防护）
 #   training.use_gradient_checkpointing: false ← 速度最优（当前默认）
 #   windowed_sampling.enabled: true（已启用）
 #   windowed_sampling.fmri_window_size: 50
 #   training.gradient_accumulation_steps: 4
 #   → 支持 4-8 被试 × 约 5 窗口/被试 ≈ 20-40 样本/epoch
 #   → 典型 epoch 时间：20-40s（EEG T=500，具体取决于 GPU 型号和系统负载）
+#   → 速度最优（不分块）可设 model.temporal_chunk_size: null，但多 epoch 后存在 OOM 风险
 #
 # 8GB GPU，遭遇 CUDA OOM 时（逐步回退，下列速度影响均针对 EEG T=500 场景）：
-#   1. 先启用 training.use_gradient_checkpointing: true（约 +40% 时间，峰值显存约 -40%）
-#   2. 再设 model.temporal_chunk_size: 64    （约 +8× 时间，约 -8× 峰值）
-#   3. 再设 model.temporal_chunk_size: 32    （约 +16× 时间，约 -16× 峰值）
-#   注：fMRI T=50 时分块代价极小（ceil(50/chunk)≈1 次调用），主要影响 EEG T=500
+#   1. 确认 model.temporal_chunk_size: 32（已是默认值）
+#   2. 先启用 training.use_gradient_checkpointing: true（约 +40% 时间，峰值显存约 -40%）
+#   3. 再设 model.temporal_chunk_size: 16    （约 +32× 时间，约 -32× 峰值）
+#   注：fMRI T=50 时分块代价极小（ceil(50/chunk)≈1-2 次调用），主要影响 EEG T=500
 #
 # 16GB GPU（RTX 3080 Ti / RTX 4080 / etc.）：
 #   model.hidden_channels: 128
