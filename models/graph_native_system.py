@@ -1249,16 +1249,16 @@ class GraphNativeTrainer:
                     end_factor=1.0,
                     total_iters=warmup_epochs,
                 )
-                # T_0=20: first cosine restart at warmup_epochs+20 (epoch 25 with default warmup=5).
-                # The original T_0=10 caused a premature restart at epoch 15, which spiked LR and
-                # triggered the AdaptiveLossBalancer to misread the transient loss increase as
-                # "pred_eeg converging much slower" → inflated pred_eeg weight rapidly → train_loss
-                # appeared to rise and pred_r2_eeg collapsed (matching the epoch-11/15 divergence
-                # pattern observed in logs).  T_0=20 delays the restart well past the balancer's
-                # warmup stabilisation period.
+                # cosine_T0: first restart after this many post-warmup epochs.
+                # Read from v5_optimization.cosine_T0 (default 20 for backward compat).
+                # Larger T_0 delays the LR spike past the adaptive loss balancer's
+                # warmup stabilisation period, preventing pred_r2 oscillations.
+                # Example: warmup=5, T_0=20 → first restart at epoch 25.
+                #          warmup=5, T_0=50 → first restart at epoch 55.
+                cosine_T0 = self._optimization_config.get('cosine_T0', 20)
                 cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     self.optimizer,
-                    T_0=20,    # restart every 20 epochs (was 10)
+                    T_0=cosine_T0,
                     T_mult=2,  # double period after each restart
                     eta_min=learning_rate * 0.01,
                 )
@@ -1269,7 +1269,7 @@ class GraphNativeTrainer:
                 )
                 logger.info(
                     f"LR scheduler: Linear warmup ({warmup_epochs} epochs) "
-                    f"→ CosineAnnealingWarmRestarts(T_0=20, T_mult=2)"
+                    f"→ CosineAnnealingWarmRestarts(T_0={cosine_T0}, T_mult=2)"
                 )
             elif scheduler_type == 'onecycle':
                 # OneCycle (will need total_steps, set in train_epoch)
