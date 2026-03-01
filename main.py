@@ -1418,7 +1418,25 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
     logger.info("=" * 60)
     logger.info("开始训练循环")
     logger.info("=" * 60)
-    
+
+    # ── 预加载所有样本到 GPU（V5.49 优化）──────────────────────────────────
+    # train_step() 内部的 data.to(device) 在每步均被调用。
+    # 若 data_list 的样本仍在 CPU，每步都会产生 CPU→GPU 传输开销
+    # （PyG HeteroData.to() 在非同设备时创建新对象）。
+    # 预先将 train_graphs 和 val_graphs 全部移到 GPU：
+    #  - 消除 N_samples × N_epochs 次重复传输
+    #  - 训练开始后 data.to(device) 等效为 no-op（same-device → 返回 self）
+    #  - ei_cache 的 data_ptr() 键在整个训练期间保持稳定（持久 GPU 张量）
+    # 内存代价：所有样本同时驻留 GPU。
+    # 典型估算（EEG 63ch, fMRI 190 ROI, 约 50-100 个窗口）：每样本约 200-300 KB
+    # → 50 个样本约 10-15 MB，可忽略不计。
+    _device_str = str(trainer.device)
+    if 'cuda' in _device_str:
+        logger.info(f"📦 预加载 {len(train_graphs)} 训练样本 + {len(val_graphs)} 验证样本到 {_device_str}...")
+        train_graphs = [g.to(trainer.device) for g in train_graphs]
+        val_graphs   = [g.to(trainer.device) for g in val_graphs]
+        logger.info("✅ 数据预加载完成（消除逐步 CPU→GPU 传输开销）")
+
     # 训练循环
     best_val_loss = float('inf')       # always tracked for logging (val_loss value)
     best_selection_score = float('inf')  # criterion-dependent; drives save + early-stop
@@ -1494,9 +1512,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 logger.warning(
                     f"  ⚠️ GPU 显存碎片化较高 ({frag_ratio*100:.0f}% 碎片): "
                     f"reserved={reserved_gb:.2f} GB 中仅 {allocated_gb:.2f} GB 被使用。"
-                    f" 若遇到 CUDA OOM，建议：(1) 启用 use_gradient_checkpointing 或"
-                    f" 设 temporal_chunk_size=64/32；(2) 关闭 use_dynamic_graph；"
-                    f" (3) 减小 max_seq_len 或 k_nearest_fmri。"
+                    f" 若遇到 CUDA OOM，建议：(1) 确认 use_gradient_checkpointing=true (必须！backward 峰值约 12 GB)；"
+                    f" (2) 设 temporal_chunk_size=64/32（更激进内存节省，但有 Python overhead）；"
+                    f" (3) 关闭 use_dynamic_graph；(4) 减小 k_nearest_fmri 或 eeg_window_size。"
                 )
 
         # ── 每轮清理 GPU 碎片 ─────────────────────────────────────────────
