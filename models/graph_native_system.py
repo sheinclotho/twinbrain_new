@@ -1086,7 +1086,17 @@ class GraphNativeBrainModel(nn.Module):
 
                 # Causal prediction: last context_length steps → next prediction_steps.
                 # This is the NPI paradigm: "N past steps → K future steps."
-                pred = self.predictor.predict_next(context)  # [N, pred_steps, H]
+                #
+                # Efficiency: generate only as many steps as can be supervised.
+                # With windowed sampling, T_fut = T - T_ctx = T × (1/3).
+                # Examples (default config):
+                #   fMRI (T=50):  T_ctx=33, T_fut=17 → effective_steps=min(50,17)=17
+                #   EEG  (T=500): T_ctx=333,T_fut=167→ effective_steps=min(50,167)=50
+                # Generating prediction_steps=50 for fMRI then truncating to 17
+                # would waste 66% of predictor computation and activation memory.
+                T_fut = T - T_ctx
+                effective_steps = min(self.prediction_steps, T_fut)
+                pred = self.predictor.predict_next(context, num_steps=effective_steps)
                 pred_means[node_type] = pred
                 future_targets[node_type] = future_target
                 T_ctx_dict[node_type] = T_ctx
@@ -1111,15 +1121,9 @@ class GraphNativeBrainModel(nn.Module):
                     )
                     continue
                 aligned_steps = min(pred_mean.shape[1], future_target.shape[1])
-                if aligned_steps < pred_mean.shape[1]:
-                    logger.debug(
-                        f"pred_{node_type}: prediction_steps={pred_mean.shape[1]} > "
-                        f"T_fut={future_target.shape[1]}; supervising only "
-                        f"{aligned_steps} steps. "
-                        f"Reduce prediction_steps to <= int(T_window * 1/3) "
-                        f"to eliminate unsupervised prediction steps."
-                    )
                 if aligned_steps > 0:
+                    pm_slice = pred_mean[:, :aligned_steps, :]      # [N, S, H]
+                    ft_slice = future_target[:, :aligned_steps, :]  # [N, S, H]
                     if self.pred_step_weight_gamma > 0.0 and aligned_steps > 1:
                         # Exponentially increasing weight for later prediction steps.
                         # Step t gets weight exp(gamma * t / (aligned_steps - 1)),
@@ -1128,10 +1132,14 @@ class GraphNativeBrainModel(nn.Module):
                         # harder to predict (curriculum difficulty weighting).
                         # Reference: Bengio et al. 2015 "Scheduled Sampling".
                         #
-                        # Computed inline (not pre-cached): aligned_steps can differ
-                        # between modalities and between samples depending on T_fut.
-                        # torch.linspace + torch.exp over ~15 elements takes <1µs,
-                        # negligible vs the forward/backward passes.
+                        # Implementation: fully vectorised — NO Python loop.
+                        # The previous implementation used a for-loop over aligned_steps
+                        # (e.g. 17 for fMRI, 50 for EEG), issuing individual
+                        # F.huber_loss CUDA kernel calls per step.
+                        # Per epoch: (17_fmri_steps + 50_eeg_steps) × 80 grad-accum
+                        # = 5360 F.huber_loss kernel launches — significant overhead.
+                        # The vectorised approach uses 3-4 CUDA ops per modality per
+                        # sample regardless of aligned_steps.
                         step_w = torch.exp(
                             torch.linspace(
                                 0.0, self.pred_step_weight_gamma, aligned_steps,
@@ -1139,27 +1147,25 @@ class GraphNativeBrainModel(nn.Module):
                             )
                         )
                         step_w = (step_w / step_w.mean()).detach()  # [aligned_steps]
-                        weighted_losses = []
-                        for _t in range(aligned_steps):
-                            _pm = pred_mean[:, _t:_t + 1, :]
-                            _ft = future_target[:, _t:_t + 1, :]
-                            if self.loss_type == 'huber':
-                                _l = F.huber_loss(_pm, _ft, delta=1.0)
-                            else:
-                                _l = F.mse_loss(_pm, _ft)
-                            weighted_losses.append(_l * step_w[_t])
-                        pred_loss = torch.stack(weighted_losses).mean()
+                        # Compute per-element loss: [N, aligned_steps, H]
+                        diff = (pm_slice - ft_slice)
+                        if self.loss_type == 'huber':
+                            delta = 1.0
+                            abs_diff = diff.abs()
+                            per_element = torch.where(
+                                abs_diff < delta,
+                                0.5 * diff.pow(2),
+                                delta * (abs_diff - 0.5 * delta),
+                            )
+                        else:
+                            per_element = diff.pow(2)
+                        # Mean over N and H → per-step scalar [aligned_steps]
+                        per_step_loss = per_element.mean(dim=(0, 2))
+                        pred_loss = (per_step_loss * step_w).mean()
                     elif self.loss_type == 'huber':
-                        pred_loss = F.huber_loss(
-                            pred_mean[:, :aligned_steps, :],
-                            future_target[:, :aligned_steps, :],
-                            delta=1.0,
-                        )
+                        pred_loss = F.huber_loss(pm_slice, ft_slice, delta=1.0)
                     else:
-                        pred_loss = F.mse_loss(
-                            pred_mean[:, :aligned_steps, :],
-                            future_target[:, :aligned_steps, :],
-                        )
+                        pred_loss = F.mse_loss(pm_slice, ft_slice)
                     losses[f'pred_{node_type}'] = pred_loss
 
             # ── Signal-space prediction loss ─────────────────────────────────
@@ -2182,8 +2188,19 @@ class GraphNativeTrainer:
                             if node_type not in h_ctx_dict:
                                 continue
                             h_ctx = h_ctx_dict[node_type]  # [N, T_ctx, H]
+                            # Efficiency: only generate steps that can be compared
+                            # against the actual future signal.  For fMRI (T_fut=17
+                            # with prediction_steps=50), generating all 50 steps
+                            # wastes 66% of predictor computation for no gain.
+                            T_total = data[node_type].x.shape[1]
+                            T_fut = T_total - T_ctx
+                            effective_steps = min(
+                                self.model.prediction_steps, max(1, T_fut)
+                            )
                             pred_latents[node_type] = (
-                                self.model.predictor.predict_next(h_ctx)
+                                self.model.predictor.predict_next(
+                                    h_ctx, num_steps=effective_steps
+                                )
                             )
                             pred_T_ctx[node_type] = T_ctx
 

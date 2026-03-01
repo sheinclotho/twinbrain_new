@@ -962,7 +962,7 @@ class EnhancedMultiStepPredictor(nn.Module):
             current = projected
         return torch.cat(preds, dim=1)
 
-    def _predict_from_context(self, context: torch.Tensor) -> torch.Tensor:
+    def _predict_from_context(self, context: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
         """Core prediction dispatch: context ``[B, T, H]`` → ``[B, pred_steps, H]``.
 
         Dispatches to the appropriate predictor based on the configuration flags
@@ -971,13 +971,21 @@ class EnhancedMultiStepPredictor(nn.Module):
 
         This helper is called by both ``predict_next()`` and the non-uncertainty
         branch of ``forward()``, eliminating the duplicated 4-branch dispatch.
+
+        Args:
+            context: Context tensor ``[batch, T, H]``.
+            num_steps: Override the number of future steps to generate.
+                When ``None`` (default), uses ``self.prediction_steps``.
+                Pass a smaller value (e.g. ``aligned_steps = min(prediction_steps,
+                T_fut)``) to avoid generating unsupervised prediction steps.
         """
+        steps = num_steps if num_steps is not None else self.prediction_steps
         if self.use_hierarchical:
-            pred, _ = self.predictor(context, self.prediction_steps)
+            pred, _ = self.predictor(context, steps)
         elif self.use_transformer:
-            pred = _transformer_seq2seq_predict(self.predictor, context, self.prediction_steps)
+            pred = _transformer_seq2seq_predict(self.predictor, context, steps)
         else:
-            pred = self._gru_rollout(context, self.prediction_steps)
+            pred = self._gru_rollout(context, steps)
         return pred
 
     def forward(
@@ -1031,7 +1039,7 @@ class EnhancedMultiStepPredictor(nn.Module):
         
         return predictions, targets, uncertainties
     
-    def predict_next(self, h: torch.Tensor) -> torch.Tensor:
+    def predict_next(self, h: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
         """Causal one-shot prediction: context → future.
 
         Uses the last ``min(context_length, T)`` timesteps as context and
@@ -1051,19 +1059,28 @@ class EnhancedMultiStepPredictor(nn.Module):
         Args:
             h: Latent sequence [batch, T, H].  Only the last
                ``min(context_length, T)`` steps are used.
+            num_steps: Override number of predicted steps.  When ``None``
+               (default) uses ``self.prediction_steps``.  Pass
+               ``aligned_steps = min(prediction_steps, T_fut)`` from the
+               caller to avoid generating unsupervised prediction steps for
+               modalities whose future window is shorter than
+               ``prediction_steps`` (e.g. fMRI T_fut=17 with
+               prediction_steps=50 → pass num_steps=17 to save 66% of
+               predictor computation and activation memory).
 
         Returns:
-            pred: Predicted latent [batch, prediction_steps, H]
+            pred: Predicted latent [batch, num_steps, H]
         """
+        steps = num_steps if num_steps is not None else self.prediction_steps
         ctx_len = min(self.context_length, h.shape[1])
-        if self.context_length < self.prediction_steps:
+        if self.context_length < steps:
             # Only warn when the configured context_length cap is shorter than
-            # prediction_steps — that is a genuine configuration mismatch.
-            # Having h.shape[1] < prediction_steps is expected and by-design
+            # the requested steps — that is a genuine configuration mismatch.
+            # Having h.shape[1] < steps is expected and by-design
             # in windowed-sampling mode (T_ctx = window × 2/3 < prediction_steps).
             logger.warning(
                 f"predict_next: context_length ({self.context_length}) is configured "
-                f"shorter than prediction_steps ({self.prediction_steps}). "
+                f"shorter than prediction steps ({steps}). "
                 f"Consider increasing context_length or reducing prediction_steps."
             )
         context = h[:, -ctx_len:, :]   # [batch, ctx_len, H] — causally bounded
@@ -1072,11 +1089,11 @@ class EnhancedMultiStepPredictor(nn.Module):
             # UncertaintyAwarePredictor: we don't need std here, request mean only.
             pred, _ = self.predictor(
                 context,
-                future_steps=self.prediction_steps,
+                future_steps=steps,
                 return_uncertainty=False,
             )
         else:
-            pred = self._predict_from_context(context)
+            pred = self._predict_from_context(context, num_steps=steps)
 
         return pred
 

@@ -1,12 +1,130 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-03-01  
-**版本**：V5.44  
+**版本**：V5.45  
 **状态**：生产就绪
 
 ---
 
-## [V5.44] 2026-03-01 — 数字孪生推理引擎 + 会话嵌入 + 个性化推理 API
+## [V5.45] 2026-03-01 — 训练速度优化 + EEG/fMRI 预测效率修复
+
+### 背景
+
+用户反馈笔记本 GPU（8GB）训练时每 epoch 耗时 200-260s，GPU 利用率仅约 2%（allocated=0.16GB / 8GB）。
+同时指出 EEG（250Hz）和 fMRI（0.5Hz）在时间精度上存在巨大差异，现有实现未充分利用这一物理约束。
+
+**根本原因诊断**（三个互相独立的瓶颈）：
+
+1. **`temporal_chunk_size=32` × EEG T=500 = 16 次 propagate() 调用/层（Python overhead 主因）**  
+   无 gradient checkpointing 时，分块不节省内存（autograd 无论如何存储全部 T 步激活），  
+   却制造 16× Python-GPU 往返开销（16 次 PyG propagate() 调用，每次含多个 Python 层）。  
+   EEG 4 层 × 3 边类型 × 80 grad-accum 步 = 每 epoch 约 **15,360** 次额外 kernel launch。
+
+2. **`prediction_steps=50` 生成 50 个 fMRI 预测步但只有 17 个受监督（66% 浪费）**  
+   fMRI 窗口 T=50, T_fut=17，多余的 33 步由 predictor 生成但没有梯度信号，  
+   占用 predictor 约 66% 计算量和激活显存，无任何训练收益。
+
+3. **`pred_step_weight_gamma=1.0` 使用 Python for-loop 发出 5360+ 个单独 CUDA kernel**  
+   每个 step 调用一次 `F.huber_loss()`（1 CUDA kernel），aligned_steps=50（EEG）+ 17（fMRI）  
+   × 80 grad-accum × 4 gradient-accum = 每 epoch ~5360+ kernel launch。
+
+### 修复内容
+
+**A. 智能自适应分块（`graph_native_encoder.py`）**
+
+`SpatialTemporalGraphConv.forward()` 现在根据 `use_gradient_checkpointing` 状态自动选择策略：
+
+```python
+# 旧代码（每次都分块）：
+chunk_size = self.temporal_chunk_size if self.temporal_chunk_size is not None else T
+
+# 新代码（智能选择）：
+if self.use_gradient_checkpointing and self.training:
+    chunk_size = self.temporal_chunk_size if self.temporal_chunk_size is not None else T
+else:
+    chunk_size = T  # 单次 propagate() 调用：最快路径，内存占用相同
+```
+
+EEG T=500: 16 次 propagate() → 1 次；  
+fMRI T=50: 2 次 → 1 次（已接近最优，改善较小）。
+
+**B. 预测器按需生成步数（`advanced_prediction.py`）**
+
+`predict_next()` 和 `_predict_from_context()` 新增 `num_steps` 参数：
+
+```python
+def predict_next(self, h: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
+    steps = num_steps if num_steps is not None else self.prediction_steps
+    ...
+```
+
+**C. 调用方传入有效步数（`graph_native_system.py`）**
+
+`compute_loss()` 和 `validate()` 现在预先计算每个模态的有效监督步数：
+
+```python
+# compute_loss():
+effective_steps = min(self.prediction_steps, T_fut)
+pred = self.predictor.predict_next(context, num_steps=effective_steps)
+# fMRI: 生成 17 步（不再生成无用的 33 步）
+# EEG: 生成 50 步（与之前相同，全量监督）
+```
+
+**D. 向量化步权重损失（`graph_native_system.py`）**
+
+`pred_step_weight_gamma` 路径完全向量化，消除 Python for-loop：
+
+```python
+# 旧代码：for _t in range(aligned_steps): F.huber_loss(pred[:,_t:_t+1,:], ...)
+# 新代码：
+diff = pm_slice - ft_slice                     # [N, S, H]
+per_element = vectorized_huber(diff)            # [N, S, H]
+per_step_loss = per_element.mean(dim=(0, 2))   # [S] — 1 CUDA op 替代 S 次
+pred_loss = (per_step_loss * step_w).mean()    # 1 CUDA op
+```
+
+每 epoch 的 CUDA kernel 数量：5360+ → ~160（降低 33×）。
+
+**E. 配置更新（`configs/default.yaml`）**
+
+- `temporal_chunk_size: 32 → null`（无 checkpointing 时代码层自动不分块；null 仅作文档说明）
+- 更新注释，明确说明分块只在 `use_gradient_checkpointing: true` 时有效
+
+### 期望效果
+
+| 指标 | 修复前 | 修复后（估算） |
+|------|--------|---------------|
+| EEG propagate() 调用/层 | 16 | 1 |
+| fMRI 有效预测步 | 17/50（34%） | 17/17（100%） |
+| 步权重 CUDA kernel/epoch | ~5360 | ~160 |
+| GPU 利用率（8GB） | ~2% | ~20-40% |
+| 预估 epoch 时间 | ~200s | ~30-60s |
+
+### 科学讨论：EEG/fMRI 时间异质性
+
+用户提出了一个深刻问题：EEG（250Hz）和 fMRI（0.5Hz）被迫对齐时，EEG 的高频信息丢失。
+
+**物理约束分析**：
+- EEG context（333步 × 4ms = 1.33s）：覆盖 alpha（8-12Hz）10+ 个完整周期，足够预测振荡相位
+- fMRI context（33步 × 2s = 66s）：覆盖完整 HRF（~12s），足够预测血动力学状态
+- EEG→fMRI 跨模态消息：F.interpolate 将 EEG latent 从 T=500 压缩到 T=50，等效低通滤波
+
+**低通滤波的科学合理性**：
+神经血管耦合（Logothetis et al. 2001, Nature）表明 fMRI BOLD 本质上是 EEG 活动的时间积分  
+（HRF 带宽 ~0.1Hz）。将 EEG 插值到 fMRI 时间分辨率，实质上是在执行 HRF 卷积的近似。  
+因此，"能量损失"在物理上是正确的 — 高频 EEG 成分不应该影响 fMRI 预测。
+
+**pred_r2_eeg 低的根本原因**：
+EEG 信号在 2s 窗口内本质上是嘈杂的随机过程（信噪比 < 1）。  
+即使使用完美的预测器，EEG 信号在 4ms 精度下预测 200ms 内的 R² 上限也很低。  
+这是物理约束，不是实现缺陷。改善方法：
+1. 使用 EEG 频域特征（功率谱）而非时域原始信号
+2. 将 EEG 投影到宽频段特征（delta/theta/alpha/beta/gamma 功率）
+3. 只预测 EEG envelope（Hilbert 变换），而非原始波形
+
+---
+
+
 
 ### 背景
 

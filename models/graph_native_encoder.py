@@ -283,7 +283,30 @@ class SpatialTemporalGraphConv(MessagePassing):
         #    row n*T+t, causing a systematic node/time transposition in the gathered
         #    source features (only invisible when T==N, e.g. for fMRI ROIs ≈ 190).
         E = edge_index.shape[1]
-        chunk_size = self.temporal_chunk_size if self.temporal_chunk_size is not None else T
+        # Smart chunk-size selection:
+        #
+        # Without gradient checkpointing, chunking does NOT reduce total activation
+        # memory.  Autograd stores a forward activation tensor for each tensor
+        # operation; splitting T timesteps into N chunks creates N separate
+        # propagate() calls, each storing its own sub-activation.  The total memory
+        # across all N chunks equals what a single unchunked call would store
+        # (≈ T×E×H bytes).  Chunking with chunk_size=32 for EEG (T=500) therefore
+        # only adds 16× Python-loop overhead (16 iterations × loop body + PyG
+        # propagate() Python overhead ≈ 16× more CPU→GPU round trips) WITHOUT
+        # any net memory benefit.
+        #
+        # With gradient checkpointing (and self.training=True), gradient_checkpoint()
+        # DISCARDS each chunk's intermediate activations after the forward pass and
+        # RECOMPUTES them on-demand during backward.  Peak backward memory then
+        # scales with chunk_size×E×H (not T×E×H) — chunking genuinely saves memory.
+        #
+        # Rule:
+        #   use_gradient_checkpointing=True AND training=True → use configured chunk_size
+        #   otherwise                                         → single call (chunk_size=T)
+        if self.use_gradient_checkpointing and self.training:
+            chunk_size = self.temporal_chunk_size if self.temporal_chunk_size is not None else T
+        else:
+            chunk_size = T  # single propagate() call — fastest path, same total memory
 
         # Permute once to [T, N, H] so that index t*N+n correctly addresses (n,t).
         # contiguous() ensures reshape produces the expected row-major layout.

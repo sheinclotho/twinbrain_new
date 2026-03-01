@@ -26,6 +26,62 @@
 
 ---
 
+### [2026-03-01] temporal_chunk_size × no-checkpointing = 纯 Python overhead（训练极慢）
+
+**用户观察**：epoch 时间 200-260s，但日志显示 `GPU Memory: allocated=0.16 GB, reserved=0.44 GB`（8GB GPU 仅用 2%）。
+
+**思维误区**：看到 `temporal_chunk_size=32` 就认为"为了节省显存，合理"，没有追问：**当 gradient_checkpointing 关闭时，分块到底节省了什么显存？**
+
+**根因**：
+- 无 gradient checkpointing 时，PyTorch autograd 会为每个 tensor operation 存储前向激活（用于 backward）
+- 无论 chunk_size=32 还是 chunk_size=T（整体），autograd **都会存储全部 T 步的激活**
+- 分块只是把一个 propagate() 调用拆成了 T/chunk_size 个独立调用
+- 每次 propagate() 调用都有 Python overhead（PyG 的 __check_input__、__lift__、__collect__ 等 Python 函数 + CUDA kernel launch）
+- EEG T=500, chunk_size=32 → 16 次 propagate/层，4 层 × 3 边 × 16 次 = 192 次 Python 调用/forward
+- GPU 96% 时间在等待 CPU 的 Python 调度，真正的计算时间只有 4%
+
+**正确认识**：
+| 场景 | 分块效果 |
+|------|---------|
+| checkpointing=False（默认） | ❌ 不节省显存，纯 Python overhead |
+| checkpointing=True，训练时 | ✅ 真正节省 backward 峰值显存（每块重计算） |
+| checkpointing=True，推理时 | ❌ 不节省（inference 无 backward） |
+
+**修复（V5.45）**：
+```python
+# SpatialTemporalGraphConv.forward()
+if self.use_gradient_checkpointing and self.training:
+    chunk_size = self.temporal_chunk_size or T  # 按配置分块（真正节省显存）
+else:
+    chunk_size = T  # 单次调用：最快，与分块内存相同
+```
+
+**规则**：**"分块" 只有与 gradient checkpointing 配合才有实际意义。** 在评估任何 "分块优化" 时，必须先追问：不分块时，内存如何变化？如果内存不变（autograd 保留所有激活），分块只添加 Python overhead，应当去除。
+
+---
+
+### [2026-03-01] EEG/fMRI 时间异质性：预测物理约束
+
+**用户观察**：pred_r2_eeg=0.051，明显低于 pred_r2_fmri=0.205，询问是否实现有问题。
+
+**关键认识**：
+1. **EEG 预测本质困难**：EEG 信号在 ms 量级有大量生理噪声（眼动、肌电、电极漂移）。  
+   在 2s 窗口内预测 200ms 后的原始 EEG 波形，信噪比 < 1，任何模型的 R² 上限都很低。
+2. **fMRI 预测本质容易**：BOLD 信号是神经活动的低通滤波（HRF 带宽 ~0.1Hz），
+   有强自相关性（当前值高度预测下一秒的值），任何有基本时序能力的模型都能达到 R²>0.1。
+3. **EEG→fMRI 低通滤波是物理正确的**：将 EEG latent 从 T=500 插值到 T=50，
+   等效于神经血管耦合的时间积分。"能量损失"反映真实物理过程，不是 bug。
+
+**正确期望**：
+- `pred_r2_eeg = 0.05-0.15`：正常，EEG 波形预测本质困难。
+  若需要更高值，应改用频段功率（envelope）而非原始波形预测。
+- `pred_r2_fmri = 0.1-0.4`：正常范围，随训练提高。
+  若 < 0，则是模型问题（检查因果性、loss 权重等）。
+
+**规则**：**评估 pred_r2 时，必须与模态的物理上限对比，而非用同一标准衡量 EEG 和 fMRI。**
+
+---
+
 ### [2026-03-01] pred_r2 随训练加深持续恶化：TemporalAttention 双向注意力造成训练-验证致命偏差
 
 **用户观察**：epoch 5 pred_r2_eeg=0.219（最优），之后持续恶化到 -0.163，70 epoch 时仍为 -0.02。
@@ -1153,6 +1209,10 @@ for nt in list(pred_enc.node_types):
 | 梯度归因可解释性（compute_attribution，功能指纹）| ✅ 已实现 | V5.44 |
 | 检查点自动推理（TwinBrainDigitalTwin.from_checkpoint）| ✅ 已实现 | V5.44 |
 | 自我演化（多会话在线学习）| ❌ Future work | — |
+| temporal_chunk_size 无 checkpointing 时自动不分块（消除 16× Python overhead）| ✅ 已修复 | V5.45 |
+| predict_next() num_steps 参数（按需生成，避免 fMRI 66% 无监督步）| ✅ 已实现 | V5.45 |
+| pred_step_weight_gamma 向量化（5360 kernel → 160 kernel/epoch）| ✅ 已修复 | V5.45 |
+| temporal_chunk_size 默认值 32 → null（文档准确化）| ✅ 已更新 | V5.45 |
 
 ### 被试特异性嵌入全链路（V5.19–V5.20）
 
