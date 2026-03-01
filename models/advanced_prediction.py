@@ -1056,11 +1056,15 @@ class EnhancedMultiStepPredictor(nn.Module):
             pred: Predicted latent [batch, prediction_steps, H]
         """
         ctx_len = min(self.context_length, h.shape[1])
-        if ctx_len < self.prediction_steps:
+        if self.context_length < self.prediction_steps:
+            # Only warn when the configured context_length cap is shorter than
+            # prediction_steps — that is a genuine configuration mismatch.
+            # Having h.shape[1] < prediction_steps is expected and by-design
+            # in windowed-sampling mode (T_ctx = window × 2/3 < prediction_steps).
             logger.warning(
-                f"predict_next: available context ({ctx_len} steps) is shorter than "
-                f"prediction_steps ({self.prediction_steps}).  Prediction may be unreliable. "
-                f"Consider reducing prediction_steps or providing a longer sequence."
+                f"predict_next: context_length ({self.context_length}) is configured "
+                f"shorter than prediction_steps ({self.prediction_steps}). "
+                f"Consider increasing context_length or reducing prediction_steps."
             )
         context = h[:, -ctx_len:, :]   # [batch, ctx_len, H] — causally bounded
 
