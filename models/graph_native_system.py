@@ -475,6 +475,76 @@ class GraphNativeBrainModel(nn.Module):
         loss = 1.0 - (z_src * z_dst).sum()
         return loss.to(h_src.dtype)
 
+    @staticmethod
+    def _info_nce_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        temperature: float = 0.1,
+    ) -> torch.Tensor:
+        """InfoNCE / Contrastive Predictive Coding (CPC) loss.
+
+        Forces the predictor to produce *discriminative* latent representations
+        that uniquely identify the correct future timestep, rather than predicting
+        the unconditional mean of the future distribution.
+
+        Why this matters for pred_r2:
+          Pure regression (Huber / MSE) can be minimised by predicting a smooth
+          average of plausible futures, which yields low MSE but negative R² (worse
+          than predicting the global mean).  InfoNCE requires the predictor to
+          distinguish the correct future (positive) from all other timesteps
+          (negatives), which is only possible if the predicted representation
+          carries unique information about that specific future window.
+          This is the same principle as CPC (Oord 2018), wav2vec 2.0 (Baevski 2020),
+          and CLIP (Radford 2021): contrastive discrimination forces the model to
+          capture the *what* of future states, not just the *expected average*.
+
+        Scientific basis:
+          The brain exhibits a rich structure of temporal sequences; even brief
+          windows of EEG / fMRI carry unique spectro-spatial fingerprints that
+          distinguish them from other windows in the same session (Stringer et al.
+          2019, Nature; Engemann et al. 2022, NeuroImage).  InfoNCE exploits this
+          structure as a training signal.
+
+        Implementation:
+          Flatten (node, step) pairs to [N*S, H]; L2-normalise; compute cosine
+          similarity matrix [N*S, N*S] / τ; positives are on the diagonal.
+          Symmetric bidirectional cross-entropy (pred→target and target→pred) as
+          in CLIP for additional stability.
+
+        References:
+            Oord et al. (2018) "Representation Learning with CPC." NeurIPS wrkshp.
+            Baevski et al. (2020) "wav2vec 2.0." NeurIPS.
+            Radford et al. (2021) "CLIP." ICML.
+
+        Args:
+            pred:        [N, S, H] predicted latent representations.
+            target:      [N, S, H] actual future latent representations.
+                         Stop-gradient applied internally (target is supervision).
+            temperature: Softmax temperature τ.  Smaller → more discriminative but
+                         harder to optimise.  0.1 is standard for brain imaging data.
+        Returns:
+            Scalar InfoNCE loss.  Lower = predictor is more discriminative.
+        """
+        N, S, H = pred.shape
+        n_items = N * S
+        if n_items < 2:
+            # Degenerate case: cannot form positive/negative pairs.
+            return pred.new_zeros(1).squeeze()
+        # Flatten and L2-normalise for cosine similarity.
+        # Cast to float32: cosine similarity with float16 and near-zero norms
+        # can produce NaN (same issue as _pearson_loss, _cross_modal_align_loss).
+        pred_flat   = F.normalize(pred.float().reshape(n_items, H), dim=-1)          # [n_items, H]
+        # Detach target: it is fixed supervision (analogous to a label).
+        # Gradients flow only through pred, not through target.
+        target_flat = F.normalize(target.detach().float().reshape(n_items, H), dim=-1)  # [n_items, H]
+        # Cosine similarity matrix, scaled by temperature.
+        logits = torch.matmul(pred_flat, target_flat.T) / temperature  # [n_items, n_items]
+        # Positive pairs lie on the diagonal: pred[i] ↔ target[i].
+        labels = torch.arange(n_items, device=pred.device)
+        # Symmetric InfoNCE (CLIP-style): average both directions for stability.
+        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2.0
+        return loss.to(pred.dtype)
+
     def __init__(
         self,
         node_types: List[str],
@@ -497,6 +567,8 @@ class GraphNativeBrainModel(nn.Module):
         use_cross_modal_align: bool = True,
         pred_step_weight_gamma: float = 1.0,
         num_runs: int = 0,
+        use_info_nce: bool = True,
+        info_nce_temperature: float = 0.1,
     ):
         """
         Initialize complete model.
@@ -566,6 +638,18 @@ class GraphNativeBrainModel(nn.Module):
                 Initialized to zero so it has no effect at the start of training
                 and only diverges from zero as session-specific patterns emerge.
                 0 = disabled (default, backward-compatible).
+            use_info_nce: Add InfoNCE contrastive prediction loss alongside the
+                regression prediction losses (pred_*, pred_sig_*).  Prevents
+                mean-prediction collapse (predicting the unconditional mean of the
+                future distribution), which is the primary cause of negative pred_r2
+                in pure MSE/Huber training.  InfoNCE forces the predictor to produce
+                *discriminative* representations that uniquely identify each future
+                time window.  Default True (V5.47).
+                Reference: Oord et al. (2018) CPC; Baevski et al. (2020) wav2vec 2.0.
+            info_nce_temperature: Softmax temperature τ for InfoNCE loss.  Smaller τ
+                is more discriminative (sharper similarity distribution) but harder
+                to optimise on small datasets.  0.1 = standard value for brain signals
+                (SimCLR uses 0.1; wav2vec 2.0 uses 0.1).  Default 0.1 (V5.47).
         """
         super().__init__()
         
@@ -579,6 +663,8 @@ class GraphNativeBrainModel(nn.Module):
         self.use_spectral_loss = use_spectral_loss
         self.use_cross_modal_align = use_cross_modal_align
         self.pred_step_weight_gamma = pred_step_weight_gamma
+        self.use_info_nce = use_info_nce
+        self.info_nce_temperature = info_nce_temperature
 
         # 被试特异性嵌入 (AGENTS.md §九 Gap 2)
         # num_subjects > 0: each subject gets a learnable [H] offset added to
