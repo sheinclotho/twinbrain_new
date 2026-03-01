@@ -572,6 +572,7 @@ class GraphNativeBrainModel(nn.Module):
         self.node_types = node_types
         self.hidden_channels = hidden_channels
         self.use_prediction = use_prediction
+        self.prediction_steps = prediction_steps
         self.loss_type = loss_type
         self.num_subjects = num_subjects
         self.num_runs = num_runs
