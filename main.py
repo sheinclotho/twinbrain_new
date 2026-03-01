@@ -1372,8 +1372,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 logger.warning(
                     f"  ⚠️ GPU 显存碎片化较高 ({frag_ratio*100:.0f}% 碎片): "
                     f"reserved={reserved_gb:.2f} GB 中仅 {allocated_gb:.2f} GB 被使用。"
-                    f" 若遇到 CUDA OOM，建议：(1) 减小 temporal_chunk_size（如 32）；"
-                    f" (2) 关闭 use_dynamic_graph；(3) 减小 max_seq_len 或 k_nearest_fmri。"
+                    f" 若遇到 CUDA OOM，建议：(1) 启用 use_gradient_checkpointing 或"
+                    f" 设 temporal_chunk_size=64/32；(2) 关闭 use_dynamic_graph；"
+                    f" (3) 减小 max_seq_len 或 k_nearest_fmri。"
                 )
 
         # ── 每轮清理 GPU 碎片 ─────────────────────────────────────────────
