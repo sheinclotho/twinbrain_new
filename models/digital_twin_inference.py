@@ -480,8 +480,10 @@ class TwinBrainDigitalTwin:
                     f"loss={total_loss.item():.4f}"
                 )
 
-        # Re-freeze the adapted embedding and restore eval mode
-        self.model.subject_embed.weight.requires_grad_(False)
+        # Restore full gradient flow and eval mode.
+        # Reverses the freeze applied at the start of adapt_to_subject():
+        #   - Start: all params frozen, then subject_embed.weight selectively unfrozen
+        #   - End  : all params unfrozen (no selective step needed, the loop covers all)
         for param in self.model.parameters():
             param.requires_grad_(True)
         self.model.eval()

@@ -2091,190 +2091,189 @@ class GraphNativeTrainer:
         pred_ss_sum: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         pred_ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}
 
-        with torch.no_grad():
-            for data in data_list:
-                data = data.to(self.device)
+        for data in data_list:
+            data = data.to(self.device)
 
-                # Forward pass — always request encoded representations so that:
-                # a) compute_loss() can include the latent prediction loss, and
-                # b) we can compute signal-space prediction R² below.
-                if self.model.use_prediction:
-                    reconstructed, _, encoded = self.model(
-                        data, return_prediction=False, return_encoded=True
-                    )
-                else:
-                    reconstructed, _ = self.model(data, return_prediction=False)
-                    encoded = None
+            # Forward pass — always request encoded representations so that:
+            # a) compute_loss() can include the latent prediction loss, and
+            # b) we can compute signal-space prediction R² below.
+            if self.model.use_prediction:
+                reconstructed, _, encoded = self.model(
+                    data, return_prediction=False, return_encoded=True
+                )
+            else:
+                reconstructed, _ = self.model(data, return_prediction=False)
+                encoded = None
 
-                losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
-                total_loss += sum(losses.values()).item()
+            losses = self.model.compute_loss(data, reconstructed, encoded=encoded)
+            total_loss += sum(losses.values()).item()
 
-                # ── Reconstruction R² per modality ──────────────────────────
+            # ── Reconstruction R² per modality ──────────────────────────
+            for node_type in self.node_types:
+                if node_type in data.node_types and node_type in reconstructed:
+                    target = data[node_type].x       # [N, T, C]
+                    recon  = reconstructed[node_type]  # [N, T', C]
+                    T_min  = min(target.shape[1], recon.shape[1])
+                    target = target[:, :T_min, :]
+                    recon  = recon[:, :T_min, :]
+                    if recon.shape[0] != target.shape[0]:
+                        continue
+                    ss_res[node_type] += ((target - recon) ** 2).sum().item()
+                    ss_raw[node_type] += (target ** 2).sum().item()
+                    ss_sum[node_type] += target.sum().item()
+                    ss_cnt[node_type] += target.numel()
+
+            # ── Signal-space prediction R² per modality ─────────────────
+            # TRULY CAUSAL evaluation:
+            #
+            # The encoder uses symmetric Conv1d padding (±1-step boundary
+            # leakage) and CAUSAL TemporalAttention (is_causal=True, V5.42
+            # fix).  With causal attention the h[:,t,:] latent contains ONLY
+            # information from signal[0..t], eliminating global future leakage.
+            #
+            # For the strictest possible metric we still re-encode with ONLY
+            # the first T_ctx raw signal timesteps.  This removes even the
+            # ±1-step Conv1d boundary leakage at position T_ctx-1 (which
+            # affects fewer than 1% of timesteps and is otherwise negligible).
+            # Cost: one extra encoder forward pass without backprop (acceptable
+            # in a validation loop).
+            #
+            # Result: pred_R² here is a conservative lower bound that neither
+            # the causal-attention nor the boundary-Conv1d approximation can
+            # inflate.  This is the authoritative benchmark.
+            if self.model.use_prediction:
+                pred_latents: Dict[str, torch.Tensor] = {}
+                pred_T_ctx: Dict[str, int] = {}
+                # h_ctx_dict is assigned inside `if ctx_T_map:` below and
+                # referenced inside `if pred_latents:`.  The current logic
+                # guarantees pred_latents non-empty → ctx_T_map non-empty →
+                # h_ctx_dict assigned, but initializing here makes this
+                # invariant explicit and prevents UnboundLocalError if the
+                # code is extended in the future.
+                h_ctx_dict: Dict[str, torch.Tensor] = {}
+
+                # ── Step 1: Determine context split per modality ──────────
+                # Use the full-sequence latent length (from encoded above,
+                # if available) to compute T_ctx; otherwise fall back to the
+                # raw-signal length.
+                ctx_T_map: Dict[str, int] = {}
                 for node_type in self.node_types:
-                    if node_type in data.node_types and node_type in reconstructed:
-                        target = data[node_type].x       # [N, T, C]
-                        recon  = reconstructed[node_type]  # [N, T', C]
-                        T_min  = min(target.shape[1], recon.shape[1])
-                        target = target[:, :T_min, :]
-                        recon  = recon[:, :T_min, :]
-                        if recon.shape[0] != target.shape[0]:
+                    if node_type not in data.node_types:
+                        continue
+                    if encoded is not None and node_type in encoded:
+                        T = encoded[node_type].shape[1]
+                    else:
+                        T = data[node_type].x.shape[1]
+                    if T < self.model._PRED_MIN_SEQ_LEN:
+                        continue
+                    ctx_T_map[node_type] = int(T * self.model._PRED_CONTEXT_RATIO)
+
+                if ctx_T_map:
+                    # ── Step 2: Build context-only data and encode ────────
+                    # Each node type is sliced to its T_ctx steps so the
+                    # encoder only sees past data — no future leakage.
+                    context_data = data.clone()
+                    for node_type, T_ctx in ctx_T_map.items():
+                        context_data[node_type].x = (
+                            data[node_type].x[:, :T_ctx, :]
+                        )
+                    _, _, h_ctx_dict = self.model(
+                        context_data,
+                        return_prediction=False,
+                        return_encoded=True,
+                    )
+
+                    # ── Step 3: Predict from causal context ───────────────
+                    for node_type, T_ctx in ctx_T_map.items():
+                        if node_type not in h_ctx_dict:
                             continue
-                        ss_res[node_type] += ((target - recon) ** 2).sum().item()
-                        ss_raw[node_type] += (target ** 2).sum().item()
-                        ss_sum[node_type] += target.sum().item()
-                        ss_cnt[node_type] += target.numel()
+                        h_ctx = h_ctx_dict[node_type]  # [N, T_ctx, H]
+                        # Efficiency: only generate steps that can be compared
+                        # against the actual future signal.  For fMRI (T_fut=17
+                        # with prediction_steps=50), generating all 50 steps
+                        # wastes 66% of predictor computation for no gain.
+                        T_total = data[node_type].x.shape[1]
+                        T_fut = T_total - T_ctx
+                        effective_steps = min(
+                            self.model.prediction_steps, max(1, T_fut)
+                        )
+                        pred_latents[node_type] = (
+                            self.model.predictor.predict_next(
+                                h_ctx, num_steps=effective_steps
+                            )
+                        )
+                        pred_T_ctx[node_type] = T_ctx
 
-                # ── Signal-space prediction R² per modality ─────────────────
-                # TRULY CAUSAL evaluation:
-                #
-                # The encoder uses symmetric Conv1d padding (±1-step boundary
-                # leakage) and CAUSAL TemporalAttention (is_causal=True, V5.42
-                # fix).  With causal attention the h[:,t,:] latent contains ONLY
-                # information from signal[0..t], eliminating global future leakage.
-                #
-                # For the strictest possible metric we still re-encode with ONLY
-                # the first T_ctx raw signal timesteps.  This removes even the
-                # ±1-step Conv1d boundary leakage at position T_ctx-1 (which
-                # affects fewer than 1% of timesteps and is otherwise negligible).
-                # Cost: one extra encoder forward pass without backprop (acceptable
-                # in a validation loop).
-                #
-                # Result: pred_R² here is a conservative lower bound that neither
-                # the causal-attention nor the boundary-Conv1d approximation can
-                # inflate.  This is the authoritative benchmark.
-                if self.model.use_prediction:
-                    pred_latents: Dict[str, torch.Tensor] = {}
-                    pred_T_ctx: Dict[str, int] = {}
-                    # h_ctx_dict is assigned inside `if ctx_T_map:` below and
-                    # referenced inside `if pred_latents:`.  The current logic
-                    # guarantees pred_latents non-empty → ctx_T_map non-empty →
-                    # h_ctx_dict assigned, but initializing here makes this
-                    # invariant explicit and prevents UnboundLocalError if the
-                    # code is extended in the future.
-                    h_ctx_dict: Dict[str, torch.Tensor] = {}
+                # ── Step 4: System-level graph propagation ────────────────
+                if pred_latents:
+                    pred_latents = self.model.prediction_propagator(
+                        pred_latents, data
+                    )
 
-                    # ── Step 1: Determine context split per modality ──────────
-                    # Use the full-sequence latent length (from encoded above,
-                    # if available) to compute T_ctx; otherwise fall back to the
-                    # raw-signal length.
-                    ctx_T_map: Dict[str, int] = {}
-                    for node_type in self.node_types:
+                if pred_latents:
+                    # ── Step 5: Decode latent predictions to signal space ─
+                    # Seed pred_enc from h_ctx_dict (encoded context latents,
+                    # shape [N, T_ctx, H=hidden_channels]) rather than raw data
+                    # (shape [N, T, C=1]).  The decoder's first Conv1d expects
+                    # in_channels=hidden_channels, so starting from the raw data
+                    # would crash for any modality not overridden by pred_latents
+                    # (e.g. modalities skipped because T < _PRED_MIN_SEQ_LEN).
+                    # Starting from h_ctx_dict ensures every modality has the
+                    # correct feature dimension regardless of whether it was
+                    # predicted; the pred_T_ctx guard in Step 6 prevents those
+                    # modalities from contributing to the pred_R² metric.
+                    #
+                    # Tensor aliasing: data.clone() performs a deep copy of all
+                    # node/edge tensors (PyG HeteroData.clone() calls .clone() on
+                    # each stored tensor).  The subsequent .x assignments create
+                    # new references in pred_enc only; data is not modified.
+                    # This validate() function runs under @torch.no_grad() so
+                    # there are no gradient graphs that could be affected.
+                    pred_enc = data.clone()
+                    for nt, h_ctx in h_ctx_dict.items():
+                        pred_enc[nt].x = h_ctx   # [N, T_ctx, H] — correct H for decoder
+                    for nt, pred_lat in pred_latents.items():
+                        pred_enc[nt].x = pred_lat  # override with predicted latent
+                    # Guard: node types NOT in h_ctx_dict (T < _PRED_MIN_SEQ_LEN=4)
+                    # still carry the raw signal [N, T, C=1] from data.clone().
+                    # The decoder's Conv1d(in_channels=hidden_channels) would fail
+                    # with a channel mismatch on [N, 1, T].
+                    # This is extremely rare in practice (typical T ≈ 300 >> 4)
+                    # but could occur in short-sequence edge cases or unit tests.
+                    # Fix: remove those node types from pred_enc so the decoder
+                    # only processes nodes that have correct latent features.
+                    for nt in list(pred_enc.node_types):
+                        if nt not in h_ctx_dict:
+                            logger.debug(
+                                f"validate: removing '{nt}' from pred_enc "
+                                f"(T={data[nt].x.shape[1]} < _PRED_MIN_SEQ_LEN="
+                                f"{self.model._PRED_MIN_SEQ_LEN}; raw signal "
+                                f"would cause decoder channel mismatch)"
+                            )
+                            del pred_enc[nt]
+                    pred_signals = self.model.decoder(pred_enc)  # {nt: [N, pred_steps', C]}
+
+                    for node_type, pred_sig in pred_signals.items():
                         if node_type not in data.node_types:
                             continue
-                        if encoded is not None and node_type in encoded:
-                            T = encoded[node_type].shape[1]
-                        else:
-                            T = data[node_type].x.shape[1]
-                        if T < self.model._PRED_MIN_SEQ_LEN:
+                        T_ctx = pred_T_ctx.get(node_type)
+                        if T_ctx is None:
                             continue
-                        ctx_T_map[node_type] = int(T * self.model._PRED_CONTEXT_RATIO)
-
-                    if ctx_T_map:
-                        # ── Step 2: Build context-only data and encode ────────
-                        # Each node type is sliced to its T_ctx steps so the
-                        # encoder only sees past data — no future leakage.
-                        context_data = data.clone()
-                        for node_type, T_ctx in ctx_T_map.items():
-                            context_data[node_type].x = (
-                                data[node_type].x[:, :T_ctx, :]
-                            )
-                        _, _, h_ctx_dict = self.model(
-                            context_data,
-                            return_prediction=False,
-                            return_encoded=True,
-                        )
-
-                        # ── Step 3: Predict from causal context ───────────────
-                        for node_type, T_ctx in ctx_T_map.items():
-                            if node_type not in h_ctx_dict:
-                                continue
-                            h_ctx = h_ctx_dict[node_type]  # [N, T_ctx, H]
-                            # Efficiency: only generate steps that can be compared
-                            # against the actual future signal.  For fMRI (T_fut=17
-                            # with prediction_steps=50), generating all 50 steps
-                            # wastes 66% of predictor computation for no gain.
-                            T_total = data[node_type].x.shape[1]
-                            T_fut = T_total - T_ctx
-                            effective_steps = min(
-                                self.model.prediction_steps, max(1, T_fut)
-                            )
-                            pred_latents[node_type] = (
-                                self.model.predictor.predict_next(
-                                    h_ctx, num_steps=effective_steps
-                                )
-                            )
-                            pred_T_ctx[node_type] = T_ctx
-
-                    # ── Step 4: System-level graph propagation ────────────────
-                    if pred_latents:
-                        pred_latents = self.model.prediction_propagator(
-                            pred_latents, data
-                        )
-
-                    if pred_latents:
-                        # ── Step 5: Decode latent predictions to signal space ─
-                        # Seed pred_enc from h_ctx_dict (encoded context latents,
-                        # shape [N, T_ctx, H=hidden_channels]) rather than raw data
-                        # (shape [N, T, C=1]).  The decoder's first Conv1d expects
-                        # in_channels=hidden_channels, so starting from the raw data
-                        # would crash for any modality not overridden by pred_latents
-                        # (e.g. modalities skipped because T < _PRED_MIN_SEQ_LEN).
-                        # Starting from h_ctx_dict ensures every modality has the
-                        # correct feature dimension regardless of whether it was
-                        # predicted; the pred_T_ctx guard in Step 6 prevents those
-                        # modalities from contributing to the pred_R² metric.
-                        #
-                        # Tensor aliasing: data.clone() performs a deep copy of all
-                        # node/edge tensors (PyG HeteroData.clone() calls .clone() on
-                        # each stored tensor).  The subsequent .x assignments create
-                        # new references in pred_enc only; data is not modified.
-                        # This validate() function runs under @torch.no_grad() so
-                        # there are no gradient graphs that could be affected.
-                        pred_enc = data.clone()
-                        for nt, h_ctx in h_ctx_dict.items():
-                            pred_enc[nt].x = h_ctx   # [N, T_ctx, H] — correct H for decoder
-                        for nt, pred_lat in pred_latents.items():
-                            pred_enc[nt].x = pred_lat  # override with predicted latent
-                        # Guard: node types NOT in h_ctx_dict (T < _PRED_MIN_SEQ_LEN=4)
-                        # still carry the raw signal [N, T, C=1] from data.clone().
-                        # The decoder's Conv1d(in_channels=hidden_channels) would fail
-                        # with a channel mismatch on [N, 1, T].
-                        # This is extremely rare in practice (typical T ≈ 300 >> 4)
-                        # but could occur in short-sequence edge cases or unit tests.
-                        # Fix: remove those node types from pred_enc so the decoder
-                        # only processes nodes that have correct latent features.
-                        for nt in list(pred_enc.node_types):
-                            if nt not in h_ctx_dict:
-                                logger.debug(
-                                    f"validate: removing '{nt}' from pred_enc "
-                                    f"(T={data[nt].x.shape[1]} < _PRED_MIN_SEQ_LEN="
-                                    f"{self.model._PRED_MIN_SEQ_LEN}; raw signal "
-                                    f"would cause decoder channel mismatch)"
-                                )
-                                del pred_enc[nt]
-                        pred_signals = self.model.decoder(pred_enc)  # {nt: [N, pred_steps', C]}
-
-                        for node_type, pred_sig in pred_signals.items():
-                            if node_type not in data.node_types:
-                                continue
-                            T_ctx = pred_T_ctx.get(node_type)
-                            if T_ctx is None:
-                                continue
-                            # ── Step 6: Compare against raw future signal ─────
-                            # Uses the RAW signal (not the latent) so the metric
-                            # is interpretable in physical units (z-scored signal).
-                            future_sig = data[node_type].x[:, T_ctx:, :]  # [N, T_fut, C]
-                            n_steps = min(pred_sig.shape[1], future_sig.shape[1])
-                            if n_steps < 1:
-                                continue
-                            if pred_sig.shape[0] != future_sig.shape[0]:
-                                continue
-                            pred_aligned   = pred_sig[:, :n_steps, :]
-                            future_aligned = future_sig[:, :n_steps, :]
-                            pred_ss_res[node_type] += ((future_aligned - pred_aligned) ** 2).sum().item()
-                            pred_ss_raw[node_type] += (future_aligned ** 2).sum().item()
-                            pred_ss_sum[node_type] += future_aligned.sum().item()
-                            pred_ss_cnt[node_type] += future_aligned.numel()
+                        # ── Step 6: Compare against raw future signal ─────
+                        # Uses the RAW signal (not the latent) so the metric
+                        # is interpretable in physical units (z-scored signal).
+                        future_sig = data[node_type].x[:, T_ctx:, :]  # [N, T_fut, C]
+                        n_steps = min(pred_sig.shape[1], future_sig.shape[1])
+                        if n_steps < 1:
+                            continue
+                        if pred_sig.shape[0] != future_sig.shape[0]:
+                            continue
+                        pred_aligned   = pred_sig[:, :n_steps, :]
+                        future_aligned = future_sig[:, :n_steps, :]
+                        pred_ss_res[node_type] += ((future_aligned - pred_aligned) ** 2).sum().item()
+                        pred_ss_raw[node_type] += (future_aligned ** 2).sum().item()
+                        pred_ss_sum[node_type] += future_aligned.sum().item()
+                        pred_ss_cnt[node_type] += future_aligned.numel()
 
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
@@ -2457,8 +2456,10 @@ class GraphNativeTrainer:
                     f"  adapt step {step+1}/{num_steps}: loss={total_loss.item():.4f}"
                 )
 
-        # Restore full gradient flow and eval mode
-        self.model.subject_embed.weight.requires_grad_(False)
+        # Restore full gradient flow and eval mode.
+        # Reverses the freeze applied at the start of adapt_to_subject():
+        #   - Start: all params frozen, then subject_embed.weight selectively unfrozen
+        #   - End  : all params unfrozen (no selective step needed, the loop covers all)
         for param in self.model.parameters():
             param.requires_grad_(True)
         self.model.eval()
