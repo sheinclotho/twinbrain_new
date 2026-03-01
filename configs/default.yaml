@@ -535,7 +535,10 @@ v5_optimization:
       pred: 6.0
       recon: 1.0
       spectral: 0.5
-      cross_modal: 0.3  # 跨模态对齐任务初始权重（cross_modal_align 前缀匹配）
+      cross_modal: 0.3  # 跨模态对齐任务初始权重
+                       # AdaptiveLossBalancer 通过前缀匹配分配优先级：
+                       # name.startswith(key + '_')，因此 key='cross_modal'
+                       # 可匹配任务名 'cross_modal_align'（'cross_modal_' 前缀）。
     # 预测任务权重下限（log空间偏移量，防止自适应机制过度削减预测梯度）
     # pred 任务的 log_weight 永远不低于 log(initial_weight) - pred_weight_floor。
     # 即实际权重 ≥ initial_weight × exp(-pred_weight_floor) ≈ initial_weight × 0.6。

@@ -466,11 +466,14 @@ class GraphNativeBrainModel(nn.Module):
         # Mean-pool over nodes and time to obtain a global representation [H].
         # Cast to float32: cosine similarity with near-zero norms in float16
         # produces NaN (same issue as _pearson_loss).
+        # Cast back to the original dtype at the end so the returned scalar is
+        # compatible with the loss computation graph in AMP (float16) training.
         z_src = h_src.float().mean(dim=(0, 1))   # [H]
         z_dst = h_dst.float().mean(dim=(0, 1))   # [H]
         z_src = F.normalize(z_src, dim=0)
         z_dst = F.normalize(z_dst, dim=0)
-        return 1.0 - (z_src * z_dst).sum()
+        loss = 1.0 - (z_src * z_dst).sum()
+        return loss.to(h_src.dtype)
 
     def __init__(
         self,
@@ -808,8 +811,11 @@ class GraphNativeBrainModel(nn.Module):
         # an explicit cross-modal alignment signal that the graph edge alone
         # cannot provide (edges are topological, not embedding-space aware).
         if self.use_cross_modal_align and encoded is not None:
-            _eeg_key  = next((k for k in ('eeg',  'EEG')  if k in encoded), None)
-            _fmri_key = next((k for k in ('fmri', 'fMRI') if k in encoded), None)
+            # Node types are always lowercase throughout the codebase (see
+            # GraphNativeBrainMapper and map_*_to_graph helpers).  Use the
+            # canonical lowercase names directly.
+            _eeg_key  = 'eeg'  if 'eeg'  in encoded else None
+            _fmri_key = 'fmri' if 'fmri' in encoded else None
             if _eeg_key is not None and _fmri_key is not None:
                 losses['cross_modal_align'] = self._cross_modal_align_loss(
                     encoded[_eeg_key], encoded[_fmri_key]
@@ -903,6 +909,11 @@ class GraphNativeBrainModel(nn.Module):
                         # This focuses gradient signal on far-future steps that are
                         # harder to predict (curriculum difficulty weighting).
                         # Reference: Bengio et al. 2015 "Scheduled Sampling".
+                        #
+                        # Computed inline (not pre-cached): aligned_steps can differ
+                        # between modalities and between samples depending on T_fut.
+                        # torch.linspace + torch.exp over ~15 elements takes <1µs,
+                        # negligible vs the forward/backward passes.
                         step_w = torch.exp(
                             torch.linspace(
                                 0.0, self.pred_step_weight_gamma, aligned_steps,
