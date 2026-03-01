@@ -22,7 +22,7 @@ import sys
 import time
 from collections import defaultdict, Counter
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 import yaml
 import torch
 import numpy as np
