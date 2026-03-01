@@ -53,14 +53,81 @@ def truncate_timeseries(ts: np.ndarray, max_len: int) -> np.ndarray:
     return ts
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep-merge *override* into *base*, returning a new dict.
+
+    Nested dicts are merged recursively; all other values are replaced.
+    Neither *base* nor *override* is mutated.
+    """
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
 def load_config(config_path: str = None) -> dict:
-    """加载配置文件"""
+    """加载配置文件。
+
+    支持两种用法：
+
+    1. **完整配置**（``configs/default.yaml``）：直接加载，无合并。
+    2. **覆盖配置**（``configs/config_16gb.yaml``、``configs/config_32gb.yaml`` 等）：
+       仅包含与 ``default.yaml`` 不同的字段，自动深度合并到默认配置之上。
+       判断依据：文件中**缺少** ``data``、``model``、``training`` 三个顶级 key
+       之一，或文件包含 ``_base`` key 显式指向基准配置。
+
+    Example::
+
+        # 8GB 默认配置（完整配置）
+        python main.py --config configs/default.yaml
+
+        # 16GB 覆盖配置（自动合并 default.yaml + config_16gb.yaml）
+        python main.py --config configs/config_16gb.yaml
+
+        # 32GB 覆盖配置
+        python main.py --config configs/config_32gb.yaml
+    """
+    default_path = Path(__file__).parent / "configs" / "default.yaml"
+
     if config_path is None:
-        config_path = Path(__file__).parent / "configs" / "default.yaml"
-    
+        config_path = default_path
+
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    
+
+    # Detect overlay config: missing any of the three mandatory top-level sections,
+    # or explicitly declaring `_base`.  In either case deep-merge onto default.yaml.
+    _REQUIRED_TOP_LEVEL = {'data', 'model', 'training'}
+    _missing = _REQUIRED_TOP_LEVEL - config.keys()
+    _is_overlay = '_base' in config or bool(_missing)
+
+    if _is_overlay and Path(config_path) != default_path:
+        if _missing and '_base' not in config:
+            # Log so users can spot accidental overlay detection on malformed files.
+            logger.debug(
+                f"配置文件 {Path(config_path).name} 缺少顶级 key: {_missing}。"
+                f"视为覆盖配置并合并到 default.yaml。"
+                f"若非预期，请检查配置文件是否完整。"
+            )
+        # Resolve optional _base key; fall back to default.yaml
+        base_ref = config.pop('_base', None)
+        if base_ref:
+            base_path = Path(config_path).parent / base_ref
+        else:
+            base_path = default_path
+
+        with open(base_path, 'r', encoding='utf-8') as f:
+            base_config = yaml.safe_load(f)
+
+        config = _deep_merge(base_config, config)
+        logger.info(
+            f"📋 覆盖配置已合并：{Path(config_path).name} → {base_path.name} "
+            f"(gpu_memory={config.get('device', {}).get('gpu_memory', '?')})"
+        )
+
     return config
 
 

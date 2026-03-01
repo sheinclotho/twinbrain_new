@@ -721,16 +721,20 @@ class TwinBrainDigitalTwin:
         if self.model.num_subjects > 0 and hasattr(data, "subject_idx"):
             s_idx = data.subject_idx
             if not isinstance(s_idx, torch.Tensor):
-                s_idx = torch.tensor(s_idx, dtype=torch.long)
-            s_idx = s_idx.to(self.device).clamp(0, self.model.num_subjects - 1)
+                s_idx = torch.tensor(s_idx, dtype=torch.long, device=self.device)
+            else:
+                s_idx = s_idx.to(self.device)
+            s_idx = s_idx.clamp(0, self.model.num_subjects - 1)
             subject_embed = self.model.subject_embed(s_idx)
 
         run_embed = None
         if self.model.num_runs > 0 and hasattr(data, "run_idx") and data.run_idx is not None:
             r_idx = data.run_idx
             if not isinstance(r_idx, torch.Tensor):
-                r_idx = torch.tensor(r_idx, dtype=torch.long)
-            r_idx = r_idx.to(self.device).clamp(0, self.model.num_runs - 1)
+                r_idx = torch.tensor(r_idx, dtype=torch.long, device=self.device)
+            else:
+                r_idx = r_idx.to(self.device)
+            r_idx = r_idx.clamp(0, self.model.num_runs - 1)
             run_embed = self.model.run_embed(r_idx)
 
         if subject_embed is not None and run_embed is not None:

@@ -1,0 +1,68 @@
+# TwinBrain V5 — 32 GB GPU 配置
+# ================================
+# 适用硬件：RTX 3090 / RTX 4090 / A6000 / A100-40G / V100-32G
+# 相比 16 GB 配置的主要差异：
+#   • hidden_channels: 256 → 更大模型（表达能力提升 2×，参数量约 4×）
+#   • fmri_window_size: 100 → 更长预测视界（200s = 完整静息态 epoch）
+#   • prediction_steps: 33 → floor(100×1/3)，充分利用更大窗口的 T_fut
+#   • gradient_accumulation_steps: 1 → 单步更新
+#   • eeg_window_size: 1000 → 4s @ 250Hz，覆盖更多 theta/delta 慢节律
+#
+# 使用方法：
+#   python main.py --config configs/config_32gb.yaml
+#
+# 内存需求估算（fMRI: N=190, E=5700, H=256, float16）：
+#   窗口模式 fmri_window_size=100：峰值 ≈ 100×5700×256×2B ÷ 1024³ ≈ 276MB/张量
+#   加上 3-4 个峰值张量 ≈ 1.1 GB/step
+#   Adam 优化器状态（H=256）≈ 800-1600MB
+#   激活（无 GC）≈ 1.5-2.5 GB
+#   合计运行时峰值 ≈ 10-14 GB → 32GB GPU 安全（留 18GB 余量）
+#
+# 支持被试数：16+ 名（每名 ≈ 10-20 个窗口/epoch）
+#
+# ⚠ 若使用 A100-80G 或 H100，可进一步放大：
+#   hidden_channels: 512，fmri_window_size: 150，prediction_steps: 50
+
+# ── 模型覆盖 ──
+model:
+  # 更大隐层：表达能力 2×，适合 16+ 被试的大规模数据集
+  hidden_channels: 256
+
+  # 不分块（H=256 时单步张量约 276MB，仍在 32GB 安全范围）
+  temporal_chunk_size: null
+
+  # 更多编码器层（更深的图神经网络，捕获更高阶的空间-时间依赖）
+  num_encoder_layers: 6
+
+  # 加大预测步数：fmri T_fut = floor(100/3)=33
+  prediction_steps: 33
+
+  # 更小 dropout（大数据集过拟合风险低）
+  dropout: 0.1
+
+# ── 训练覆盖 ──
+training:
+  # 无需梯度检查点（32GB 缓存全部激活绰绰有余）
+  use_gradient_checkpointing: false
+
+  # 单步更新
+  gradient_accumulation_steps: 1
+
+  # 较小学习率（大模型更稳定）
+  learning_rate: 0.0001
+
+# ── 窗口采样覆盖 ──
+windowed_sampling:
+  # 更大 fMRI 窗口：100 TR × 2s = 200s = 更完整的静息态脑状态
+  fmri_window_size: 100
+  # 更大 EEG 窗口：1000 pts × 4ms = 4s，覆盖 theta/delta 慢节律
+  eeg_window_size: 1000
+
+# ── 设备覆盖 ──
+device:
+  type: "cuda"
+  gpu_memory: "32GB"
+  use_amp: true
+  # torch.compile 在 32GB GPU 上有明显加速（约 20-40%）
+  # 确认 Linux + Triton 安装后再启用
+  use_torch_compile: false

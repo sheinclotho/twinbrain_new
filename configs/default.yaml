@@ -856,14 +856,18 @@ output:
 device:
   # 设备类型："cuda"（GPU）/ "cpu"（CPU）/ "cuda:0"（指定 GPU）
   type: "cuda"
-  
+
   # GPU 内存规格（仅用于日志提示，不影响实际分配）
+  # ★ 这是 8GB 默认配置。更大显存请使用对应的覆盖配置：
+  #   16 GB → python main.py --config configs/config_16gb.yaml
+  #   32 GB → python main.py --config configs/config_32gb.yaml
+  # 覆盖配置会自动深度合并到此默认配置之上，只覆盖与显存相关的字段。
   gpu_memory: "8GB"
-  
+
   # 混合精度训练（AMP）——约 2× 速度提升，无精度损失
   # 建议：true（支持 CUDA 的 GPU 均推荐启用）。
   use_amp: True
-  
+
   # torch.compile()（PyTorch 2.0+，约 20–40% 加速）
   # ⚠ 需要 Triton，Windows 不支持。Linux/macOS 且确认 `import triton` 成功后再开启。
   use_torch_compile: False

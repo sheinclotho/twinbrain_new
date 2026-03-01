@@ -743,6 +743,76 @@ class GraphNativeBrainModel(nn.Module):
                 temporal_chunk_size=temporal_chunk_size,
             )
     
+    def _get_combined_embed(
+        self,
+        data: HeteroData,
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """Return the combined subject+run embedding for *data*, or None.
+
+        Centralises the three formerly-duplicated subject/run embedding lookup
+        blocks that existed in ``forward()``, ``simulate_intervention()``, and
+        ``compute_effective_connectivity()``.
+
+        Design rules:
+        * Index tensors are created directly on *device* to avoid a CPU→GPU
+          transfer that occurred when ``torch.tensor()`` was called without
+          a ``device`` argument and then moved with ``.to(device)`` afterwards.
+        * If *device* is None the device is inferred from the embedding weights
+          (i.e. wherever the model lives).
+        * Out-of-range subject indices emit a one-time warning and are clamped
+          (stale-cache protection: see AGENTS.md §三 "缓存命中路径 continue 绕过必要副作用").
+
+        Args:
+            data: HeteroData window carrying optional ``subject_idx`` / ``run_idx``.
+            device: Target device for index tensors.  Defaults to the device of
+                ``self.subject_embed`` or ``self.run_embed`` weights.
+
+        Returns:
+            Combined [H] embedding tensor, or ``None`` when both embeddings are
+            disabled (backward-compatible — encoder handles ``None`` gracefully).
+        """
+        if device is None:
+            if self.num_subjects > 0:
+                device = self.subject_embed.weight.device
+            elif self.num_runs > 0:
+                device = self.run_embed.weight.device
+
+        subject_embed: Optional[torch.Tensor] = None
+        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
+            s_idx = data.subject_idx
+            if not isinstance(s_idx, torch.Tensor):
+                s_idx = torch.tensor(s_idx, dtype=torch.long, device=device)
+            else:
+                s_idx = s_idx.to(device)
+            s_val = s_idx.item()  # one CPU sync; reused for check and warning message
+            if s_val < 0 or s_val >= self.num_subjects:
+                logger.warning(
+                    f"subject_idx={s_val} out of range [0, {self.num_subjects - 1}]. "
+                    f"Likely a stale graph cache (num_subjects changed).  "
+                    f"Clear the cache and re-run to fix.  Falling back to subject 0."
+                )
+                s_idx = s_idx.clamp(0, self.num_subjects - 1)
+            subject_embed = self.subject_embed(s_idx)  # [H]
+
+        run_embed: Optional[torch.Tensor] = None
+        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
+            r_idx = data.run_idx
+            if not isinstance(r_idx, torch.Tensor):
+                r_idx = torch.tensor(r_idx, dtype=torch.long, device=device)
+            else:
+                r_idx = r_idx.to(device)
+            r_idx = r_idx.clamp(0, self.num_runs - 1)
+            run_embed = self.run_embed(r_idx)  # [H]
+
+        # Additive decomposition: subject (who) + run (when).
+        # Either or both may be None; encoder handles None gracefully.
+        if subject_embed is not None and run_embed is not None:
+            return subject_embed + run_embed
+        if run_embed is not None:
+            return run_embed
+        return subject_embed  # may be None
+
     def forward(
         self,
         data: HeteroData,
@@ -780,51 +850,10 @@ class GraphNativeBrainModel(nn.Module):
                     raise ValueError(f"Inf detected in {node_type} input")
         
         # 1. Encode: Graph-native spatial-temporal encoding
-        # Subject embedding (AGENTS.md §九 Gap 2):
-        # If num_subjects > 0 and data carries a subject_idx scalar, look up the
-        # per-subject [H] offset and pass it to the encoder.  The encoder adds it
-        # to all node features after input projection, capturing individual brain
-        # differences while sharing the rest of the model weights.
-        subject_embed = None
-        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
-            s_idx = data.subject_idx
-            if not isinstance(s_idx, torch.Tensor):
-                s_idx = torch.tensor(s_idx, dtype=torch.long)
-            # Validate range; out-of-range usually means a stale cache was loaded
-            # after num_subjects changed — warn instead of silently remapping.
-            if s_idx.item() < 0 or s_idx.item() >= self.num_subjects:
-                logger.warning(
-                    f"subject_idx={s_idx.item()} out of range [0, {self.num_subjects-1}]. "
-                    f"This likely means a cached graph was built with a different "
-                    f"num_subjects.  Clearing the graph cache and re-running will fix this. "
-                    f"Falling back to subject 0 for this sample."
-                )
-                s_idx = s_idx.clamp(0, self.num_subjects - 1)
-            subject_embed = self.subject_embed(s_idx)  # [H]
-
-        # 会话/run 嵌入 (V5.44, 跨会话预测支持)
-        # run_embed captures session-level drift additive to subject_embed.
-        # Added as offset AFTER subject_embed so the two form an additive
-        # decomposition: subject (who) + run (when) → combined latent context.
-        run_embed = None
-        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
-            r_idx = data.run_idx
-            if not isinstance(r_idx, torch.Tensor):
-                r_idx = torch.tensor(r_idx, dtype=torch.long)
-            if r_idx.item() < 0 or r_idx.item() >= self.num_runs:
-                r_idx = r_idx.clamp(0, self.num_runs - 1)
-            run_embed = self.run_embed(r_idx)  # [H]
-
-        # Combine subject + run embeddings: additive decomposition.
-        # subject_embed: stable individual identity (who the brain belongs to).
-        # run_embed:     transient session state (when / in what condition).
-        # Either or both may be None (backward-compatible with older checkpoints).
-        if subject_embed is not None and run_embed is not None:
-            combined_embed = subject_embed + run_embed
-        elif run_embed is not None:
-            combined_embed = run_embed
-        else:
-            combined_embed = subject_embed  # may be None — encoder handles None
+        # Combined subject+run embedding (personalisation, V5.19/V5.44).
+        # Extracted into _get_combined_embed() to eliminate three formerly-
+        # duplicated ~20-line blocks across forward/simulate/EC methods.
+        combined_embed = self._get_combined_embed(data)
 
         encoded_data = self.encoder(data, subject_embed=combined_embed)
         
@@ -926,27 +955,9 @@ class GraphNativeBrainModel(nn.Module):
         device = next(self.parameters()).device
         data = data.to(device)
 
-        # Assemble combined embedding (subject + run) for personalized simulation
-        subject_embed = None
-        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
-            s_idx = data.subject_idx
-            if not isinstance(s_idx, torch.Tensor):
-                s_idx = torch.tensor(s_idx, dtype=torch.long)
-            subject_embed = self.subject_embed(s_idx.clamp(0, self.num_subjects - 1).to(device))
-
-        run_embed = None
-        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
-            r_idx = data.run_idx
-            if not isinstance(r_idx, torch.Tensor):
-                r_idx = torch.tensor(r_idx, dtype=torch.long)
-            run_embed = self.run_embed(r_idx.clamp(0, self.num_runs - 1).to(device))
-
-        if subject_embed is not None and run_embed is not None:
-            combined_embed = subject_embed + run_embed
-        elif run_embed is not None:
-            combined_embed = run_embed
-        else:
-            combined_embed = subject_embed
+        # Combined subject+run embedding (personalisation) — uses helper to
+        # eliminate the formerly-duplicated ~15-line block.
+        combined_embed = self._get_combined_embed(data, device=device)
 
         # 1. Encode baseline
         encoded_data = self.encoder(data, subject_embed=combined_embed)
@@ -1095,21 +1106,9 @@ class GraphNativeBrainModel(nn.Module):
                 f"Use a longer time window."
             )
 
-        # Build subject/run embeddings once (shared across all perturbations)
-        combined_embed = None
-        if self.num_subjects > 0 and hasattr(data, 'subject_idx') and data.subject_idx is not None:
-            s_idx = data.subject_idx
-            if not isinstance(s_idx, torch.Tensor):
-                s_idx = torch.tensor(s_idx, dtype=torch.long)
-            subject_embed = self.subject_embed(s_idx.clamp(0, self.num_subjects - 1).to(device))
-            combined_embed = subject_embed
-
-        if self.num_runs > 0 and hasattr(data, 'run_idx') and data.run_idx is not None:
-            r_idx = data.run_idx
-            if not isinstance(r_idx, torch.Tensor):
-                r_idx = torch.tensor(r_idx, dtype=torch.long)
-            run_embed = self.run_embed(r_idx.clamp(0, self.num_runs - 1).to(device))
-            combined_embed = (combined_embed + run_embed) if combined_embed is not None else run_embed
+        # Combined subject+run embedding (shared across all N perturbations) —
+        # uses helper to eliminate the formerly-duplicated ~15-line block.
+        combined_embed = self._get_combined_embed(data, device=device)
 
         # Encode baseline once
         encoded_data = self.encoder(data, subject_embed=combined_embed)
