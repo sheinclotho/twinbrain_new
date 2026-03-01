@@ -177,13 +177,47 @@ class SpatialTemporalGraphConv(MessagePassing):
         # None = no chunking (full T, original behaviour).
         self.temporal_chunk_size = temporal_chunk_size
         
-        # Temporal convolution (processes time dimension)
+        # Multi-scale temporal convolution: two parallel paths with different
+        # temporal receptive fields, fused via a learnable gate.
+        #
+        # Fast path (local context):  kernel_size=k, dilation=1
+        #   Captures rapid dynamics: EEG gamma/beta (12–28ms @ 250Hz).
+        #   Receptive field = k steps.
+        #
+        # Slow path (wider context):  same kernel_size, dilation=3
+        #   Captures slow oscillations: EEG alpha/theta (28–60ms), fMRI HRF (~14s).
+        #   Effective kernel span = dilation * (k−1) + 1 = 3*2+1 = 7 steps for k=3.
+        #   Padding = dilation * (k // 2) to preserve temporal length.
+        #
+        # Learnable gate sigmoid(temporal_scale_gate):
+        #   0.5 at init (equal mix) → learned optimally during training.
+        #   If the task is primarily high-frequency (e.g. gamma EEG), gate → 1.
+        #   If the task is primarily low-frequency (e.g. alpha EEG, fMRI BOLD), gate → 0.
+        #
+        # Scientific motivation:
+        #   Neural oscillations span multiple timescales simultaneously:
+        #   gamma (30–80Hz), beta (13–30Hz), alpha (8–12Hz), theta (4–7Hz).
+        #   A single-scale conv must choose one receptive field; multi-scale captures
+        #   all bands in parallel (cf. Inception networks, Szegedy et al. 2015).
+        #   Reference: Wang et al. (2017) "Time Series Classification from Scratch
+        #   with Deep Neural Networks: A Strong Baseline" IJCNN.
         self.temporal_conv = nn.Conv1d(
             in_channels,
             out_channels,
             kernel_size=temporal_kernel_size,
             padding=temporal_kernel_size // 2,
         )
+        # Dilated slow-path conv: same kernel but 3× wider temporal window.
+        _dilation = 3
+        self.temporal_conv_slow = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size=temporal_kernel_size,
+            padding=_dilation * (temporal_kernel_size // 2),
+            dilation=_dilation,
+        )
+        # Learnable gate logit: sigmoid(0) = 0.5 → equal fast/slow mix at init.
+        self.temporal_scale_gate = nn.Parameter(torch.zeros(1))
         
         # Apply spectral normalization to linear layers for training stability
         if use_spectral_norm:
@@ -253,10 +287,14 @@ class SpatialTemporalGraphConv(MessagePassing):
         N_src = N  # x is always the source tensor
         N_dst = size[1] if size is not None else N
 
-        # 1. Temporal convolution (all T timesteps at once — already vectorised)
-        x_t = x.permute(0, 2, 1)          # [N_src, C_in, T]
-        x_t = self.temporal_conv(x_t)     # [N_src, C_out, T]
-        x_t = x_t.permute(0, 2, 1)        # [N_src, T, C_out]
+        # 1. Multi-scale temporal convolution (all T timesteps at once — vectorised).
+        #    Fast path captures local dynamics; slow (dilated) path captures long-range
+        #    oscillations.  A learnable gate interpolates between the two.
+        x_conv_in  = x.permute(0, 2, 1)                              # [N_src, C_in, T]
+        x_fast     = self.temporal_conv(x_conv_in)                   # [N_src, C_out, T]
+        x_slow     = self.temporal_conv_slow(x_conv_in)              # [N_src, C_out, T]
+        gate       = torch.sigmoid(self.temporal_scale_gate)         # scalar ∈ (0, 1)
+        x_t        = (gate * x_fast + (1.0 - gate) * x_slow).permute(0, 2, 1)  # [N_src, T, C_out]
 
         # 2. Chunked spatial message passing across T timesteps.
         #

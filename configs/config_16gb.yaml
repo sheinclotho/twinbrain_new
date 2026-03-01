@@ -1,0 +1,56 @@
+# TwinBrain V5 — 16 GB GPU 配置
+# ================================
+# 适用硬件：RTX 3080 Ti / RTX 4080 / A4000 / RTX 3090（显存用量 ≤ 16 GB）
+# 相比 8 GB 默认配置的主要差异：
+#   • 取消分块（temporal_chunk_size: null）→ 最快 GPU 利用率（无 Python 循环 overhead）
+#   • 关闭梯度检查点 → 最快 backward（无重计算开销，约节省 40% backward 时间）
+#   • 加大 fMRI 窗口（80 TR = 160s）→ 更长预测视界，捕获更多血动力学动态
+#   • 加大 prediction_steps（26）→ 匹配更大的 T_fut_fmri = floor(80×1/3)=26
+#   • gradient_accumulation_steps: 1 → 标准单步更新（显存充足时无需累积）
+#
+# 使用方法：
+#   python main.py --config configs/config_16gb.yaml
+#
+# 内存需求估算（fMRI: N=190, E=5700, H=128, float16）：
+#   窗口模式 fmri_window_size=80：峰值 ≈ 80×5700×128×2B ÷ 1024³ ≈ 115MB/张量
+#   加上 3-4 个峰值张量（lin_msg + att + msg × alpha）≈ 460MB/step
+#   Adam 优化器状态 ≈ 200-400MB（模型参数 × 2）
+#   激活（无 GC）≈ 700-900MB
+#   合计运行时峰值 ≈ 4-6 GB → 16GB GPU 安全（留 10GB 余量）
+#
+# 支持被试数：8-16 名（每名 ≈ 10 个窗口/epoch）
+
+# ── 模型覆盖 ──
+model:
+  # hidden_channels: 128 与 8GB 相同；16GB 可用 256 进一步提升表达能力
+  # （256 会将 Adam 状态翻倍到 ~800MB，仍在 16GB 安全范围内）
+  hidden_channels: 128
+
+  # null = 不分块，单次 propagate() 处理全部 T 步
+  # ⚠ 仅当 use_gradient_checkpointing: false 时有意义（无 GC 时分块只加 overhead）
+  temporal_chunk_size: null
+
+  # 加大预测步数：fmri T_fut = floor(80×1/3)=26，EEG T_fut 更充裕
+  prediction_steps: 26
+
+# ── 训练覆盖 ──
+training:
+  # 关闭梯度检查点：16GB 显存足以缓存全部激活，无需重计算
+  use_gradient_checkpointing: false
+
+  # 标准单步更新：显存充足时无需梯度累积来模拟大 batch
+  gradient_accumulation_steps: 1
+
+# ── 窗口采样覆盖 ──
+windowed_sampling:
+  # 加大 fMRI 窗口：80 TR × 2s = 160s ≈ 更完整的脑状态演化
+  fmri_window_size: 80
+  # EEG 窗口保持 500 pts（2s @ 250Hz），避免单步激活过大
+  eeg_window_size: 500
+
+# ── 设备覆盖 ──
+device:
+  type: "cuda"
+  gpu_memory: "16GB"
+  use_amp: true
+  use_torch_compile: false

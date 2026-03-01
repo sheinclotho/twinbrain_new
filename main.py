@@ -53,14 +53,81 @@ def truncate_timeseries(ts: np.ndarray, max_len: int) -> np.ndarray:
     return ts
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep-merge *override* into *base*, returning a new dict.
+
+    Nested dicts are merged recursively; all other values are replaced.
+    Neither *base* nor *override* is mutated.
+    """
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
 def load_config(config_path: str = None) -> dict:
-    """加载配置文件"""
+    """加载配置文件。
+
+    支持两种用法：
+
+    1. **完整配置**（``configs/default.yaml``）：直接加载，无合并。
+    2. **覆盖配置**（``configs/config_16gb.yaml``、``configs/config_32gb.yaml`` 等）：
+       仅包含与 ``default.yaml`` 不同的字段，自动深度合并到默认配置之上。
+       判断依据：文件中**缺少** ``data``、``model``、``training`` 三个顶级 key
+       之一，或文件包含 ``_base`` key 显式指向基准配置。
+
+    Example::
+
+        # 8GB 默认配置（完整配置）
+        python main.py --config configs/default.yaml
+
+        # 16GB 覆盖配置（自动合并 default.yaml + config_16gb.yaml）
+        python main.py --config configs/config_16gb.yaml
+
+        # 32GB 覆盖配置
+        python main.py --config configs/config_32gb.yaml
+    """
+    default_path = Path(__file__).parent / "configs" / "default.yaml"
+
     if config_path is None:
-        config_path = Path(__file__).parent / "configs" / "default.yaml"
-    
+        config_path = default_path
+
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    
+
+    # Detect overlay config: missing any of the three mandatory top-level sections,
+    # or explicitly declaring `_base`.  In either case deep-merge onto default.yaml.
+    _REQUIRED_TOP_LEVEL = {'data', 'model', 'training'}
+    _missing = _REQUIRED_TOP_LEVEL - config.keys()
+    _is_overlay = '_base' in config or bool(_missing)
+
+    if _is_overlay and Path(config_path) != default_path:
+        if _missing and '_base' not in config:
+            # Log so users can spot accidental overlay detection on malformed files.
+            logger.debug(
+                f"配置文件 {Path(config_path).name} 缺少顶级 key: {_missing}。"
+                f"视为覆盖配置并合并到 default.yaml。"
+                f"若非预期，请检查配置文件是否完整。"
+            )
+        # Resolve optional _base key; fall back to default.yaml
+        base_ref = config.pop('_base', None)
+        if base_ref:
+            base_path = Path(config_path).parent / base_ref
+        else:
+            base_path = default_path
+
+        with open(base_path, 'r', encoding='utf-8') as f:
+            base_config = yaml.safe_load(f)
+
+        config = _deep_merge(base_config, config)
+        logger.info(
+            f"📋 覆盖配置已合并：{Path(config_path).name} → {base_path.name} "
+            f"(gpu_memory={config.get('device', {}).get('gpu_memory', '?')})"
+        )
+
     return config
 
 
@@ -944,6 +1011,8 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         use_cross_modal_align=config['model'].get('use_cross_modal_align', True),
         pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
         num_runs=effective_num_runs,
+        use_info_nce=config['model'].get('use_info_nce', True),
+        info_nce_temperature=config['model'].get('info_nce_temperature', 0.1),
     )
 
     if num_subjects > 0:
@@ -1342,7 +1411,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         (e.g. pred_r2 requested but prediction disabled), preventing mixed
         comparison between negated-R² scores and raw val_loss values."""
         if _criterion == 'pred_r2':
-            _vals = [v for k, v in r2.items() if k.startswith('pred_r2_')]
+            _vals = [v for k, v in r2.items() if k.startswith('pred_r2_') and '_h1_' not in k]
             return -sum(_vals) / len(_vals) if _vals else float('inf')
         return vl  # 'val_loss'
 
@@ -1434,7 +1503,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
             # Format R² values for logging — separate reconstruction from prediction.
             # Prediction R² (pred_r2_*) is the primary quality indicator and is
             # shown first, followed by reconstruction R² (r2_*).
-            _pred_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_')}
+            # Primary metrics: pred_r2 (full-horizon) and recon R² for the epoch log line.
+            # Exclude h1 from the main display to keep it readable; show separately below.
+            _pred_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_') and '_h1_' not in k}
             _recon_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('r2_')}
             _pred_r2_str  = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_pred_r2_items.items()))
             _recon_r2_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_recon_r2_items.items()))
@@ -1445,11 +1516,25 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 f"{_r2_display}, "
                 f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
+            # Scientific diagnostics: ar1_r2, decorr, pred_r2_h1 (logged at DEBUG to keep INFO clean)
+            # decorr > 0 means TwinBrain outperforms the trivial AR(1) autocorrelation baseline.
+            _decorr_items = {k: v for k, v in r2_dict.items() if k.startswith('decorr_')}
+            _ar1_items    = {k: v for k, v in r2_dict.items() if k.startswith('ar1_r2_')}
+            _h1_items     = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_h1_')}
+            if _decorr_items:
+                _decorr_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_decorr_items.items()))
+                _ar1_str    = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_ar1_items.items()))
+                _h1_str     = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_h1_items.items()))
+                logger.debug(
+                    f"  📐 超NPI指标: {_decorr_str}  {_ar1_str}  {_h1_str}"
+                )
 
             # ── R² < 0 警报：模型差于均值基线时明确告警 ─────────────────
             for _r2k, _r2v in r2_dict.items():
-                if _r2v < 0.0:
-                    _is_pred = _r2k.startswith('pred_r2_')
+                # ar1_r2 can legitimately be near zero or negative (data property, not model failure).
+                # decorr can be negative (means model ≤ AR(1) baseline — IS a meaningful warning).
+                if _r2v < 0.0 and not _r2k.startswith('ar1_r2_'):
+                    _is_pred = _r2k.startswith('pred_r2_') or _r2k.startswith('decorr_')
                     _metric_desc = "预测能力" if _is_pred else "重建效果"
                     logger.warning(
                         f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"

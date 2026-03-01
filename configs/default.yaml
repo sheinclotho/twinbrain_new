@@ -332,6 +332,19 @@ model:
   #        注意：启用后，若需加载旧 checkpoint 需指定 strict=False。
   use_run_embed: false
 
+  # InfoNCE对比预测损失（V5.47 突破性改进）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 在MSE/Huber回归损失之外，增加信息噪声对比估计(InfoNCE)损失。
+  # 核心作用：防止"均值预测崩塌"——模型通过预测未来信号的无条件均值来
+  # 最小化MSE（低MSE但pred_r2≤0）。InfoNCE要求模型在所有(节点×时间步)
+  # 候选中识别出正确的未来表示，迫使预测头产生可区分的特异性表示。
+  # 科学类比：与CLIP(视觉-语言对比学习)和wav2vec 2.0(语音对比学习)相同原理。
+  # 参考文献：Oord et al. (2018) CPC; Baevski et al. (2020) wav2vec 2.0.
+  use_info_nce: true
+  # InfoNCE温度参数τ（越小=越判别性，但更难优化）
+  # 0.1 = 标准值（SimCLR/wav2vec默认），适合脑信号数据。
+  info_nce_temperature: 0.1
+
 # ──────────────────────────────────────────────────────────────────────────
 # 三、训练配置
 # ──────────────────────────────────────────────────────────────────────────
@@ -615,6 +628,7 @@ v5_optimization:
     # 在有限梯度预算下须明确优先，防止重建任务随训练积累而挤占预测梯度。
     task_priorities:
       pred: 6.0
+      pred_nce: 4.0   # InfoNCE对比预测（V5.47新增）
       recon: 1.0
       spectral: 0.5
       cross_modal: 0.3  # 跨模态对齐任务初始权重
@@ -842,14 +856,18 @@ output:
 device:
   # 设备类型："cuda"（GPU）/ "cpu"（CPU）/ "cuda:0"（指定 GPU）
   type: "cuda"
-  
+
   # GPU 内存规格（仅用于日志提示，不影响实际分配）
+  # ★ 这是 8GB 默认配置。更大显存请使用对应的覆盖配置：
+  #   16 GB → python main.py --config configs/config_16gb.yaml
+  #   32 GB → python main.py --config configs/config_32gb.yaml
+  # 覆盖配置会自动深度合并到此默认配置之上，只覆盖与显存相关的字段。
   gpu_memory: "8GB"
-  
+
   # 混合精度训练（AMP）——约 2× 速度提升，无精度损失
   # 建议：true（支持 CUDA 的 GPU 均推荐启用）。
   use_amp: True
-  
+
   # torch.compile()（PyTorch 2.0+，约 20–40% 加速）
   # ⚠ 需要 Triton，Windows 不支持。Linux/macOS 且确认 `import triton` 成功后再开启。
   use_torch_compile: False
