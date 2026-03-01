@@ -398,12 +398,13 @@ training:
   #     因此无 GC 时分块仅增加 Python overhead，无任何内存收益（V5.45 设计意图）。
   #
   # 建议：
-  #   8GB GPU 且 GPU 利用率 < 50%（如 allocated < 2GB）→ false（最快，无重计算）
-  #   遭遇 CUDA OOM → true + temporal_chunk_size=64（真正分块节省显存）
-  #   注意：若仅设 true 但 temporal_chunk_size=null，虽减少峰值但无分块加速；
+  #   8GB GPU（默认）→ true（EEG T=500 backward 激活 4层×3边×12块 ≈ 2.9GB；GC 将峰值降至 ~230MB）
+  #   遭遇 CUDA OOM 且 true 不足 → true + temporal_chunk_size=64（真正分块节省显存）
+  #   16GB/32GB GPU 且确认无 OOM → false（无重计算，最快）
+  #   注意：若仅设 true 但 temporal_chunk_size=null，单次 GC 调用已减少峰值（无 Python overhead）；
   #         若仅设 temporal_chunk_size=64 但 use_gradient_checkpointing=false，
   #         分块仅增加 Python overhead，无内存收益（V5.45 规则）。
-  use_gradient_checkpointing: false  # 推荐 false；GPU 利用率低时最快；OOM 时改为 true
+  use_gradient_checkpointing: true   # 默认 true（8GB GPU OOM 安全）；16GB+ 无 OOM 可改 false 提速
 
   # 最大序列长度（单样本模式，windowed_sampling.enabled: false）
   # ─────────────────────────────────────────────────────────────
@@ -845,25 +846,27 @@ output:
 # 八、设备配置
 # ──────────────────────────────────────────────────────────────────────────
 #
-# ★ GPU 内存配置速查表（V5.48 更新）
+# ★ GPU 内存配置速查表（V5.49 更新）
 # ─────────────────────────────────────────────────────────────────────────
-# 速度最优原则（8GB+ GPU，当前默认）：
-#   model.temporal_chunk_size: null           ← 最快（无分块循环）
-#   training.use_gradient_checkpointing: false ← 最快（无重计算）
-#
-# ⚠ 8GB GPU（RTX 3070 / RTX 4070 等）当前默认（速度优先，OOM 风险低）：
-#   model.temporal_chunk_size: null           ← 单次 propagate（无 Python overhead）
-#   training.use_gradient_checkpointing: false ← 无重计算（最快）
+# ⚠ 8GB GPU（RTX 3070 / RTX 4070 等）当前默认（安全优先）：
+#   model.temporal_chunk_size: null            ← 单次 propagate（无 Python overhead）
+#   training.use_gradient_checkpointing: true  ← GC 减少 backward 峰值内存（+40% 时间）
 #   windowed_sampling.enabled: true（已启用）
 #   windowed_sampling.fmri_window_size: 50
 #   training.gradient_accumulation_steps: 4
 #   → 支持 4-8 被试 × 约 5 窗口/被试 ≈ 20-40 样本/epoch
-#   → 显存估算：peak ≈ 0.18GB（模型）+ 0.36GB（激活）≈ 0.54GB 总峰值（8GB GPU 安全）
+#   → 显存估算：EEG T=500 backward 峰值 ≈ 230MB（单次 GC 重计算）而非无 GC 的 ~2.9GB
+#   → 为何需要 GC=true：4层×3边=12次 propagate()，每次存 T×E×H≈230MB；无 GC 时总存储
+#     ≈12×230MB=2.7GB，加上模型参数/优化器/其他 → 超出 8GB GPU 显存 → backward OOM。
+#
+# 速度最优（16GB+ GPU 且确认无 OOM）：
+#   model.temporal_chunk_size: null            ← 最快（无分块循环）
+#   training.use_gradient_checkpointing: false ← 最快（无重计算）
 #
 # ⚠ V5.47 的错误配置（已修复）：
 #   temporal_chunk_size: 64 + use_gradient_checkpointing: true =
 #   EEG T=500, 4层×3边×8块 = 96 forward + 96 recompute = 192 propagate() 调用/step
-#   vs 正确配置（null+false）: 4×3×1 = 12 调用 → 16× 更慢
+#   vs 最快配置（null+false）: 4×3×1 = 12 调用 → 16× 更慢
 #
 # 8GB GPU，遭遇 CUDA OOM 时（逐步回退）：
 #   1. 启用 training.use_gradient_checkpointing: true（约 +40% 时间，峰值显存约 -40%）
