@@ -687,9 +687,9 @@ class TwinBrainDigitalTwin:
                 _, _, encoded = self.model(window, return_encoded=True)
             if modality in encoded:
                 h = encoded[modality]  # [N, T, H]
-                # Mean-pool H → [N, T] activation time series
-                act = h.mean(dim=-1)   # [N, T]
-                all_latents.append(act)
+                # Mean-pool latent dim H → per-node temporal activation series [N, T]
+                node_ts = h.mean(dim=-1)   # [N, T]: one time series per brain region
+                all_latents.append(node_ts)
 
         if not all_latents:
             raise RuntimeError(f"No valid windows for FC computation of '{modality}'.")

@@ -290,11 +290,11 @@ class SpatialTemporalGraphConv(MessagePassing):
         # 1. Multi-scale temporal convolution (all T timesteps at once — vectorised).
         #    Fast path captures local dynamics; slow (dilated) path captures long-range
         #    oscillations.  A learnable gate interpolates between the two.
-        _xc    = x.permute(0, 2, 1)                           # [N_src, C_in, T]
-        _xfast = self.temporal_conv(_xc)                      # [N_src, C_out, T]
-        _xslow = self.temporal_conv_slow(_xc)                 # [N_src, C_out, T]
-        _gate  = torch.sigmoid(self.temporal_scale_gate)      # scalar ∈ (0, 1)
-        x_t    = (_gate * _xfast + (1.0 - _gate) * _xslow).permute(0, 2, 1)  # [N_src, T, C_out]
+        x_conv_in  = x.permute(0, 2, 1)                              # [N_src, C_in, T]
+        x_fast     = self.temporal_conv(x_conv_in)                   # [N_src, C_out, T]
+        x_slow     = self.temporal_conv_slow(x_conv_in)              # [N_src, C_out, T]
+        gate       = torch.sigmoid(self.temporal_scale_gate)         # scalar ∈ (0, 1)
+        x_t        = (gate * x_fast + (1.0 - gate) * x_slow).permute(0, 2, 1)  # [N_src, T, C_out]
 
         # 2. Chunked spatial message passing across T timesteps.
         #

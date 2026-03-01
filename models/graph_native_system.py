@@ -533,7 +533,7 @@ class GraphNativeBrainModel(nn.Module):
         # Flatten and L2-normalise for cosine similarity.
         # Cast to float32: cosine similarity with float16 and near-zero norms
         # can produce NaN (same issue as _pearson_loss, _cross_modal_align_loss).
-        pred_flat   = F.normalize(pred.float().reshape(n_items, H), dim=-1)          # [n_items, H]
+        pred_flat   = F.normalize(pred.float().reshape(n_items, H), dim=-1)   # [n_items, H]
         # Detach target: it is fixed supervision (analogous to a label).
         # Gradients flow only through pred, not through target.
         target_flat = F.normalize(target.detach().float().reshape(n_items, H), dim=-1)  # [n_items, H]
@@ -1146,7 +1146,7 @@ class GraphNativeBrainModel(nn.Module):
 
         # Compute per-node perturbation direction: unit vector along mean latent
         h_mod = h_baseline[modality]                   # [N, T, H]
-        node_stds = h_mod.std(dim=(1,)).clamp(min=1e-6)  # [N, H]
+        node_stds = h_mod.std(dim=1).clamp(min=1e-6)        # [N, H]
         node_means = h_mod.mean(dim=1)                   # [N, H]
         norms = node_means.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # [N, 1]
         node_directions = node_means / norms             # [N, H]  unit direction
@@ -1155,7 +1155,7 @@ class GraphNativeBrainModel(nn.Module):
             # Perturb region i: add delta in the node's principal direction
             h_pert = {nt: h.clone() for nt, h in h_baseline.items()}
             delta_vec = node_directions[i] * perturbation_strength * node_stds[i].mean()
-            h_pert[modality][i, :, :] += delta_vec.view(1, -1)  # broadcast over T
+            h_pert[modality][i, :, :] += delta_vec.view(1, 1, -1)  # [1, 1, H] → broadcast over [T, H]
 
             # Predict perturbed future
             pred_pert: Dict[str, torch.Tensor] = {}
@@ -1171,8 +1171,8 @@ class GraphNativeBrainModel(nn.Module):
             # Causal effect at modality: perturbed - baseline
             if modality in sig_pert and modality in sig_baseline:
                 effect = sig_pert[modality] - sig_baseline[modality]  # [N, steps, C]
-                # Mean over time and channels → scalar per region [N]
-                ec_column = effect.mean(dim=(1, 2))  # [N]
+                # Mean causal effect over time and channels → scalar per region [N]
+                ec_column = effect.mean(dim=(1, 2))  # [N]: averaged over steps and C
                 if signed:
                     ec_matrix[:, i] = ec_column
                 else:
@@ -1807,6 +1807,8 @@ class GraphNativeTrainer:
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
                     task_names.append(f'pred_sig_{node_type}')
+                # getattr fallback: supports loading pre-V5.47 checkpoints where
+                # model.use_info_nce may not yet exist as an instance attribute.
                 if getattr(model, 'use_info_nce', False):
                     task_names.append(f'pred_nce_{node_type}')
             # cross_modal_align is added in V5.43: aligns mean EEG and fMRI
