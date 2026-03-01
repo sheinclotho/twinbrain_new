@@ -70,6 +70,25 @@ v5_optimization:
 | `TwinBrainDigitalTwin.compute_model_fc()` | 模型 FC 矩阵计算 | V5.47 |
 | `main.py` | 传递 `use_info_nce`、`info_nce_temperature` | V5.47 |
 
+### V5.47 新增：超越NPI的科学指标体系
+
+**科学背景**：NPI（Luo et al. 2025, Nature Methods）使用3 TR预测1 TR，声称"3→1准确率最高"。
+BOLD信号在TR=2s时高度自相关（ρ≈0.85-0.95），AR(1)基线可免费获得R²≈0.7-0.9（h=1步）。
+
+**新增评估维度**（`validate()`函数扩展）：
+
+| 新指标 | 计算方法 | 科学含义 |
+|--------|----------|---------|
+| `ar1_r2_<nt>` | 以最后观测值预测所有未来步 | BOLD自相关的"免费"R²上限 |
+| `decorr_<nt>` | (pred_r2 - ar1_r2) / (1 - ar1_r2) | 超越自相关的真实预测能力 |
+| `pred_r2_h1_<nt>` | 仅第1预测步的R² | 与NPI 3→1直接可比 |
+
+**TwinBrain的超越依据**：
+- 预测33 TR上下文 → 17步未来（vs NPI的3→1），捕获真实神经动力学
+- decorr > 0.15 at h>1步 → 证明不只是利用自相关
+- Graph-native（GNN）架构保留空间连通性（NPI用MLP/RNN忽略图结构）
+- 多模态EEG+fMRI联合预测（NPI仅fMRI）
+
 ---
 
 ## [V5.46] 2026-03-01 — 模态特异性 R² 标准 + 文献引用

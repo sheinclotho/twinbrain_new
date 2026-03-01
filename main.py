@@ -1344,7 +1344,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         (e.g. pred_r2 requested but prediction disabled), preventing mixed
         comparison between negated-R² scores and raw val_loss values."""
         if _criterion == 'pred_r2':
-            _vals = [v for k, v in r2.items() if k.startswith('pred_r2_')]
+            _vals = [v for k, v in r2.items() if k.startswith('pred_r2_') and '_h1_' not in k]
             return -sum(_vals) / len(_vals) if _vals else float('inf')
         return vl  # 'val_loss'
 
@@ -1436,7 +1436,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
             # Format R² values for logging — separate reconstruction from prediction.
             # Prediction R² (pred_r2_*) is the primary quality indicator and is
             # shown first, followed by reconstruction R² (r2_*).
-            _pred_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_')}
+            # Primary metrics: pred_r2 (full-horizon) and recon R² for the epoch log line.
+            # Exclude h1 from the main display to keep it readable; show separately below.
+            _pred_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_') and '_h1_' not in k}
             _recon_r2_items = {k: v for k, v in r2_dict.items() if k.startswith('r2_')}
             _pred_r2_str  = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_pred_r2_items.items()))
             _recon_r2_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_recon_r2_items.items()))
@@ -1447,11 +1449,25 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 f"{_r2_display}, "
                 f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
+            # Scientific diagnostics: ar1_r2, decorr, pred_r2_h1 (logged at DEBUG to keep INFO clean)
+            # decorr > 0 means TwinBrain outperforms the trivial AR(1) autocorrelation baseline.
+            _decorr_items = {k: v for k, v in r2_dict.items() if k.startswith('decorr_')}
+            _ar1_items    = {k: v for k, v in r2_dict.items() if k.startswith('ar1_r2_')}
+            _h1_items     = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_h1_')}
+            if _decorr_items:
+                _decorr_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_decorr_items.items()))
+                _ar1_str    = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_ar1_items.items()))
+                _h1_str     = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_h1_items.items()))
+                logger.debug(
+                    f"  📐 超NPI指标: {_decorr_str}  {_ar1_str}  {_h1_str}"
+                )
 
             # ── R² < 0 警报：模型差于均值基线时明确告警 ─────────────────
             for _r2k, _r2v in r2_dict.items():
-                if _r2v < 0.0:
-                    _is_pred = _r2k.startswith('pred_r2_')
+                # ar1_r2 can legitimately be near zero or negative (data property, not model failure).
+                # decorr can be negative (means model ≤ AR(1) baseline — IS a meaningful warning).
+                if _r2v < 0.0 and not _r2k.startswith('ar1_r2_'):
+                    _is_pred = _r2k.startswith('pred_r2_') or _r2k.startswith('decorr_')
                     _metric_desc = "预测能力" if _is_pred else "重建效果"
                     logger.warning(
                         f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
