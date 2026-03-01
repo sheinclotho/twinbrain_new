@@ -6,7 +6,7 @@
 
 ---
 
-## [V5.49] 2026-03-02 — OOM 修复：8GB GPU backward 显存爆炸
+## [V5.49] 2026-03-02 — OOM 修复 + 性能优化：edge expansion 缓存 + GPU 预加载
 
 ### 问题
 
@@ -58,7 +58,47 @@ OOM 发生在 `self.scaler.scale(total_loss).backward()` 阶段。
 
 ---
 
+### 性能优化：edge expansion 缓存 + GPU 预加载
 
+同一 PR 内附加的性能优化，解决训练速度 524s/epoch、GPU 利用率仅 2% 的问题。
+
+#### 根因
+
+| 原因 | 影响 |
+|------|------|
+| `eeg_window_size=500` | TemporalAttention O(T²)=250K ops；propagate O(T×E)=945K msgs/层 |
+| `k_nearest_fmri=20` | fMRI 静态边 7600 条/层 = 380K msgs/层 |
+| `k_dynamic_neighbors=10` | 动态边每 forward 重建 |
+| edge expansion 无缓存 | 每个训练窗口重新分配 `[2, T×E]` 张量 |
+
+#### 配置变更
+
+| 参数 | V5.48 | V5.49 | 效果 |
+|------|-------|-------|------|
+| `windowed_sampling.eeg_window_size` | 500 | **250** | TemporalAttention 4× 快，propagate 2× 快 |
+| `model.k_nearest_fmri` | 20 | **10** | fMRI 边 3800→1900，propagate 2× 快 |
+| `model.k_dynamic_neighbors` | 10 | **5** | dynamic edges 减半，DGC topk 2× 快 |
+
+#### 代码优化
+
+**`SpatialTemporalGraphConv._ei_cache`**（`models/graph_native_encoder.py`）
+
+同一 run 的所有滑动窗口共享同一 `edge_index` 对象（`extract_windowed_samples` 复制引用而非数据）。
+首次调用构建 `[2, T×E]` 虚拟节点 edge_index 展开张量；后续窗口直接从缓存读取，
+消除每窗口一次的 GPU 内存分配（fMRI 约 7 MB/次；动态图边总是 miss，正常重算）。
+
+缓存键：`(data_ptr, n_edges, ea_ptr, chunk_len, N_src, N_dst)`。
+LRU 上限 128 条目（典型使用 3 edge_types × 4 layers × 少量 run 远低于此限制）。
+
+**`train_model()` GPU 预加载**（`main.py`）
+
+训练循环前对所有图调用 `g.to(device)` 一次，
+使 `edge_index.data_ptr()` 在整个训练过程中稳定，cache 命中率达 100%（静态图）；
+同时消除逐步 CPU→GPU 传输的 Python 函数调用开销。
+
+---
+
+## [V5.48] 2026-03-02 — V5.47 回归修复：训练速度恢复 + InfoNCE 温度调优
 
 ### 背景
 
@@ -114,6 +154,7 @@ V5.47 新增 InfoNCE 对比预测损失，temperature=0.1 导致：
 
 ---
 
+## [V5.47] 2026-03-01 — NPI 对等实现：InfoNCE 对比预测 + EC 矩阵 + 科学指标
 
 ### 背景
 
