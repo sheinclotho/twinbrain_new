@@ -1,8 +1,116 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-02-28  
-**版本**：V5.41.1  
+**最后更新**：2026-03-01  
+**版本**：V5.43  
 **状态**：生产就绪
+
+---
+
+## [V5.43] 2026-03-01 — 跨模态对齐损失 + 预测步指数加权
+
+### 背景
+
+在 V5.42（因果注意力修复）的基础上，本次更新从两个角度进一步提升预测准确率：
+1. **显式跨模态对齐监督信号**：EEG→fMRI 预测依赖图边传播，但缺少直接的潜空间对齐约束
+2. **预测损失难度加权**：均匀权重导致模型过拟合近期预测步，忽视远期步（核心挑战）
+
+### 新增内容
+
+**A. 跨模态潜空间对齐损失（Cross-Modal Latent Alignment，V5.43）**
+
+在重建损失之后、预测损失之前，计算 EEG 和 fMRI 全局均值表示的余弦相似度损失：
+- 对各模态编码后的特征在节点和时间维度做均值池化 → 各自得到 `[H]` 全局表示
+- 损失：`1 − cosine_similarity(mean_eeg, mean_fmri)`（0=完全对齐，2=完全反向）
+- 梯度流经两个模态的编码器路径，同时优化 EEG 和 fMRI 的潜空间方向
+
+科学依据：
+- 神经血管耦合（Logothetis et al. 2001, Nature）：EEG 和 fMRI 编码相同的神经活动
+- 对比多视角编码（CMC, Tian et al. 2019, NeurIPS）：不同模态的同一内容应在潜空间相邻
+- 脑动力学自监督学习（Thomas et al. 2022）：跨模态对齐改善 EEG→fMRI 泛化
+
+配置项：`model.use_cross_modal_align: true`（V5.43 默认开启）；
+`v5_optimization.adaptive_loss.task_priorities.cross_modal: 0.3`（低权重，不主导梯度）
+
+**B. 预测步指数加权（Temporal Prediction Step Weighting，V5.43）**
+
+将预测损失中各时间步的权重由均匀改为指数递增：
+- 步骤 t 的权重：`w(t) = exp(gamma × t / (T_fut - 1))`，归一化到均值=1
+- 步骤 0（近期，容易）权重最低；步骤 T_fut-1（远期，困难）权重最高
+- 默认 gamma=1.0 → 权重比约 exp(1)≈2.72 倍（最远步是最近步的 2.72 倍）
+
+科学依据：
+- 时序预测中远期步难度指数增加（Bengio et al. 2015, "Scheduled Sampling"）
+- 大脑时序处理层级性（Hasson et al. 2015, Trends in Cognitive Sciences）
+- 均匀权重使模型的梯度被容易的近期步主导，远期步学习信号不足
+
+配置项：`model.pred_step_weight_gamma: 1.0`（0.0=均匀权重，即 V5.42 行为）
+
+**C. 修复误导性注释（V5.43）**
+
+`graph_native_system.py` 中两处注释仍声称编码器使用"双向注意力 (is_causal=False)"，
+与 V5.42 实际代码（`is_causal=True`）相悖。本版本更新这两处注释以反映正确状态：
+- `compute_loss()` 中的 "⚠ 设计说明" 注释
+- `validate()` 中的 "TRULY CAUSAL evaluation" 注释
+
+### 配置变更对照
+
+| 参数 | V5.42 | V5.43 | 说明 |
+|------|-------|-------|------|
+| `model.use_cross_modal_align` | 无 | `true` | 新增跨模态对齐损失 |
+| `model.pred_step_weight_gamma` | 无 | `1.0` | 新增预测步加权 |
+| `task_priorities.cross_modal` | 无 | `0.3` | 跨模态任务初始权重 |
+
+### 向后兼容性
+
+- `use_cross_modal_align: false`：完全关闭，行为与 V5.42 一致
+- `pred_step_weight_gamma: 0.0`：均匀权重，行为与 V5.42 一致
+- 现有检查点：可继续加载，新参数仅影响损失计算，不改变模型架构
+
+---
+
+## [V5.42] 2026-03-01 — 因果注意力修复：消除训练-验证 pred_r2 偏差
+
+### 背景
+
+根据 AGENTS.md §三 [2026-03-01] 的根因分析，V5.41.1 的 pred_r2 在训练加深时持续恶化
+（epoch 5 最优，之后降至负值）。根因为三个叠加因素，V5.42 修复全部三个。
+
+### 根因 1（最严重）：TemporalAttention 双向注意力造成训练-验证致命偏差
+
+`TemporalAttention(is_causal=False)` 使训练时的 context h[T_ctx-1] 通过全局注意力
+访问所有未来时间步，导致预测器学习"回忆"已编码的未来信息（trivial shortcut）。
+验证时因果重编码（V5.31）使 shortcut 失效 → pred_r2 崩溃。随训练加深，shortcut 越来越强。
+
+**修复**：`TemporalAttention.forward()` 改为因果：`is_causal=False` → `is_causal=True`；
+fallback 路径同步添加显式上三角因果 mask。
+
+### 根因 2：use_spectral_loss 在小数据集上稀释梯度预算
+
+V5.40 新增 `spectral_eeg/fmri` 两个频域损失任务，共 8 个任务竞争梯度预算。
+在 4-8 被试的小数据集上，更多任务使 pred 任务得到的有效梯度更少。
+
+**修复**：`use_spectral_loss: true → false`（默认关闭）。
+
+### 根因 3：AdaptiveLossBalancer 逐步削减预测任务权重
+
+GradNorm 机制使 pred 损失收敛快 → 降低 pred 权重，但潜空间收敛快 ≠ signal 空间 pred_r2 好。
+
+**修复**：
+- `pred_sig` 损失 Pearson 权重 `0.2 → 0.5`：直接加强对 pred_r2 指标的优化信号
+- `task_priorities.pred: 3.0 → 6.0`：确保预测任务从一开始就占据主导梯度预算
+- `adaptive_loss.warmup_epochs: 5 → 10`：更稳定的基线建立后再启动自适应调整
+- `AdaptiveLossBalancer` 新增 `pred_weight_floor=0.5`：防止 GradNorm 将预测任务权重饿死
+
+### 配置变更对照
+
+| 参数 | V5.41.1 | V5.42 | 说明 |
+|------|---------|-------|------|
+| `TemporalAttention is_causal` | `False` | `True` | 消除训练-验证偏差（P0） |
+| `model.use_spectral_loss` | `true` | `false` | 保留梯度预算给 pred（P1） |
+| `pred_sig Pearson weight` | `0.2` | `0.5` | 强化 pred_r2 训练信号 |
+| `task_priorities.pred` | `3.0` | `6.0` | 预测任务梯度优先级提升 |
+| `adaptive_loss.warmup_epochs` | `5` | `10` | 延迟自适应调整开始时间 |
+| `pred_weight_floor` | `0.0` | `0.5` | 防止 pred 权重被饿死 |
 
 ---
 

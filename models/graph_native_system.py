@@ -437,6 +437,41 @@ class GraphNativeBrainModel(nn.Module):
         r = (numer / denom).clamp(-1.0, 1.0)  # [N*C]
         return (1.0 - r).mean()
 
+    @staticmethod
+    def _cross_modal_align_loss(
+        h_src: torch.Tensor,
+        h_dst: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cross-modal latent alignment via cosine similarity.
+
+        Forces the global mean representation of the source modality (EEG)
+        and destination modality (fMRI) to be close in the shared latent
+        space.  This directly optimises the neurovascular coupling (NVC)
+        alignment: EEG high-gamma power and fMRI BOLD share an underlying
+        neural signal source (Logothetis et al. 2001), so their mean
+        latent codes should point in similar directions.
+
+        Reference:
+            Tian et al. (2019) Contrastive Multiview Coding (CMC).
+            Thomas et al. (2022) Self-supervised learning of brain dynamics
+              from broad neuroimaging data.
+
+        Args:
+            h_src: Source modality latent [N_src, T, H] (e.g. EEG).
+            h_dst: Destination modality latent [N_dst, T, H] (e.g. fMRI).
+
+        Returns:
+            Scalar loss in [0, 2]  (0 = perfect alignment).
+        """
+        # Mean-pool over nodes and time to obtain a global representation [H].
+        # Cast to float32: cosine similarity with near-zero norms in float16
+        # produces NaN (same issue as _pearson_loss).
+        z_src = h_src.float().mean(dim=(0, 1))   # [H]
+        z_dst = h_dst.float().mean(dim=(0, 1))   # [H]
+        z_src = F.normalize(z_src, dim=0)
+        z_dst = F.normalize(z_dst, dim=0)
+        return 1.0 - (z_src * z_dst).sum()
+
     def __init__(
         self,
         node_types: List[str],
@@ -456,6 +491,8 @@ class GraphNativeBrainModel(nn.Module):
         num_subjects: int = 0,
         use_spectral_loss: bool = False,
         temporal_chunk_size: Optional[int] = None,
+        use_cross_modal_align: bool = True,
+        pred_step_weight_gamma: float = 1.0,
     ):
         """
         Initialize complete model.
@@ -502,6 +539,18 @@ class GraphNativeBrainModel(nn.Module):
                 call in SpatialTemporalGraphConv.  Bounds peak GPU memory during
                 backward recomputation.  None = full T (original behaviour).
                 Set to 64 to cut peak message-tensor memory by ~4× vs T=300.
+            use_cross_modal_align: Add a cross-modal latent alignment loss
+                (cosine similarity between mean EEG and fMRI representations).
+                Encourages the shared latent space to reflect neurovascular
+                coupling (Logothetis 2001): EEG and fMRI encode the same
+                underlying neural activity and should be close in latent space.
+                Reference: CMC (Tian et al. 2019), Thomas et al. 2022.
+                Default True (V5.43); set False to disable.
+            pred_step_weight_gamma: Exponential weight for later prediction
+                steps.  step t gets weight exp(gamma * t / T_fut), normalised
+                to mean 1.  Larger gamma → more emphasis on far-future
+                steps (harder to predict).  0.0 = uniform (original behaviour).
+                Default 1.0 (V5.43).
         """
         super().__init__()
         
@@ -511,6 +560,8 @@ class GraphNativeBrainModel(nn.Module):
         self.loss_type = loss_type
         self.num_subjects = num_subjects
         self.use_spectral_loss = use_spectral_loss
+        self.use_cross_modal_align = use_cross_modal_align
+        self.pred_step_weight_gamma = pred_step_weight_gamma
 
         # 被试特异性嵌入 (AGENTS.md §九 Gap 2)
         # num_subjects > 0: each subject gets a learnable [H] offset added to
@@ -741,27 +792,42 @@ class GraphNativeBrainModel(nn.Module):
                     losses[f'spectral_{node_type}'] = self._spectral_loss(
                         recon[:, :T_min, :], target[:, :T_min, :]
                     )
-        
+
+        # ── Cross-modal latent alignment loss (V5.43) ────────────────────────
+        # Cosine similarity between mean EEG and fMRI global latent
+        # representations.  Encourages the shared H-dimensional space to
+        # reflect neurovascular coupling: EEG and fMRI are two views of the
+        # same underlying neural activity and should be close in latent space.
+        #
+        # Scientific basis: Logothetis et al. 2001 (Nature), CMC Tian 2019,
+        #   Thomas et al. 2022 "Self-supervised learning of brain dynamics".
+        #
+        # Implementation: mean-pool encoded[nt] over nodes and time → [H];
+        # loss = 1 − cosine_similarity(z_eeg, z_fmri).
+        # Gradients flow through BOTH modalities' encoder paths, creating
+        # an explicit cross-modal alignment signal that the graph edge alone
+        # cannot provide (edges are topological, not embedding-space aware).
+        if self.use_cross_modal_align and encoded is not None:
+            _eeg_key  = next((k for k in ('eeg',  'EEG')  if k in encoded), None)
+            _fmri_key = next((k for k in ('fmri', 'fMRI') if k in encoded), None)
+            if _eeg_key is not None and _fmri_key is not None:
+                losses['cross_modal_align'] = self._cross_modal_align_loss(
+                    encoded[_eeg_key], encoded[_fmri_key]
+                )
+
         # ── 潜空间自监督预测预标记任务（系统级）──────────────────────────────
         #
-        # ⚠ 设计说明（工程权衡，非 bug）：
-        #   编码器使用双向时序卷积（Conv1d 对称 padding）和双向时序注意力
-        #   (is_causal=False)。这意味着 h[:, T_ctx-1, :] 含有来自 T_ctx 和
-        #   T_ctx+1 的少量未来信息（kernel_size=3 时边界泄漏 ±1 步）。
-        #   对于 T_ctx=200 步的序列，这种泄漏比例极小（约 0.5%），因此：
-        #   • 预标记任务仍然提供了有用的时序动力学学习信号（正确）
-        #   • 但不是严格的"因果"监督信号（可接受的工程权衡）
+        # 设计说明（V5.42 因果注意力修复后）：
+        #   编码器使用对称填充 Conv1d（±1 步边界泄漏）和因果时序注意力
+        #   (TemporalAttention: is_causal=True，V5.42 修复)。
+        #   is_causal=True 确保 h[:, t, :] 仅包含 signal[0..t] 的信息，
+        #   训练时不再有全局未来信息泄漏。Conv1d 的 ±1 步边界泄漏仅影响
+        #   序列首尾各 1 步（约 T 的 0.7%），可接受的工程近似。
+        #   • 训练：编码器因果 → 预测器收到无污染的上下文
+        #   • 验证：validate() 重新编码仅 T_ctx 步 → 消除 Conv1d 边界泄漏
+        #   训练/验证的监督目标完全一致，pred_r2 可信。
         #
-        # 真正因果的评估在 validate() 中完成：
-        #   validate() 对每个样本重新编码仅含 T_ctx 步的数据（上下文截断），
-        #   确保编码器看不到任何未来信息。pred_r2 度量由此保证科学严谨性。
-        #
-        # 为什么训练不也用因果编码？
-        #   训练每步需要额外一次编码器 forward pass，速度下降 ~50%。
-        #   对于 kernel_size=3 的卷积，边界泄漏仅 ±1 步，预标记任务仍然
-        #   有意义。如需完全因果训练，可修改编码器为因果卷积（左填充）。
-        #
-        # 流程（修正后）：
+        # 流程：
         #   1. 切分 h → context（前 2/3）+ future_target（后 1/3）
         #   2. predict_next(context)：最后 context_length 步 → 下一 pred_steps 步
         #   3. GraphPredictionPropagator：系统级传播（EEG→fMRI 耦合动态）
@@ -830,7 +896,31 @@ class GraphNativeBrainModel(nn.Module):
                         f"to eliminate unsupervised prediction steps."
                     )
                 if aligned_steps > 0:
-                    if self.loss_type == 'huber':
+                    if self.pred_step_weight_gamma > 0.0 and aligned_steps > 1:
+                        # Exponentially increasing weight for later prediction steps.
+                        # Step t gets weight exp(gamma * t / (aligned_steps - 1)),
+                        # normalised so the mean weight = 1 (preserving loss scale).
+                        # This focuses gradient signal on far-future steps that are
+                        # harder to predict (curriculum difficulty weighting).
+                        # Reference: Bengio et al. 2015 "Scheduled Sampling".
+                        step_w = torch.exp(
+                            torch.linspace(
+                                0.0, self.pred_step_weight_gamma, aligned_steps,
+                                device=pred_mean.device, dtype=torch.float32,
+                            )
+                        )
+                        step_w = (step_w / step_w.mean()).detach()  # [aligned_steps]
+                        weighted_losses = []
+                        for _t in range(aligned_steps):
+                            _pm = pred_mean[:, _t:_t + 1, :]
+                            _ft = future_target[:, _t:_t + 1, :]
+                            if self.loss_type == 'huber':
+                                _l = F.huber_loss(_pm, _ft, delta=1.0)
+                            else:
+                                _l = F.mse_loss(_pm, _ft)
+                            weighted_losses.append(_l * step_w[_t])
+                        pred_loss = torch.stack(weighted_losses).mean()
+                    elif self.loss_type == 'huber':
                         pred_loss = F.huber_loss(
                             pred_mean[:, :aligned_steps, :],
                             future_target[:, :aligned_steps, :],
@@ -1208,6 +1298,11 @@ class GraphNativeTrainer:
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
                     task_names.append(f'pred_sig_{node_type}')
+            # cross_modal_align is added in V5.43: aligns mean EEG and fMRI
+            # latent representations via cosine similarity.  Registered only
+            # when the model flag is on AND both modalities are present.
+            if getattr(model, 'use_cross_modal_align', False) and len(node_types) >= 2:
+                task_names.append('cross_modal_align')
             
             al_cfg = self._optimization_config.get('adaptive_loss', {})
             self.loss_balancer = AdaptiveLossBalancer(
@@ -1796,21 +1891,21 @@ class GraphNativeTrainer:
                 # ── Signal-space prediction R² per modality ─────────────────
                 # TRULY CAUSAL evaluation:
                 #
-                # The encoder uses symmetric Conv1d padding + bidirectional
-                # TemporalAttention (is_causal=False).  This means h[:,T_ctx-1,:]
-                # contains a small amount of information from timestep T_ctx
-                # (boundary leakage of ±1 step for kernel_size=3).
+                # The encoder uses symmetric Conv1d padding (±1-step boundary
+                # leakage) and CAUSAL TemporalAttention (is_causal=True, V5.42
+                # fix).  With causal attention the h[:,t,:] latent contains ONLY
+                # information from signal[0..t], eliminating global future leakage.
                 #
-                # For a scientifically rigorous metric we re-encode with ONLY
-                # the first T_ctx raw signal timesteps so the encoder cannot see
-                # any future data.  Cost: one extra encoder forward pass without
-                # backprop (acceptable in a validation loop).
+                # For the strictest possible metric we still re-encode with ONLY
+                # the first T_ctx raw signal timesteps.  This removes even the
+                # ±1-step Conv1d boundary leakage at position T_ctx-1 (which
+                # affects fewer than 1% of timesteps and is otherwise negligible).
+                # Cost: one extra encoder forward pass without backprop (acceptable
+                # in a validation loop).
                 #
-                # Why this matters: if we use h[:, :T_ctx, :] from the full
-                # bidirectional encoding, pred_R² is slightly optimistic because
-                # the context latent already "leaks" about the future through the
-                # bidirectional temporal attention. The truly causal evaluation
-                # here is the reliable benchmark.
+                # Result: pred_R² here is a conservative lower bound that neither
+                # the causal-attention nor the boundary-Conv1d approximation can
+                # inflate.  This is the authoritative benchmark.
                 if self.model.use_prediction:
                     pred_latents: Dict[str, torch.Tensor] = {}
                     pred_T_ctx: Dict[str, int] = {}

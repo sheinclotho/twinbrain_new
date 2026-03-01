@@ -933,6 +933,8 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0):
         num_subjects=num_subjects,
         use_spectral_loss=config['model'].get('use_spectral_loss', False),
         temporal_chunk_size=config['model'].get('temporal_chunk_size', None),
+        use_cross_modal_align=config['model'].get('use_cross_modal_align', True),
+        pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
     )
 
     if num_subjects > 0:
