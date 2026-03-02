@@ -1759,6 +1759,58 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                         "尚未从数据中学到有效信号。"
                         " 请检查数据质量、atlas 加载、或降低学习率后重试。"
                     )
+
+            # ── NPI 比较背景：ar1_r2_h1 < 0 时 pred_r2_h1 偏低的物理解释 ──────
+            # When ar1_r2_h1 is negative and decorr_h1 > 0, the model already beats
+            # the AR(1) baseline at h=1, but the absolute pred_r2_h1 looks "low"
+            # because the data itself lacks the strong temporal autocorrelation that
+            # NPI exploits for its reportedly high h=1 R².
+            #
+            # Key formula: last-value AR(1) baseline → R²_ar1_h1 = 2ρ - 1,
+            # so ρ = (1 + R²_ar1_h1) / 2.  For typical resting-state BOLD at TR=2s,
+            # ρ ≈ 0.85-0.95, giving AR(1) R²≈0.7-0.9 "for free".  NPI's high
+            # single-step accuracy largely exploits this free autocorrelation.
+            for _nt_name in sorted({
+                k.removeprefix('decorr_h1_') for k in r2_dict if k.startswith('decorr_h1_')
+            }):
+                _d_h1 = r2_dict.get(f'decorr_h1_{_nt_name}')
+                _a_h1 = r2_dict.get(f'ar1_r2_h1_{_nt_name}')
+                _p_h1 = r2_dict.get(f'pred_r2_h1_{_nt_name}')
+                if _d_h1 is None or _a_h1 is None or _p_h1 is None:
+                    continue
+                if _d_h1 > 0 and _a_h1 < 0:
+                    # Good: model beats AR(1) at h=1 despite negative baseline.
+                    # Explain that the "low" absolute pred_r2_h1 is a data property.
+                    # Derivation: R²_ar1_h1 = 2ρ - 1 (last-value predictor, unit-var signal)
+                    # → invert: ρ = (R²_ar1_h1 + 1) / 2
+                    _rho = (_a_h1 + 1.0) / 2.0
+                    logger.info(
+                        f"  ✅ {_nt_name} h=1: 模型超越 AR(1) 基线"
+                        f" (decorr_h1={_d_h1:.3f} > 0, ar1_r2_h1={_a_h1:.3f})。"
+                        f" pred_r2_h1={_p_h1:.3f} 绝对值偏低是因为该{_nt_name}数据的"
+                        f"滞后-1自相关 ρ≈{_rho:.2f}，低于典型 BOLD fMRI（ρ≈0.85-0.95）。"
+                        " NPI 声称的高 h=1 R\u00b2 依赖此\u201c免费\u201d自相关（AR(1) R\u00b2≈0.7-0.9），"
+                        f"在本数据上不适用。decorr_h1={_d_h1:.3f} 是更客观的比较指标。"
+                    )
+
+            # ── pred_r2 连续下降趋势检测 ──────────────────────────────────────
+            # 如果 pred_r2 连续 3 次验证均下降（而非偶发波动），可能是 InfoNCE
+            # 与 pred_sig 梯度竞争加剧，或学习率过高导致预测头振荡。
+            for _nt in sorted(trainer.model.node_types):
+                _hist_key = f'val_pred_r2_{_nt}'
+                _pred_hist = trainer.history.get(_hist_key, [])
+                if len(_pred_hist) >= 3 and all(
+                    _pred_hist[-i] < _pred_hist[-i - 1] for i in range(1, 3)
+                ):
+                    logger.warning(
+                        f"  ⚠️ pred_r2_{_nt} 连续 3 次验证下降"
+                        f" ({_pred_hist[-3]:.3f}→{_pred_hist[-2]:.3f}→{_pred_hist[-1]:.3f})。"
+                        " 可能原因: (1) InfoNCE 梯度竞争——建议调高 info_nce_temperature"
+                        " (0.5→1.0) 或降低 pred_nce 优先级 (2.0→1.0)；"
+                        " (2) 学习率过高——建议降低至 1e-4；"
+                        " (3) 早停过晚——当前最佳 pred_r2 已在更早 epoch 出现。"
+                    )
+
 
             # ── 过拟合检测：训练/验证损失比超阈值时警告 ─────────────────
             if train_loss > 0 and val_loss > 0:
