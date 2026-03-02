@@ -384,10 +384,19 @@ class SpatialTemporalGraphConv(MessagePassing):
             # Key includes n_edges (shape[1]) as an extra guard against the unlikely
             # case where a new tensor is allocated at the exact same data_ptr after
             # the previous one has been freed.
+            #
+            # IMPORTANT: Only cache when edge_attr does NOT require grad.
+            # DynamicGraphConstructor returns edge_attr with requires_grad=True.
+            # Caching it allows CUDA memory reuse to produce a false cache hit
+            # in a later forward pass, serving a stale ea_chunk whose grad_fn
+            # was freed by backward() → "backward through the graph a second time".
+            # Dynamic edges always produce new tensor addresses per call, so
+            # skipping their cache entries has no practical performance cost.
+            _ea_requires_grad = edge_attr is not None and edge_attr.requires_grad
             _E = edge_index.shape[1]
             _ea_ptr = edge_attr.data_ptr() if edge_attr is not None else 0
             _cache_key = (edge_index.data_ptr(), _E, _ea_ptr, chunk_len, N_src, N_dst)
-            if _cache_key in self._ei_cache:
+            if not _ea_requires_grad and _cache_key in self._ei_cache:
                 ei_chunk, ea_chunk = self._ei_cache[_cache_key]
             else:
                 t_local = torch.arange(chunk_len, device=edge_index.device)  # [chunk_len]
@@ -397,11 +406,14 @@ class SpatialTemporalGraphConv(MessagePassing):
                 ei_dst  = edge_index[1].unsqueeze(0) + dst_off   # [chunk_len, E]
                 ei_chunk = torch.stack([ei_src.reshape(-1), ei_dst.reshape(-1)])  # [2, chunk*E]
                 ea_chunk = edge_attr.repeat(chunk_len, 1) if edge_attr is not None else None
-                # Evict oldest entry when cache is full (insert-order, Python 3.7+).
-                if len(self._ei_cache) >= 128:
-                    oldest_key = next(iter(self._ei_cache))
-                    del self._ei_cache[oldest_key]
-                self._ei_cache[_cache_key] = (ei_chunk, ea_chunk)
+                # Only cache non-grad tensors: grad-carrying edge_attr (dynamic graph)
+                # must not be cached to prevent stale-graph references across steps.
+                if not _ea_requires_grad:
+                    # Evict oldest entry when cache is full (insert-order, Python 3.7+).
+                    if len(self._ei_cache) >= 128:
+                        oldest_key = next(iter(self._ei_cache))
+                        del self._ei_cache[oldest_key]
+                    self._ei_cache[_cache_key] = (ei_chunk, ea_chunk)
 
             # Flatten chunk: row t_local*N_src+n = features of (node n, time t_start+t_local)
             xt_chunk = x_t_perm[t_start:t_end].reshape(chunk_len * N_src, -1)
