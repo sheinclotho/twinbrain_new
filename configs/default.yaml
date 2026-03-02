@@ -346,10 +346,12 @@ model:
   #
   # ⚠ 必须保持开启（不可随意关闭）：
   #   V5.47 出现 pred_r2 因 InfoNCE 下降的根因是 temperature=0.1（loss_scale≈81，
-  #   50× 压制 pred_sig 梯度）。V5.48 已修复：temperature=0.5 + pred_nce priority=2.0
-  #   → effective_nce=32 vs pred_sig=6 → 5:1（可接受）。
+  #   50× 压制 pred_sig 梯度）。V5.48 修复：temperature=0.5 + pred_nce priority=2.0
+  #   → effective_nce=32 vs pred_sig=6 → 5:1。
+  #   V5.50 进一步修复：temperature=1.0 + pred_nce priority=1.0
+  #   → effective_nce=8 vs pred_sig=6 → 1.3:1（低BOLD自相关数据 pred_r2 持续下降的根因）。
   #   关闭 InfoNCE 会使模型失去对均值崩塌的唯一对抗机制，可能导致 pred_r2≤0。
-  #   仅当 temperature 调高至 1.0 后 pred_r2 仍持续下降时才考虑关闭（最后手段）。
+  #   仅当 temperature=1.0 后 pred_r2 仍持续下降时才考虑关闭（最后手段）。
   use_info_nce: true
   # InfoNCE温度参数τ（越小=越判别性，但更难优化）
   # 0.1 = 原始 SimCLR/wav2vec 默认值，但对脑信号（小数据集）过于激进：
@@ -357,10 +359,14 @@ model:
   #   warmup 期间（前10 epoch）权重固定，pred_nce priority=4.0 时：
   #   InfoNCE effective 梯度 ≈ 4.0×81 = 324 vs pred_sig ≈ 6.0×1.0 = 6 → 50× 压制
   #   结果：predictor 学会"区分"但不学会"准确预测"→ pred_r2_h1_fmri 下降
-  # 0.5（当前推荐值，配合 pred_nce priority=2.0）：
-  #   loss_scale ≈ log(3230)/0.5 ≈ 16，effective = 2.0×16 = 32 vs pred_sig = 6 → 5× 比例（可接受）
-  # 若 pred_r2 持续出现告警，可进一步调高至 1.0 或关闭 use_info_nce: false
-  info_nce_temperature: 0.5
+  # 0.5（V5.48 修复值，配合 pred_nce priority=2.0）：
+  #   loss_scale ≈ log(3230)/0.5 ≈ 16，effective = 2.0×16 = 32 vs pred_sig = 6 → 5× 比例
+  #   在实验数据（低BOLD自相关，ρ≈0.23）上 pred_r2 仍出现连续下降告警（epoch 20-40）
+  # 1.0（V5.50 修复值，配合 pred_nce priority=1.0）：
+  #   loss_scale ≈ log(3230)/1.0 ≈ 8，effective = 1.0×8 = 8 vs pred_sig = 6 → 1.3× 比例
+  #   InfoNCE 与 pred_sig 梯度接近平衡，避免 InfoNCE 长期压制预测准确度学习
+  # 关闭（use_info_nce: false）：仅在 temperature=1.0 后 pred_r2 仍持续下降时使用（最后手段）
+  info_nce_temperature: 1.0
 
   # 是否将信号重建损失（recon_eeg, recon_fmri）纳入训练目标。
   # ─ true（默认）：8 个任务同时训练（recon×2 + pred×2 + pred_sig×2 + pred_nce×2）
@@ -684,10 +690,11 @@ v5_optimization:
       pred: 6.0
       recon: 1.0
       spectral: 0.5
-      pred_nce: 2.0     # InfoNCE 对比预测优先级（use_info_nce=true，默认开启）
-                        # ⚠ temperature=0.5 时 loss_scale ≈ 16，priority=2.0 →
-                        #   effective 梯度 = 2×16=32 vs pred_sig = 6 → 5:1（可接受）。
-                        #   若设 4.0: 4×16=64 vs 6 → 10:1 → warmup 期 pred_r2 可能为负。
+      pred_nce: 1.0     # InfoNCE 对比预测优先级（use_info_nce=true，默认开启）
+                        # V5.50 调整：temperature=1.0 时 loss_scale ≈ 8，priority=1.0 →
+                        #   effective 梯度 = 1×8=8 vs pred_sig = 6 → 1.3:1（均衡）。
+                        #   V5.48 值 priority=2.0 + temperature=0.5 → 5:1 在低BOLD自相关
+                        #   数据（ρ≈0.23）上导致 pred_r2 epoch 20-40 连续下降。
       cross_modal: 0.3  # 跨模态对齐任务初始权重（use_cross_modal_align=true 时生效）
     # 预测任务权重下限（log空间偏移量，防止自适应机制过度削减预测梯度）
     # pred 任务的 log_weight 永远不低于 log(initial_weight) - pred_weight_floor。

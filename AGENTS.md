@@ -109,11 +109,13 @@ V5.47 新增 InfoNCE 损失（use_info_nce=true, temperature=0.1）。
 **InfoNCE 温度调优规则（小数据集，4-8 被试）**：
 - n_items = N × prediction_steps（如 190×17=3230 for fMRI）
 - 初始 loss_scale ≈ log(n_items) / temperature
-- 目标：InfoNCE effective 梯度 ≤ 10× pred_sig，避免 warmup 期预测准确度被压制
+- 目标：InfoNCE effective 梯度 ≤ 2× pred_sig，避免 pred_r2 随训练深入持续下降
   - effective_nce = pred_nce_priority × loss_scale = pred_nce_priority × log(n_items) / temperature
   - effective_pred = pred_priority × pred_sig_scale ≈ 6.0 × 1.0 = 6
-  - 推荐配置：pred_nce=2.0, temperature=0.5 → effective_nce = 2.0×16 = 32 vs 6 → 5:1（可接受）
-- 若仍出现 pred_r2 下降，设 use_info_nce: false（明确禁用优于错误配置）
+  - V5.48 配置：pred_nce=2.0, temperature=0.5 → effective_nce = 32 vs 6 → 5:1（对低ρ数据过高）
+  - **V5.50 配置：pred_nce=1.0, temperature=1.0 → effective_nce = 8 vs 6 → 1.3:1（均衡）**
+  - 注意：低 BOLD 自相关数据（ρ≈0.23，实验性 EEG-fMRI）比静息态数据（ρ≈0.85-0.95）对 InfoNCE 竞争更敏感
+- 若仍出现 pred_r2 持续下降（≥3次验证），设 use_info_nce: false（明确禁用优于错误配置）
 
 ---
 
