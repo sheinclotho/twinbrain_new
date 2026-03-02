@@ -304,11 +304,8 @@ model:
   # 梯度流经两个模态的编码器路径，同时优化 EEG 和 fMRI 的潜空间方向。
   #
   # true（V5.43 默认）：启用，改善跨模态预测准确率。
-  # false（V5.50 默认）：关闭。将并发梯度目标从 9 个减少至 8 个：
-  #   9 个（全开）：recon×2 + pred×2 + pred_sig×2 + pred_nce×2 + cross_modal×1
-  #   8 个（默认）：recon×2 + pred×2 + pred_sig×2 + pred_nce×2
-  #   cross_modal_align 是可解释性辅助目标（EEG-fMRI 潜空间对齐），
-  #   对核心 pred_r2 指标贡献最小，去掉可为其他目标多留一份梯度预算。
+  # false（V5.50 默认）：关闭，对核心 pred_r2 指标贡献最小，
+  #   去掉可为其他任务多留一份梯度预算。
   #   需要 EEG↔fMRI 跨模态可解释性分析时可手动启用。
   use_cross_modal_align: false
 
@@ -364,6 +361,15 @@ model:
   #   loss_scale ≈ log(3230)/0.5 ≈ 16，effective = 2.0×16 = 32 vs pred_sig = 6 → 5× 比例（可接受）
   # 若 pred_r2 持续出现告警，可进一步调高至 1.0 或关闭 use_info_nce: false
   info_nce_temperature: 0.5
+
+  # 是否将信号重建损失（recon_eeg, recon_fmri）纳入训练目标。
+  # ─ true（默认）：8 个任务同时训练（recon×2 + pred×2 + pred_sig×2 + pred_nce×2）
+  # ─ false：仅训练预测任务（pred×2 + pred_sig×2 + pred_nce×2 = 6 个任务）
+  #   适用场景：模型规模较小、梯度预算有限、以 pred_r2 为唯一优化目标时。
+  #   注意：即使设为 false，编码器和解码器依然通过 pred_sig_* 路径（预测潜
+  #   变量→解码器→信号空间）获得梯度，不会出现参数"孤立"（zero-gradient）。
+  #   重建 R²（r2_eeg / r2_fmri）在 validate() 中始终计算，仅训练目标被移除。
+  use_reconstruction_loss: true
 
 # ──────────────────────────────────────────────────────────────────────────
 # 三、训练配置
@@ -662,9 +668,11 @@ v5_optimization:
     # 可扩展：未来添加双向预测（bidir_pred_*）时，直接在此添加 bidir_pred 键即可，
     # 无需修改代码。
     #
-    # 默认并发目标（V5.50，use_info_nce=true, use_cross_modal_align=false）：
+    # 默认并发目标（V5.50，use_reconstruction_loss=true, use_info_nce=true, use_cross_modal_align=false）：
     #   recon×2 + pred×2 + pred_sig×2 + pred_nce×2 = 8 个目标
     #   其中 pred_nce（InfoNCE）是防止均值崩塌的必要保护，不可省去。
+    #   设 use_reconstruction_loss=false 可降为 6 个目标（pred×2 + pred_sig×2 + pred_nce×2）
+    #   节省的梯度预算全部转移给预测任务，推荐在预测专项训练时使用。
     #
     # 当前推荐设置（数字越大 = 该类任务初始梯度比重越高）：
     #   侧重预测（数字孪生脑，默认）: pred: 6.0, recon: 1.0

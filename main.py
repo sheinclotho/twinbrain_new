@@ -1025,6 +1025,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         num_runs=effective_num_runs,
         use_info_nce=config['model'].get('use_info_nce', True),
         info_nce_temperature=config['model'].get('info_nce_temperature', 0.1),
+        use_reconstruction_loss=config['model'].get('use_reconstruction_loss', True),
     )
 
     if num_subjects > 0:
@@ -1629,51 +1630,60 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 f"time={epoch_time:.1f}s, ETA={eta_str}"
             )
             # Scientific diagnostics: ar1_r2, decorr, pred_r2_h1 (logged at DEBUG to keep INFO clean)
-            # decorr > 0 means TwinBrain outperforms the trivial AR(1) autocorrelation baseline.
-            _decorr_items = {k: v for k, v in r2_dict.items() if k.startswith('decorr_')}
-            _ar1_items    = {k: v for k, v in r2_dict.items() if k.startswith('ar1_r2_')}
-            _h1_items     = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_h1_')}
-            if _decorr_items:
-                _decorr_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_decorr_items.items()))
-                _ar1_str    = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_ar1_items.items()))
-                _h1_str     = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_h1_items.items()))
+            # decorr_h1 > 0 means TwinBrain h=1 prediction beats trivial autocorrelation (NPI-comparable).
+            # decorr   > 0 means TwinBrain multi-step prediction beats constant-last-value baseline.
+            _decorr_h1_items = {k: v for k, v in r2_dict.items() if k.startswith('decorr_h1_')}
+            _decorr_items    = {k: v for k, v in r2_dict.items() if k.startswith('decorr_') and '_h1_' not in k}
+            _ar1_h1_items    = {k: v for k, v in r2_dict.items() if k.startswith('ar1_r2_h1_')}
+            _ar1_items       = {k: v for k, v in r2_dict.items() if k.startswith('ar1_r2_') and '_h1_' not in k}
+            _h1_items        = {k: v for k, v in r2_dict.items() if k.startswith('pred_r2_h1_')}
+            if _decorr_items or _decorr_h1_items:
+                _decorr_h1_str = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_decorr_h1_items.items()))
+                _decorr_str    = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_decorr_items.items()))
+                _ar1_h1_str    = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_ar1_h1_items.items()))
+                _ar1_str       = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_ar1_items.items()))
+                _h1_str        = "  ".join(f"{k}={v:.3f}" for k, v in sorted(_h1_items.items()))
                 logger.debug(
-                    f"  📐 超NPI指标: {_decorr_str}  {_ar1_str}  {_h1_str}"
+                    f"  📐 超NPI指标(h=1): {_decorr_h1_str}  {_ar1_h1_str}  {_h1_str}"
+                )
+                logger.debug(
+                    f"  📐 多步基线: {_decorr_str}  {_ar1_str}"
                 )
 
             # ── R² < 0 警报：模型差于均值基线时明确告警 ─────────────────
             for _r2k, _r2v in r2_dict.items():
-                # ar1_r2 can legitimately be near zero or negative (data property, not model failure).
-                # decorr can be negative (means model ≤ AR(1) baseline — IS a meaningful warning).
+                # ar1_r2_* (both h=1 and multi-step) can legitimately be negative
+                # (data property, not model failure) — skip silently.
+                # decorr_* can be negative (means model ≤ AR(1) baseline — IS a warning).
                 if _r2v < 0.0 and not _r2k.startswith('ar1_r2_'):
                     _is_pred = _r2k.startswith('pred_r2_') or _r2k.startswith('decorr_')
                     _metric_desc = "预测能力" if _is_pred else "重建效果"
 
                     # For pred_r2_h1_* and pred_r2_* metrics: check whether the model still
-                    # beats the AR(1) baseline.  When ar1_r2 is itself negative (a data-level
-                    # property of this dataset's autocorrelation), having pred_r2 < 0 does NOT
-                    # mean the model has learned nothing — it may simply reflect that the signal
-                    # is inherently hard to predict at that horizon.  In that case, replace the
-                    # alarming ⛔ with a softer ℹ️ note so users are not misled.
+                    # beats the SAME-HORIZON AR(1) baseline.
+                    # ★ IMPORTANT: pred_r2_h1_* must be compared against ar1_r2_h1_* (h=1
+                    #   baseline), NOT ar1_r2_* (multi-step baseline).  Using the wrong
+                    #   horizon baseline is a category error — ar1_r2 (multi-step) can be
+                    #   negative even when ar1_r2_h1 (h=1) is 0.7-0.9.
                     _beats_ar1 = False
                     _ar1_ref_key = None
                     _ar1_ref_val = None
                     if _r2k.startswith('pred_r2_h1_'):
                         _nt = _r2k[len('pred_r2_h1_'):]
-                        _ar1_ref_key = f'ar1_r2_{_nt}'
+                        _ar1_ref_key = f'ar1_r2_h1_{_nt}'   # h=1 AR(1) baseline (correct horizon)
                     elif _r2k.startswith('pred_r2_'):
                         _nt = _r2k[len('pred_r2_'):]
-                        _ar1_ref_key = f'ar1_r2_{_nt}'
+                        _ar1_ref_key = f'ar1_r2_{_nt}'       # multi-step AR(1) baseline (correct horizon)
                     if _ar1_ref_key is not None:
                         _ar1_ref_val = r2_dict.get(_ar1_ref_key)
                         if _ar1_ref_val is not None and _r2v > _ar1_ref_val:
                             _beats_ar1 = True
 
                     if _beats_ar1:
-                        # Negative R² but model still above AR(1) — data is inherently hard,
-                        # not a model failure.  Log at INFO so it is visible but not alarming.
+                        # Negative R² but model still above same-horizon AR(1) — data is
+                        # inherently hard at this horizon, not a model failure.
                         logger.info(
-                            f"  ℹ️ {_r2k}={_r2v:.3f} < 0，但仍优于AR(1)基线"
+                            f"  ℹ️ {_r2k}={_r2v:.3f} < 0，但仍优于同horizon的AR(1)基线"
                             f"（{_ar1_ref_key}={_ar1_ref_val:.3f}）。"
                             " 该数据集在此时间分辨率下本身可预测性较低（AR(1)亦为负），"
                             " 模型依然在基线之上，属正常现象。"
@@ -1767,7 +1777,10 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         _all_trustworthy = True
 
         # ── 1. 预测 R²（模型首要能力）──────────────────────────────────
-        _pred_items = {k: v for k, v in best_r2_dict.items() if k.startswith('pred_r2_')}
+        # Exclude pred_r2_h1_* — diagnostic NPI-comparison metric, not primary.
+        # ar1_r2_*, decorr_* are also excluded (diagnostic, not primary capability).
+        _pred_items = {k: v for k, v in best_r2_dict.items()
+                       if k.startswith('pred_r2_') and '_h1_' not in k}
         _recon_items = {k: v for k, v in best_r2_dict.items() if k.startswith('r2_')}
 
         def _trust_threshold(metric_key: str) -> float:

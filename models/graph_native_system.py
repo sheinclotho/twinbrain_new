@@ -569,6 +569,7 @@ class GraphNativeBrainModel(nn.Module):
         num_runs: int = 0,
         use_info_nce: bool = True,
         info_nce_temperature: float = 0.1,
+        use_reconstruction_loss: bool = True,
     ):
         """
         Initialize complete model.
@@ -650,6 +651,16 @@ class GraphNativeBrainModel(nn.Module):
                 is more discriminative (sharper similarity distribution) but harder
                 to optimise on small datasets.  0.1 = standard value for brain signals
                 (SimCLR uses 0.1; wav2vec 2.0 uses 0.1).  Default 0.1 (V5.47).
+            use_reconstruction_loss: Include the signal reconstruction loss
+                (recon_{nt}) in the training objective.  Default True.
+                Set False to train on prediction only (pred_* + pred_sig_* +
+                pred_nce_*), freeing the entire gradient budget for prediction.
+                The encoder and decoder are still trained through the prediction
+                path (pred_sig_loss → decoder → predictor), so disabling
+                reconstruction does NOT orphan any module weights.
+                Recommended setting: True (default) for general use; False when
+                pred_r2 is the sole objective and the model is too small to
+                simultaneously learn both tasks well.
         """
         super().__init__()
         
@@ -665,6 +676,7 @@ class GraphNativeBrainModel(nn.Module):
         self.pred_step_weight_gamma = pred_step_weight_gamma
         self.use_info_nce = use_info_nce
         self.info_nce_temperature = info_nce_temperature
+        self.use_reconstruction_loss = use_reconstruction_loss
 
         # 被试特异性嵌入 (AGENTS.md §九 Gap 2)
         # num_subjects > 0: each subject gets a learnable [H] offset added to
@@ -1228,8 +1240,14 @@ class GraphNativeBrainModel(nn.Module):
         losses = {}
         
         # Reconstruction loss per modality
-        for node_type in self.node_types:
-            if node_type in data.node_types and node_type in reconstructed:
+        # Gated by use_reconstruction_loss (default True).  When False the
+        # encoder and decoder are still trained through the signal-space
+        # prediction path (pred_sig_loss → decoder → predictor), so no
+        # parameters become orphaned.
+        if self.use_reconstruction_loss:
+            for node_type in self.node_types:
+                if node_type not in data.node_types or node_type not in reconstructed:
+                    continue
                 # Detach target: raw signal is fixed supervision (like a label).
                 # When EEG enhancement is active, data[node_type].x is the EEG
                 # handler output (requires_grad=True).  Detaching prevents an
@@ -1812,9 +1830,11 @@ class GraphNativeTrainer:
             # (FFT magnitude comparison).  Registered when use_spectral_loss=True.
             task_names = []
             for node_type in node_types:
-                task_names.append(f'recon_{node_type}')
-                if getattr(model, 'use_spectral_loss', False):
-                    task_names.append(f'spectral_{node_type}')
+                # recon tasks only if reconstruction loss is enabled
+                if getattr(model, 'use_reconstruction_loss', True):
+                    task_names.append(f'recon_{node_type}')
+                    if getattr(model, 'use_spectral_loss', False):
+                        task_names.append(f'spectral_{node_type}')
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
                     task_names.append(f'pred_sig_{node_type}')
@@ -2380,19 +2400,32 @@ class GraphNativeTrainer:
         pred_ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}
 
         # ── AR(1) baseline and h=1 horizon accumulators (V5.47) ────────────
-        # Measure genuine beyond-autocorrelation predictive skill.
-        # BOLD at TR=2s has ρ ≈ 0.85-0.95; the "constant last value" AR(1)
-        # predictor therefore achieves R² ≈ 0.7-0.9 for h=1 — essentially for
-        # free, without any learned model.  Reporting ar1_r2 and decorr_score
-        # exposes whether TwinBrain's pred_r2 represents genuine neural dynamics
-        # learning or merely exploits temporal autocorrelation (as NPI's 3→1 does).
-        # ar1_ss_res shares target statistics (ss_raw/sum/cnt) with pred_r2.
+        # Two separate AR(1) baselines serve different purposes:
+        #
+        # ar1_ss_res  — MULTI-STEP constant-last-value baseline.
+        #   Predicts y_{T_ctx+h} = y_{T_ctx} for ALL h in [1, pred_steps].
+        #   Shares target statistics (ss_raw/sum/cnt) with the full pred_r2.
+        #   NOTE: for z-scored signals this baseline can yield ar1_r2 < 0 because
+        #   holding the last value constant over many steps is worse than predicting
+        #   the global mean.  BOLD ρ ≈ 0.85-0.95 only guarantees high R² at h=1;
+        #   over 15 TRs (30 s) the constant prediction degrades severely.
+        #   decorr = (pred_r2 - ar1_r2) / (1 - ar1_r2) is therefore the skill score
+        #   of the MULTI-STEP model relative to the MULTI-STEP constant baseline.
+        #
+        # ar1_h1_ss_res  — H=1 ONLY constant-last-value baseline (★ NPI-comparable).
+        #   Predicts y_{T_ctx+1} = y_{T_ctx} — the single next step only.
+        #   For BOLD at TR=2s this should yield ar1_r2_h1 ≈ 0.7-0.9 (the "free"
+        #   autocorrelation R²).  decorr_h1 = (pred_r2_h1 - ar1_r2_h1) / (1 - ar1_r2_h1)
+        #   is the direct, apples-to-apples NPI skill score: > 0 means TwinBrain's
+        #   h=1 prediction beats trivial autocorrelation.
         ar1_ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         # h=1 horizon: next-step-only prediction (apples-to-apples vs NPI 3→1).
         pred_h1_ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         pred_h1_ss_raw: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         pred_h1_ss_sum: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
         pred_h1_ss_cnt: Dict[str, int]   = {nt: 0   for nt in self.node_types}
+        # h=1 AR(1) baseline (same target statistics as pred_h1_ss_*)
+        ar1_h1_ss_res: Dict[str, float] = {nt: 0.0 for nt in self.node_types}
 
         for data in data_list:
             data = data.to(self.device)
@@ -2577,7 +2610,9 @@ class GraphNativeTrainer:
                         pred_ss_raw[node_type] += (future_aligned ** 2).sum().item()
                         pred_ss_sum[node_type] += future_aligned.sum().item()
                         pred_ss_cnt[node_type] += future_aligned.numel()
-                        # AR(1) baseline: constant "last context step" prediction.
+                        # AR(1) baseline (multi-step): constant "last context step"
+                        # prediction expanded over ALL future steps.  Shares target
+                        # statistics with pred_r2 accumulators.
                         _last_obs = data[node_type].x[:, T_ctx - 1 : T_ctx, :]  # [N, 1, C]
                         _ar1_pred = _last_obs.expand_as(future_aligned)           # [N, n_steps, C]
                         ar1_ss_res[node_type] += ((future_aligned - _ar1_pred) ** 2).sum().item()
@@ -2588,6 +2623,10 @@ class GraphNativeTrainer:
                         pred_h1_ss_raw[node_type] += (_f1 ** 2).sum().item()
                         pred_h1_ss_sum[node_type] += _f1.sum().item()
                         pred_h1_ss_cnt[node_type] += _f1.numel()
+                        # AR(1) h=1 baseline (★ NPI-comparable): constant last value vs
+                        # the single next step.  For BOLD at TR=2s this should yield
+                        # ar1_r2_h1 ≈ 0.7-0.9.  Shares target statistics with pred_h1.
+                        ar1_h1_ss_res[node_type] += ((_f1 - _last_obs) ** 2).sum().item()
 
         avg_loss = total_loss / len(data_list)
         self.history['val_loss'].append(avg_loss)
@@ -2620,25 +2659,38 @@ class GraphNativeTrainer:
                     self.history[key] = []
                 self.history[key].append(pred_r2)
 
-            # AR(1) baseline R², decorrelation score, h=1 R² (V5.47)
+            # AR(1) baseline R², decorrelation scores, h=1 R² (V5.47 / V5.50)
             # ─────────────────────────────────────────────────────────────────────
-            # These three metrics together prove TwinBrain exceeds NPI's capability:
+            # Four derived metrics provide scientifically rigorous NPI comparison:
             #
-            # 1. ar1_r2: How much R² is "free" from BOLD autocorrelation alone.
-            #    NPI's 3→1 achieves high accuracy primarily because BOLD is
-            #    strongly autocorrelated (AR(1) baseline R² ≈ 0.7-0.9 for h=1).
+            # 1. ar1_r2_{nt}: MULTI-STEP constant baseline R².
+            #    Predicts y_{T_ctx+h} = y_{T_ctx} for h in [1, pred_steps].
+            #    Can be NEGATIVE for fast-changing signals (EEG) or long horizons
+            #    (fMRI > 10 TRs) because holding the last value constant over many
+            #    steps becomes worse than predicting the global mean.
+            #    Note: "AR(1) ≈ 0.7-0.9 for h=1" does NOT apply here — that claim
+            #    holds only for the single next step, not averaged over all steps.
             #
-            # 2. decorr_score: Genuine learned predictive capability.
+            # 2. decorr_{nt}: MULTI-STEP skill score.
             #    = (pred_r2 − ar1_r2) / (1 − ar1_r2)
-            #    Score > 0  → model outperforms trivial autocorrelation.
-            #    Score ≈ 0  → model only exploits autocorrelation (NPI's regime).
-            #    Score > 0.15 → clear scientific superiority (TwinBrain target).
+            #    Measures how much of the gap between AR(1) and perfect prediction
+            #    TwinBrain closes when predicting ALL future steps.
+            #    > 0 → outperforms constant-last-value multi-step baseline.
             #
-            # 3. pred_r2_h1: R² at horizon h=1 only (apples-to-apples vs NPI 3→1).
-            #    Expected to be higher than full-horizon pred_r2; confirms that
-            #    multi-step prediction is harder and our context is used meaningfully.
+            # 3. ar1_r2_h1_{nt}: H=1 ONLY constant baseline R² (★ NPI-comparable).
+            #    Predicts y_{T_ctx+1} = y_{T_ctx} — the SINGLE next step only.
+            #    For BOLD at TR=2s this should yield ar1_r2_h1 ≈ 0.7-0.9 because
+            #    BOLD is strongly autocorrelated (ρ ≈ 0.85-0.95) at lag 1.
+            #    For EEG at 4ms this may also be high (ρ is large at 4ms).
+            #    This is the "free" R² any trivial predictor captures at h=1.
+            #
+            # 4. decorr_h1_{nt}: H=1 ONLY skill score (★ NPI-comparable).
+            #    = (pred_r2_h1 − ar1_r2_h1) / (1 − ar1_r2_h1)
+            #    > 0 → TwinBrain's h=1 prediction beats trivial autocorrelation.
+            #    < 0 → model does NOT beat trivial autocorrelation at h=1 (weak).
+            #    This is the direct, apples-to-apples NPI comparison metric.
             for node_type in self.node_types:
-                # AR(1) R² (shares target stats with pred_r2 accumulators)
+                # AR(1) multi-step R² (shares target stats with pred_r2 accumulators)
                 ar1_r2 = self._r2_from_accum(
                     ar1_ss_res[node_type],
                     pred_ss_raw[node_type],
@@ -2647,7 +2699,7 @@ class GraphNativeTrainer:
                 )
                 r2_dict[f'ar1_r2_{node_type}'] = ar1_r2
 
-                # Decorrelation score: genuine beyond-autocorrelation skill
+                # Multi-step decorrelation score: skill relative to constant baseline
                 pred_r2_val = r2_dict.get(f'pred_r2_{node_type}', 0.0)
                 decorr = (pred_r2_val - ar1_r2) / max(1e-3, 1.0 - ar1_r2)
                 r2_dict[f'decorr_{node_type}'] = float(decorr)
@@ -2660,6 +2712,19 @@ class GraphNativeTrainer:
                     pred_h1_ss_cnt[node_type],
                 )
                 r2_dict[f'pred_r2_h1_{node_type}'] = pred_r2_h1
+
+                # h=1 AR(1) R² (★ NPI-comparable: shares target stats with pred_h1)
+                ar1_r2_h1 = self._r2_from_accum(
+                    ar1_h1_ss_res[node_type],
+                    pred_h1_ss_raw[node_type],
+                    pred_h1_ss_sum[node_type],
+                    pred_h1_ss_cnt[node_type],
+                )
+                r2_dict[f'ar1_r2_h1_{node_type}'] = ar1_r2_h1
+
+                # h=1 decorrelation score (★ NPI-comparable skill score)
+                decorr_h1 = (pred_r2_h1 - ar1_r2_h1) / max(1e-3, 1.0 - ar1_r2_h1)
+                r2_dict[f'decorr_h1_{node_type}'] = float(decorr_h1)
 
         return avg_loss, r2_dict
     
