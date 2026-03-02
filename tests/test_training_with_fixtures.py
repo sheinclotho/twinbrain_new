@@ -342,3 +342,41 @@ class TestValidationWithFixtures:
         _, r2_dict = trainer.validate([all_graphs[2]])
         for key, val in r2_dict.items():
             assert math.isfinite(val), f"R² key '{key}' = {val} is not finite"
+
+    def test_no_reconstruction_loss_trains_without_error(self, all_graphs):
+        """use_reconstruction_loss=False must train and validate without error."""
+        node_types = ["eeg", "fmri"]
+        edge_types = [
+            ("eeg", "connects", "eeg"),
+            ("fmri", "connects", "fmri"),
+            ("eeg", "projects_to", "fmri"),
+        ]
+        model = GraphNativeBrainModel(
+            node_types=node_types,
+            edge_types=edge_types,
+            in_channels_dict={"eeg": 1, "fmri": 1},
+            hidden_channels=16,
+            num_encoder_layers=1,
+            num_decoder_layers=1,
+            use_prediction=True,
+            prediction_steps=3,
+            dropout=0.0,
+            use_dynamic_graph=False,
+            use_spectral_loss=False,
+            use_cross_modal_align=False,
+            use_reconstruction_loss=False,
+        )
+        trainer = _make_trainer(model)
+        loss = trainer.train_epoch(all_graphs[:2], epoch=1, total_epochs=2)
+        assert math.isfinite(loss), f"Training loss not finite: {loss}"
+        # validate() must still compute r2_* even when recon loss is disabled in training
+        _, r2_dict = trainer.validate([all_graphs[2]])
+        assert "r2_eeg" in r2_dict, "r2_eeg must be computed in validation even with use_reconstruction_loss=False"
+        assert "r2_fmri" in r2_dict
+        # No recon tasks should appear in the loss balancer's task list
+        if trainer.use_adaptive_loss:
+            registered = trainer.loss_balancer.task_names
+            assert not any(t.startswith('recon_') for t in registered), (
+                f"recon tasks must not be registered when use_reconstruction_loss=False; "
+                f"found: {[t for t in registered if t.startswith('recon_')]}"
+            )

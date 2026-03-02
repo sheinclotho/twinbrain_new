@@ -1025,6 +1025,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         num_runs=effective_num_runs,
         use_info_nce=config['model'].get('use_info_nce', True),
         info_nce_temperature=config['model'].get('info_nce_temperature', 0.1),
+        use_reconstruction_loss=config['model'].get('use_reconstruction_loss', True),
     )
 
     if num_subjects > 0:

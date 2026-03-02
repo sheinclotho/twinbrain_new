@@ -569,6 +569,7 @@ class GraphNativeBrainModel(nn.Module):
         num_runs: int = 0,
         use_info_nce: bool = True,
         info_nce_temperature: float = 0.1,
+        use_reconstruction_loss: bool = True,
     ):
         """
         Initialize complete model.
@@ -650,6 +651,16 @@ class GraphNativeBrainModel(nn.Module):
                 is more discriminative (sharper similarity distribution) but harder
                 to optimise on small datasets.  0.1 = standard value for brain signals
                 (SimCLR uses 0.1; wav2vec 2.0 uses 0.1).  Default 0.1 (V5.47).
+            use_reconstruction_loss: Include the signal reconstruction loss
+                (recon_{nt}) in the training objective.  Default True.
+                Set False to train on prediction only (pred_* + pred_sig_* +
+                pred_nce_*), freeing the entire gradient budget for prediction.
+                The encoder and decoder are still trained through the prediction
+                path (pred_sig_loss → decoder → predictor), so disabling
+                reconstruction does NOT orphan any module weights.
+                Recommended setting: True (default) for general use; False when
+                pred_r2 is the sole objective and the model is too small to
+                simultaneously learn both tasks well.
         """
         super().__init__()
         
@@ -665,6 +676,7 @@ class GraphNativeBrainModel(nn.Module):
         self.pred_step_weight_gamma = pred_step_weight_gamma
         self.use_info_nce = use_info_nce
         self.info_nce_temperature = info_nce_temperature
+        self.use_reconstruction_loss = use_reconstruction_loss
 
         # 被试特异性嵌入 (AGENTS.md §九 Gap 2)
         # num_subjects > 0: each subject gets a learnable [H] offset added to
@@ -1228,8 +1240,14 @@ class GraphNativeBrainModel(nn.Module):
         losses = {}
         
         # Reconstruction loss per modality
-        for node_type in self.node_types:
-            if node_type in data.node_types and node_type in reconstructed:
+        # Gated by use_reconstruction_loss (default True).  When False the
+        # encoder and decoder are still trained through the signal-space
+        # prediction path (pred_sig_loss → decoder → predictor), so no
+        # parameters become orphaned.
+        if self.use_reconstruction_loss:
+            for node_type in self.node_types:
+                if node_type not in data.node_types or node_type not in reconstructed:
+                    continue
                 # Detach target: raw signal is fixed supervision (like a label).
                 # When EEG enhancement is active, data[node_type].x is the EEG
                 # handler output (requires_grad=True).  Detaching prevents an
@@ -1812,9 +1830,11 @@ class GraphNativeTrainer:
             # (FFT magnitude comparison).  Registered when use_spectral_loss=True.
             task_names = []
             for node_type in node_types:
-                task_names.append(f'recon_{node_type}')
-                if getattr(model, 'use_spectral_loss', False):
-                    task_names.append(f'spectral_{node_type}')
+                # recon tasks only if reconstruction loss is enabled
+                if getattr(model, 'use_reconstruction_loss', True):
+                    task_names.append(f'recon_{node_type}')
+                    if getattr(model, 'use_spectral_loss', False):
+                        task_names.append(f'spectral_{node_type}')
                 if model.use_prediction:
                     task_names.append(f'pred_{node_type}')
                     task_names.append(f'pred_sig_{node_type}')
