@@ -1445,6 +1445,9 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
     patience_counter = 0
     no_improvement_warning_shown = False
     epoch_times = []
+    # GPU memory growth tracking: record post-cleanup allocated memory each monitoring epoch
+    # so we can detect if it trends upward and estimate when OOM might occur.
+    _mem_history: list = []   # (epoch, allocated_gb) pairs sampled after cleanup
     output_dir = Path(config['output']['output_dir'])
     best_checkpoint_path = output_dir / "best_model.pt"
 
@@ -1502,21 +1505,6 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         else:
             eta_str = "计算中..."
         
-        # Memory monitoring every 5 epochs with fragmentation warning
-        if epoch % 5 == 0 and torch.cuda.is_available():
-            allocated_gb = torch.cuda.memory_allocated() / 1e9
-            reserved_gb = torch.cuda.memory_reserved() / 1e9
-            frag_ratio = (reserved_gb - allocated_gb) / max(reserved_gb, 1e-6)
-            logger.info(f"  💾 GPU Memory: allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
-            if frag_ratio > 0.5 and reserved_gb > 0.5:
-                logger.warning(
-                    f"  ⚠️ GPU 显存碎片化较高 ({frag_ratio*100:.0f}% 碎片): "
-                    f"reserved={reserved_gb:.2f} GB 中仅 {allocated_gb:.2f} GB 被使用。"
-                    f" 若遇到 CUDA OOM，建议：(1) 确认 use_gradient_checkpointing=true (必须！backward 峰值约 12 GB)；"
-                    f" (2) 设 temporal_chunk_size=64/32（更激进内存节省，但有 Python overhead）；"
-                    f" (3) 关闭 use_dynamic_graph；(4) 减小 k_nearest_fmri 或 eeg_window_size。"
-                )
-
         # ── 每轮清理 GPU 碎片 ─────────────────────────────────────────────
         # 每个训练步骤都会分配并释放大量中间张量（T×E 消息传递、梯度检查点等），
         # 导致 CUDA 分配器的空闲列表碎片化累积。若不及时清理，这些碎片在多个 epoch
@@ -1527,6 +1515,73 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         if torch.cuda.is_available():
             gc.collect()
             torch.cuda.empty_cache()
+
+        # Memory monitoring every 5 epochs — measured AFTER cleanup so the reading
+        # reflects true steady-state live tensors, not transient training residuals.
+        # torch.cuda.synchronize() ensures all pending CUDA kernels have completed
+        # before reading the allocator counters (avoids a systematic under-count).
+        if epoch % 5 == 0 and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            allocated_gb = torch.cuda.memory_allocated() / 1e9
+            reserved_gb  = torch.cuda.memory_reserved()  / 1e9
+            frag_ratio   = (reserved_gb - allocated_gb) / max(reserved_gb, 1e-6)
+            logger.info(f"  💾 GPU Memory: allocated={allocated_gb:.2f} GB, reserved={reserved_gb:.2f} GB")
+
+            # ── OOM-risk prediction via memory growth trend ────────────────
+            # Record each post-cleanup sample and fit a linear trend over the
+            # last 4 samples (~20 epochs).  If the projected memory at epoch 100
+            # would exceed 90% of the GPU capacity, warn immediately so the user
+            # can act before hitting OOM.
+            _mem_history.append((epoch, allocated_gb))
+            if len(_mem_history) >= 4:
+                _recent = _mem_history[-4:]
+                _x = [p[0] for p in _recent]
+                _y = [p[1] for p in _recent]
+                _n = len(_x)
+                _xm = sum(_x) / _n
+                _ym = sum(_y) / _n
+                _denom = sum((xi - _xm) ** 2 for xi in _x)
+                if _denom > 1e-9:
+                    _slope = sum((xi - _xm) * (yi - _ym) for xi, yi in zip(_x, _y)) / _denom
+                    _total_epochs = config['training']['num_epochs']
+                    _proj_end = allocated_gb + _slope * (_total_epochs - epoch)
+                    _dev_idx = torch.cuda.current_device()
+                    _gpu_cap_gb = torch.cuda.get_device_properties(_dev_idx).total_memory / 1e9
+                    _oom_epoch = None
+                    if _slope > 0.005:  # growth rate > 5 MB/epoch (0.005 GB/epoch) → non-trivial
+                        # Estimate the epoch when allocated + backward_peak > 90% capacity.
+                        # backward_peak ≈ 1.1 GB with GC=True + chunk=null at T=250 (AGENTS.md
+                        # formula).  If GC is off, peak is ~12 GB and OOM risk is immediate.
+                        _use_gc = config.get('model', {}).get('use_gradient_checkpointing', True)
+                        _backward_peak_est = 1.1 if _use_gc else 12.0
+                        _headroom = _gpu_cap_gb * 0.9 - allocated_gb - _backward_peak_est
+                        if _headroom > 0:
+                            _oom_epoch = epoch + int(_headroom / _slope)
+                        else:
+                            _oom_epoch = epoch
+                    if _oom_epoch is not None and _oom_epoch <= _total_epochs:
+                        logger.warning(
+                            f"  ⚠️ GPU 显存持续增长: 当前 {allocated_gb:.2f} GB, "
+                            f"增长速率 {_slope * 1000:.0f} MB/epoch。"
+                            f" 预计在 epoch {_oom_epoch} 附近可能 OOM（GPU 容量 {_gpu_cap_gb:.1f} GB）。"
+                            f" 建议: (1) 确认 use_gradient_checkpointing=true；"
+                            f" (2) 减小 eeg_window_size（当前 250→200）；"
+                            f" (3) 关闭 use_dynamic_graph；(4) 减小 k_nearest_fmri。"
+                        )
+                    elif _proj_end > _gpu_cap_gb * 0.85:
+                        logger.warning(
+                            f"  ⚠️ 到训练结束时 GPU 显存预计达 {_proj_end:.2f} GB"
+                            f"（GPU 容量 {_gpu_cap_gb:.1f} GB），余量不足 15%。"
+                        )
+
+            if frag_ratio > 0.5 and reserved_gb > 0.5:
+                logger.warning(
+                    f"  ⚠️ GPU 显存碎片化较高 ({frag_ratio*100:.0f}% 碎片): "
+                    f"reserved={reserved_gb:.2f} GB 中仅 {allocated_gb:.2f} GB 被使用。"
+                    f" 若遇到 CUDA OOM，建议：(1) 确认 use_gradient_checkpointing=true (必须！backward 峰值约 12 GB)；"
+                    f" (2) 设 temporal_chunk_size=64/32（更激进内存节省，但有 Python overhead）；"
+                    f" (3) 关闭 use_dynamic_graph；(4) 减小 k_nearest_fmri 或 eeg_window_size。"
+                )
         
         # Check for NaN loss
         if np.isnan(train_loss) or np.isinf(train_loss):
@@ -1593,11 +1648,42 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 if _r2v < 0.0 and not _r2k.startswith('ar1_r2_'):
                     _is_pred = _r2k.startswith('pred_r2_') or _r2k.startswith('decorr_')
                     _metric_desc = "预测能力" if _is_pred else "重建效果"
-                    logger.warning(
-                        f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
-                        "尚未从数据中学到有效信号。"
-                        " 请检查数据质量、atlas 加载、或降低学习率后重试。"
-                    )
+
+                    # For pred_r2_h1_* and pred_r2_* metrics: check whether the model still
+                    # beats the AR(1) baseline.  When ar1_r2 is itself negative (a data-level
+                    # property of this dataset's autocorrelation), having pred_r2 < 0 does NOT
+                    # mean the model has learned nothing — it may simply reflect that the signal
+                    # is inherently hard to predict at that horizon.  In that case, replace the
+                    # alarming ⛔ with a softer ℹ️ note so users are not misled.
+                    _beats_ar1 = False
+                    _ar1_ref_key = None
+                    _ar1_ref_val = None
+                    if _r2k.startswith('pred_r2_h1_'):
+                        _nt = _r2k[len('pred_r2_h1_'):]
+                        _ar1_ref_key = f'ar1_r2_{_nt}'
+                    elif _r2k.startswith('pred_r2_'):
+                        _nt = _r2k[len('pred_r2_'):]
+                        _ar1_ref_key = f'ar1_r2_{_nt}'
+                    if _ar1_ref_key is not None:
+                        _ar1_ref_val = r2_dict.get(_ar1_ref_key)
+                        if _ar1_ref_val is not None and _r2v > _ar1_ref_val:
+                            _beats_ar1 = True
+
+                    if _beats_ar1:
+                        # Negative R² but model still above AR(1) — data is inherently hard,
+                        # not a model failure.  Log at INFO so it is visible but not alarming.
+                        logger.info(
+                            f"  ℹ️ {_r2k}={_r2v:.3f} < 0，但仍优于AR(1)基线"
+                            f"（{_ar1_ref_key}={_ar1_ref_val:.3f}）。"
+                            " 该数据集在此时间分辨率下本身可预测性较低（AR(1)亦为负），"
+                            " 模型依然在基线之上，属正常现象。"
+                        )
+                    else:
+                        logger.warning(
+                            f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
+                            "尚未从数据中学到有效信号。"
+                            " 请检查数据质量、atlas 加载、或降低学习率后重试。"
+                        )
 
             # ── 过拟合检测：训练/验证损失比超阈值时警告 ─────────────────
             if train_loss > 0 and val_loss > 0:

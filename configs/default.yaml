@@ -303,9 +303,14 @@ model:
   # 实现：1 − cosine_similarity(mean_pool(h_eeg), mean_pool(h_fmri))
   # 梯度流经两个模态的编码器路径，同时优化 EEG 和 fMRI 的潜空间方向。
   #
-  # true（推荐，V5.43 默认）：启用，改善跨模态预测准确率。
-  # false：关闭（恢复 V5.42 行为）。
-  use_cross_modal_align: true
+  # true（V5.43 默认）：启用，改善跨模态预测准确率。
+  # false（V5.50 默认）：关闭。将并发梯度目标从 9 个减少至 8 个：
+  #   9 个（全开）：recon×2 + pred×2 + pred_sig×2 + pred_nce×2 + cross_modal×1
+  #   8 个（默认）：recon×2 + pred×2 + pred_sig×2 + pred_nce×2
+  #   cross_modal_align 是可解释性辅助目标（EEG-fMRI 潜空间对齐），
+  #   对核心 pred_r2 指标贡献最小，去掉可为其他目标多留一份梯度预算。
+  #   需要 EEG↔fMRI 跨模态可解释性分析时可手动启用。
+  use_cross_modal_align: false
 
   # 预测步指数加权系数（Temporal Step Weighting Gamma，V5.43 新增）
   # ─────────────────────────────────────────────────────────────────────────
@@ -333,7 +338,7 @@ model:
   #        注意：启用后，若需加载旧 checkpoint 需指定 strict=False。
   use_run_embed: false
 
-  # InfoNCE对比预测损失（V5.47 突破性改进）
+  # InfoNCE对比预测损失
   # ─────────────────────────────────────────────────────────────────────────
   # 在MSE/Huber回归损失之外，增加信息噪声对比估计(InfoNCE)损失。
   # 核心作用：防止"均值预测崩塌"——模型通过预测未来信号的无条件均值来
@@ -341,6 +346,13 @@ model:
   # 候选中识别出正确的未来表示，迫使预测头产生可区分的特异性表示。
   # 科学类比：与CLIP(视觉-语言对比学习)和wav2vec 2.0(语音对比学习)相同原理。
   # 参考文献：Oord et al. (2018) CPC; Baevski et al. (2020) wav2vec 2.0.
+  #
+  # ⚠ 必须保持开启（不可随意关闭）：
+  #   V5.47 出现 pred_r2 因 InfoNCE 下降的根因是 temperature=0.1（loss_scale≈81，
+  #   50× 压制 pred_sig 梯度）。V5.48 已修复：temperature=0.5 + pred_nce priority=2.0
+  #   → effective_nce=32 vs pred_sig=6 → 5:1（可接受）。
+  #   关闭 InfoNCE 会使模型失去对均值崩塌的唯一对抗机制，可能导致 pred_r2≤0。
+  #   仅当 temperature 调高至 1.0 后 pred_r2 仍持续下降时才考虑关闭（最后手段）。
   use_info_nce: true
   # InfoNCE温度参数τ（越小=越判别性，但更难优化）
   # 0.1 = 原始 SimCLR/wav2vec 默认值，但对脑信号（小数据集）过于激进：
@@ -492,13 +504,20 @@ training:
 
   # 最佳模型选择标准
   # ─────────────────────────────────────────────────────────────────────────
-  # 'pred_r2'  — 最大化各模态预测 R² 的均值（推荐）。
-  #              pred_r2 是数字孪生脑的核心能力指标；以此为标准确保保存的
-  #              是预测能力最强的模型，而非仅重建损失最低的模型。
-  #              早停也以 pred_r2 改善与否判断是否终止。
+  # ❓ 常见疑问：日志中同时显示 pred_r2_eeg / pred_r2_fmri / r2_eeg / r2_fmri，
+  #    是不是把这些指标全部加进去选最佳模型了？
+  # ✅ 不是。日志指标分两类：
+  #      训练目标指标（对应损失函数，影响梯度）：
+  #        pred_r2_eeg / pred_r2_fmri — 预测 R²（pred_sig 损失的评估结果）
+  #        r2_eeg / r2_fmri          — 重建 R²（recon 损失的评估结果）
+  #      仅监控指标（不参与最佳模型选择）：
+  #        val_loss — 合并损失（受自适应权重比例影响，不适合直接比较）
+  #
+  # 'pred_r2'  — 最大化 pred_r2_eeg 与 pred_r2_fmri 的均值（推荐，当前默认）。
+  #              r2_eeg / r2_fmri（重建 R²）和 val_loss 仅用于监控，
+  #              不参与最佳模型判断，也不影响早停计数。
   # 'val_loss' — 最小化验证总损失（旧行为）。
-  #              当损失由自适应权重平衡时，val_loss 受权重比例影响，
-  #              可能保存重建精度高但预测能力弱的模型。
+  #              受自适应权重比例影响，可能保存重建精度高但预测能力弱的模型。
   best_model_criterion: 'pred_r2'
 
   # 时序数据增强（可选）
@@ -639,29 +658,29 @@ v5_optimization:
     # 键为任务名称前缀，匹配规则为 task_name.startswith(key + '_')：
     #   pred     → 预测任务（pred_eeg, pred_fmri, pred_sig_eeg, pred_sig_fmri）
     #   recon    → 重建任务（recon_eeg, recon_fmri）
-    #   spectral → 频域重建任务（spectral_eeg, spectral_fmri）
+    #   spectral → 频域重建任务（spectral_eeg, spectral_fmri，需 use_spectral_loss=true）
     # 可扩展：未来添加双向预测（bidir_pred_*）时，直接在此添加 bidir_pred 键即可，
     # 无需修改代码。
     #
+    # 默认并发目标（V5.50，use_info_nce=true, use_cross_modal_align=false）：
+    #   recon×2 + pred×2 + pred_sig×2 + pred_nce×2 = 8 个目标
+    #   其中 pred_nce（InfoNCE）是防止均值崩塌的必要保护，不可省去。
+    #
     # 当前推荐设置（数字越大 = 该类任务初始梯度比重越高）：
-    #   侧重预测（数字孪生脑，默认）: pred: 6.0, recon: 1.0, spectral: 0.5
-    #   平衡模式（预测与重建并重）:   pred: 3.0, recon: 2.0, spectral: 0.5
-    #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0, spectral: 1.0
+    #   侧重预测（数字孪生脑，默认）: pred: 6.0, recon: 1.0
+    #   平衡模式（预测与重建并重）:   pred: 3.0, recon: 2.0
+    #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0
     # pred 提高至 6.0（原值 3.0）：预测任务是数字孪生脑的核心指标（pred_r2），
     # 在有限梯度预算下须明确优先，防止重建任务随训练积累而挤占预测梯度。
     task_priorities:
       pred: 6.0
-      pred_nce: 2.0   # InfoNCE对比预测（V5.47新增）
-                      # ⚠ 稳定性注意：temperature=0.5 时 InfoNCE 初始 loss_scale ≈ 16，
-                      #   priority=2.0 → effective 梯度 = 2×16 = 32，
-                      #   vs pred_sig effective = 6×1 = 6 → 约 5:1 比例（可接受）。
-                      #   若设 4.0（原值）: 4×16=64 vs 6 → 10:1 → warmup 期 pred_r2 可能为负。
       recon: 1.0
       spectral: 0.5
-      cross_modal: 0.3  # 跨模态对齐任务初始权重
-                       # AdaptiveLossBalancer 通过前缀匹配分配优先级：
-                       # name.startswith(key + '_')，因此 key='cross_modal'
-                       # 可匹配任务名 'cross_modal_align'（'cross_modal_' 前缀）。
+      pred_nce: 2.0     # InfoNCE 对比预测优先级（use_info_nce=true，默认开启）
+                        # ⚠ temperature=0.5 时 loss_scale ≈ 16，priority=2.0 →
+                        #   effective 梯度 = 2×16=32 vs pred_sig = 6 → 5:1（可接受）。
+                        #   若设 4.0: 4×16=64 vs 6 → 10:1 → warmup 期 pred_r2 可能为负。
+      cross_modal: 0.3  # 跨模态对齐任务初始权重（use_cross_modal_align=true 时生效）
     # 预测任务权重下限（log空间偏移量，防止自适应机制过度削减预测梯度）
     # pred 任务的 log_weight 永远不低于 log(initial_weight) - pred_weight_floor。
     # 即实际权重 ≥ initial_weight × exp(-pred_weight_floor) ≈ initial_weight × 0.6。
