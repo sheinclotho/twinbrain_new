@@ -1593,11 +1593,42 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                 if _r2v < 0.0 and not _r2k.startswith('ar1_r2_'):
                     _is_pred = _r2k.startswith('pred_r2_') or _r2k.startswith('decorr_')
                     _metric_desc = "预测能力" if _is_pred else "重建效果"
-                    logger.warning(
-                        f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
-                        "尚未从数据中学到有效信号。"
-                        " 请检查数据质量、atlas 加载、或降低学习率后重试。"
-                    )
+
+                    # For pred_r2_h1_* and pred_r2_* metrics: check whether the model still
+                    # beats the AR(1) baseline.  When ar1_r2 is itself negative (a data-level
+                    # property of this dataset's autocorrelation), having pred_r2 < 0 does NOT
+                    # mean the model has learned nothing — it may simply reflect that the signal
+                    # is inherently hard to predict at that horizon.  In that case, replace the
+                    # alarming ⛔ with a softer ℹ️ note so users are not misled.
+                    _beats_ar1 = False
+                    _ar1_ref_key = None
+                    _ar1_ref_val = None
+                    if _r2k.startswith('pred_r2_h1_'):
+                        _nt = _r2k[len('pred_r2_h1_'):]
+                        _ar1_ref_key = f'ar1_r2_{_nt}'
+                    elif _r2k.startswith('pred_r2_'):
+                        _nt = _r2k[len('pred_r2_'):]
+                        _ar1_ref_key = f'ar1_r2_{_nt}'
+                    if _ar1_ref_key is not None:
+                        _ar1_ref_val = r2_dict.get(_ar1_ref_key)
+                        if _ar1_ref_val is not None and _r2v > _ar1_ref_val:
+                            _beats_ar1 = True
+
+                    if _beats_ar1:
+                        # Negative R² but model still above AR(1) — data is inherently hard,
+                        # not a model failure.  Log at INFO so it is visible but not alarming.
+                        logger.info(
+                            f"  ℹ️ {_r2k}={_r2v:.3f} < 0，但仍优于AR(1)基线"
+                            f"（{_ar1_ref_key}={_ar1_ref_val:.3f}）。"
+                            " 该数据集在此时间分辨率下本身可预测性较低（AR(1)亦为负），"
+                            " 模型依然在基线之上，属正常现象。"
+                        )
+                    else:
+                        logger.warning(
+                            f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
+                            "尚未从数据中学到有效信号。"
+                            " 请检查数据质量、atlas 加载、或降低学习率后重试。"
+                        )
 
             # ── 过拟合检测：训练/验证损失比超阈值时警告 ─────────────────
             if train_loss > 0 and val_loss > 0:
