@@ -181,6 +181,12 @@ class AdaptiveLossBalancer(nn.Module):
             name for name in task_names if name.startswith('pred')
         }
 
+        # Pre-compute log-space weight bounds as Python floats to avoid creating
+        # new GPU tensors on every update_weights() call (one per task per step).
+        # Using plain float clamp_ is equivalent and allocation-free.
+        self._max_log_weight: float = math.log(max_weight)
+        self._min_log_weight: float = math.log(min_weight)
+
         # Track training dynamics
         self.register_buffer('step_count', torch.tensor(0, dtype=torch.long))
         self.register_buffer('epoch_count', torch.tensor(0, dtype=torch.long))
@@ -319,9 +325,7 @@ class AdaptiveLossBalancer(nn.Module):
 
                 self.log_weights[name].data += weight_update
 
-                max_log = torch.log(torch.tensor(self.max_weight, device=self.log_weights[name].device))
-                min_log = torch.log(torch.tensor(self.min_weight, device=self.log_weights[name].device))
-                self.log_weights[name].data.clamp_(min_log, max_log)
+                self.log_weights[name].data.clamp_(self._min_log_weight, self._max_log_weight)
 
                 # Pred weight floor: prevent prediction tasks from being reduced
                 # below (initial_log_weight - pred_weight_floor).  This ensures
