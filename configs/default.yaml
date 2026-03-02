@@ -303,9 +303,13 @@ model:
   # 实现：1 − cosine_similarity(mean_pool(h_eeg), mean_pool(h_fmri))
   # 梯度流经两个模态的编码器路径，同时优化 EEG 和 fMRI 的潜空间方向。
   #
-  # true（推荐，V5.43 默认）：启用，改善跨模态预测准确率。
-  # false：关闭（恢复 V5.42 行为）。
-  use_cross_modal_align: true
+  # true（V5.43 默认）：启用，改善跨模态预测准确率。
+  # false（V5.50 默认）：关闭。对 7M 参数级小模型（100 epoch，4-8 被试），
+  #   同时优化 9 个梯度目标使每个任务梯度预算不足。结合 use_info_nce=false，
+  #   将并发目标从 9（recon×2+pred×2+pred_sig×2+pred_nce×2+cross_modal×1）
+  #   减少至 6（recon×2+pred×2+pred_sig×2），使核心预测任务获得更多梯度资源。
+  #   需要跨模态可解释性分析时可手动启用。
+  use_cross_modal_align: false
 
   # 预测步指数加权系数（Temporal Step Weighting Gamma，V5.43 新增）
   # ─────────────────────────────────────────────────────────────────────────
@@ -333,7 +337,7 @@ model:
   #        注意：启用后，若需加载旧 checkpoint 需指定 strict=False。
   use_run_embed: false
 
-  # InfoNCE对比预测损失（V5.47 突破性改进）
+  # InfoNCE对比预测损失
   # ─────────────────────────────────────────────────────────────────────────
   # 在MSE/Huber回归损失之外，增加信息噪声对比估计(InfoNCE)损失。
   # 核心作用：防止"均值预测崩塌"——模型通过预测未来信号的无条件均值来
@@ -341,7 +345,16 @@ model:
   # 候选中识别出正确的未来表示，迫使预测头产生可区分的特异性表示。
   # 科学类比：与CLIP(视觉-语言对比学习)和wav2vec 2.0(语音对比学习)相同原理。
   # 参考文献：Oord et al. (2018) CPC; Baevski et al. (2020) wav2vec 2.0.
-  use_info_nce: true
+  #
+  # ⚠ 小模型梯度预算警告（V5.50 默认改为 false）：
+  #   默认配置（7M参数，100 epoch，4-8被试）下，开启会导致并发优化目标过多：
+  #     recon×2 + pred×2 + pred_sig×2 + pred_nce×2 + cross_modal = 9 个并发目标
+  #   每个任务平均梯度预算 = 总梯度预算 / 9，导致核心预测任务（pred_sig×2）
+  #   和重建任务（recon×2）梯度不足，pred_r2 收敛变慢。
+  #   关闭后：recon×2 + pred×2 + pred_sig×2 = 6 个目标，梯度集中，收敛更快。
+  #
+  # 何时启用：模型参数 ≥ 20M，训练 epoch ≥ 200，或 pred_r2_eeg ≥ 0.10 且 pred_r2_fmri ≥ 0.20 稳定后。
+  use_info_nce: false
   # InfoNCE温度参数τ（越小=越判别性，但更难优化）
   # 0.1 = 原始 SimCLR/wav2vec 默认值，但对脑信号（小数据集）过于激进：
   #   n_items_fmri = 190节点×17步 = 3230，loss_scale ≈ log(3230)/0.1 ≈ 81
@@ -639,29 +652,30 @@ v5_optimization:
     # 键为任务名称前缀，匹配规则为 task_name.startswith(key + '_')：
     #   pred     → 预测任务（pred_eeg, pred_fmri, pred_sig_eeg, pred_sig_fmri）
     #   recon    → 重建任务（recon_eeg, recon_fmri）
-    #   spectral → 频域重建任务（spectral_eeg, spectral_fmri）
+    #   spectral → 频域重建任务（spectral_eeg, spectral_fmri，需 use_spectral_loss=true）
     # 可扩展：未来添加双向预测（bidir_pred_*）时，直接在此添加 bidir_pred 键即可，
     # 无需修改代码。
     #
+    # 默认并发目标（V5.50，use_info_nce=false, use_cross_modal_align=false）：
+    #   recon_eeg, recon_fmri, pred_eeg, pred_fmri, pred_sig_eeg, pred_sig_fmri = 6个
+    #   6个目标对 7M 参数模型（100 epoch，4-8被试）是合适的上限。
+    #
     # 当前推荐设置（数字越大 = 该类任务初始梯度比重越高）：
-    #   侧重预测（数字孪生脑，默认）: pred: 6.0, recon: 1.0, spectral: 0.5
-    #   平衡模式（预测与重建并重）:   pred: 3.0, recon: 2.0, spectral: 0.5
-    #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0, spectral: 1.0
+    #   侧重预测（数字孪生脑，默认）: pred: 6.0, recon: 1.0
+    #   平衡模式（预测与重建并重）:   pred: 3.0, recon: 2.0
+    #   侧重重建（自编码器质量优先）:  pred: 1.0, recon: 3.0
     # pred 提高至 6.0（原值 3.0）：预测任务是数字孪生脑的核心指标（pred_r2），
     # 在有限梯度预算下须明确优先，防止重建任务随训练积累而挤占预测梯度。
     task_priorities:
       pred: 6.0
-      pred_nce: 2.0   # InfoNCE对比预测（V5.47新增）
-                      # ⚠ 稳定性注意：temperature=0.5 时 InfoNCE 初始 loss_scale ≈ 16，
-                      #   priority=2.0 → effective 梯度 = 2×16 = 32，
-                      #   vs pred_sig effective = 6×1 = 6 → 约 5:1 比例（可接受）。
-                      #   若设 4.0（原值）: 4×16=64 vs 6 → 10:1 → warmup 期 pred_r2 可能为负。
       recon: 1.0
       spectral: 0.5
-      cross_modal: 0.3  # 跨模态对齐任务初始权重
-                       # AdaptiveLossBalancer 通过前缀匹配分配优先级：
-                       # name.startswith(key + '_')，因此 key='cross_modal'
-                       # 可匹配任务名 'cross_modal_align'（'cross_modal_' 前缀）。
+      # 以下键仅在对应功能开启时生效（默认均为 false）：
+      pred_nce: 2.0     # use_info_nce=true 时：InfoNCE 对比预测优先级
+                        # ⚠ temperature=0.5 时 loss_scale ≈ 16，priority=2.0 →
+                        #   effective 梯度 = 2×16=32 vs pred_sig = 6 → 5:1（可接受）。
+                        #   若设 4.0: 4×16=64 vs 6 → 10:1 → warmup 期 pred_r2 可能为负。
+      cross_modal: 0.3  # use_cross_modal_align=true 时：跨模态对齐任务初始权重
     # 预测任务权重下限（log空间偏移量，防止自适应机制过度削减预测梯度）
     # pred 任务的 log_weight 永远不低于 log(initial_weight) - pred_weight_floor。
     # 即实际权重 ≥ initial_weight × exp(-pred_weight_floor) ≈ initial_weight × 0.6。
