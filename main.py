@@ -1650,50 +1650,115 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                     f"  📐 多步基线: {_decorr_str}  {_ar1_str}"
                 )
 
-            # ── R² < 0 警报：模型差于均值基线时明确告警 ─────────────────
+            # ── 预测指标异常警报（三级语义分类） ─────────────────────────
+            # Three semantically distinct "negative" cases require different messages
+            # and different severity levels:
+            #
+            # A) decorr_h1_* < 0 — h=1 SKILL SCORE below AR(1) baseline:
+            #    "AR(1) baseline" = trivially repeating the last observed value
+            #    at the single next step.  For high-frequency signals (EEG 250 Hz,
+            #    4 ms steps) adjacent-sample autocorrelation ρ ≈ 0.91 → free R² ≈
+            #    0.82 at h=1.  A model trained for MULTI-STEP prediction (15 steps
+            #    = 60 ms) will not specialise in this trivial single-step copy task
+            #    because longer-horizon gradients point toward capturing oscillatory
+            #    patterns rather than copying — a gradient competition.  When
+            #    multi-step decorr > 0 simultaneously, decorr_h1 < 0 is EXPECTED
+            #    and represents a deliberate trade-off, NOT a model failure.
+            #    → Emit INFO (not WARNING).
+            #
+            # B) decorr_* < 0 (multi-step SKILL SCORE) — model is worse than
+            #    the zero-parameter "constant last value" baseline averaged over
+            #    ALL pred_steps.  Note: "差于AR(1)" ≠ "差于均值基线".  The AR(1)
+            #    baseline itself can be negative (e.g. EEG multi-step ar1_r2 = −0.84
+            #    because repeating a single value over 60 ms is worse than the mean
+            #    in a z-scored oscillatory signal).  decorr < 0 means the model is
+            #    even more negative than that trivial predictor — a genuine concern.
+            #    → Emit WARNING with precise AR(1)-relative language.
+            #
+            # C) pred_r2_* < 0 or r2_* < 0 — model is worse than predicting the
+            #    GLOBAL MEAN (R² = 0 threshold, the true "no information" baseline).
+            #    Check same-horizon AR(1) to distinguish "data inherently hard"
+            #    (AR(1) also negative) from "model catastrophic failure".
+            #    → Emit WARNING (or INFO if model still beats AR(1)).
             for _r2k, _r2v in r2_dict.items():
-                # ar1_r2_* (both h=1 and multi-step) can legitimately be negative
-                # (data property, not model failure) — skip silently.
-                # decorr_* can be negative (means model ≤ AR(1) baseline — IS a warning).
-                if _r2v < 0.0 and not _r2k.startswith('ar1_r2_'):
-                    _is_pred = _r2k.startswith('pred_r2_') or _r2k.startswith('decorr_')
-                    _metric_desc = "预测能力" if _is_pred else "重建效果"
+                # ar1_r2_* can legitimately be negative (data property) — skip.
+                if _r2k.startswith('ar1_r2_') or _r2v >= 0.0:
+                    continue
 
-                    # For pred_r2_h1_* and pred_r2_* metrics: check whether the model still
-                    # beats the SAME-HORIZON AR(1) baseline.
-                    # ★ IMPORTANT: pred_r2_h1_* must be compared against ar1_r2_h1_* (h=1
-                    #   baseline), NOT ar1_r2_* (multi-step baseline).  Using the wrong
-                    #   horizon baseline is a category error — ar1_r2 (multi-step) can be
-                    #   negative even when ar1_r2_h1 (h=1) is 0.7-0.9.
-                    _beats_ar1 = False
-                    _ar1_ref_key = None
-                    _ar1_ref_val = None
-                    if _r2k.startswith('pred_r2_h1_'):
-                        _nt = _r2k[len('pred_r2_h1_'):]
-                        _ar1_ref_key = f'ar1_r2_h1_{_nt}'   # h=1 AR(1) baseline (correct horizon)
-                    elif _r2k.startswith('pred_r2_'):
-                        _nt = _r2k[len('pred_r2_'):]
-                        _ar1_ref_key = f'ar1_r2_{_nt}'       # multi-step AR(1) baseline (correct horizon)
-                    if _ar1_ref_key is not None:
-                        _ar1_ref_val = r2_dict.get(_ar1_ref_key)
-                        if _ar1_ref_val is not None and _r2v > _ar1_ref_val:
-                            _beats_ar1 = True
-
-                    if _beats_ar1:
-                        # Negative R² but model still above same-horizon AR(1) — data is
-                        # inherently hard at this horizon, not a model failure.
+                # ── Case A: decorr_h1_* < 0 ──────────────────────────────────
+                if _r2k.startswith('decorr_h1_'):
+                    _nt = _r2k[len('decorr_h1_'):]
+                    _multistep_decorr = r2_dict.get(f'decorr_{_nt}')
+                    _ar1_h1_val = r2_dict.get(f'ar1_r2_h1_{_nt}')
+                    _ar1_h1_str = (
+                        f"ar1_r2_h1_{_nt}={_ar1_h1_val:.3f}" if _ar1_h1_val is not None else ""
+                    )
+                    if _multistep_decorr is not None and _multistep_decorr > 0:
+                        # Expected gradient trade-off: multi-step model has not
+                        # specialised in the trivial single-step autocorrelation task.
+                        _h1_suffix = f"（{_ar1_h1_str}）" if _ar1_h1_str else ""
                         logger.info(
-                            f"  ℹ️ {_r2k}={_r2v:.3f} < 0，但仍优于同horizon的AR(1)基线"
-                            f"（{_ar1_ref_key}={_ar1_ref_val:.3f}）。"
-                            " 该数据集在此时间分辨率下本身可预测性较低（AR(1)亦为负），"
-                            " 模型依然在基线之上，属正常现象。"
+                            f"  ℹ️ {_r2k}={_r2v:.3f} < 0：h=1 预测未超越 AR(1) 自相关基线"
+                            f"{_h1_suffix}，但多步 decorr_{_nt}={_multistep_decorr:.3f} > 0，"
+                            " 模型已学到超越自相关的长程时序动态。"
+                            " 对于高采样率信号（如 EEG 250Hz），单步 AR(1) 基线极强（相邻帧ρ≈0.91），"
+                            " 多步训练目标与单步完美复现之间存在梯度竞争，此为物理预期，非模型失败。"
                         )
                     else:
+                        _h1_suffix = f"（{_ar1_h1_str}）" if _ar1_h1_str else ""
                         logger.warning(
-                            f"  ⛔ {_r2k}={_r2v:.3f} < 0: 模型{_metric_desc}差于均值基线，"
-                            "尚未从数据中学到有效信号。"
-                            " 请检查数据质量、atlas 加载、或降低学习率后重试。"
+                            f"  ⛔ {_r2k}={_r2v:.3f} < 0：h=1 预测差于 AR(1) 自相关基线"
+                            f"{_h1_suffix}，且多步预测亦未超越基线。"
+                            " 建议检查预测头配置、减小学习率或增加训练数据。"
                         )
+                    continue
+
+                # ── Case B: decorr_* < 0 (multi-step skill score) ────────────
+                if _r2k.startswith('decorr_'):
+                    _nt = _r2k[len('decorr_'):]
+                    _ar1_val = r2_dict.get(f'ar1_r2_{_nt}')
+                    _ar1_suffix = f"（ar1_r2_{_nt}={_ar1_val:.3f}）" if _ar1_val is not None else ""
+                    logger.warning(
+                        f"  ⛔ {_r2k}={_r2v:.3f} < 0：多步预测差于 AR(1) 常数外推基线"
+                        f"{_ar1_suffix}。建议检查预测头配置或延长训练时长。"
+                    )
+                    continue
+
+                # ── Case C: pred_r2_* < 0 or r2_* < 0 (absolute failure) ────
+                # Model is worse than predicting the global mean (R² = 0).
+                # For pred_r2 keys, check same-horizon AR(1) baseline:
+                # ★ pred_r2_h1_* → ar1_r2_h1_*;  pred_r2_* → ar1_r2_*
+                _is_pred = _r2k.startswith('pred_r2_')
+                _metric_desc = "预测能力" if _is_pred else "重建效果"
+                _beats_ar1 = False
+                _ar1_ref_key = None
+                _ar1_ref_val = None
+                if _r2k.startswith('pred_r2_h1_'):
+                    _nt = _r2k[len('pred_r2_h1_'):]
+                    _ar1_ref_key = f'ar1_r2_h1_{_nt}'
+                elif _r2k.startswith('pred_r2_'):
+                    _nt = _r2k[len('pred_r2_'):]
+                    _ar1_ref_key = f'ar1_r2_{_nt}'
+                if _ar1_ref_key is not None:
+                    _ar1_ref_val = r2_dict.get(_ar1_ref_key)
+                    if _ar1_ref_val is not None and _r2v > _ar1_ref_val:
+                        _beats_ar1 = True
+
+                if _beats_ar1:
+                    # Negative R² but model still above same-horizon AR(1) —
+                    # data is inherently hard at this horizon, not model failure.
+                    logger.info(
+                        f"  ℹ️ {_r2k}={_r2v:.3f} < 0，但仍优于同 horizon 的 AR(1) 基线"
+                        f"（{_ar1_ref_key}={_ar1_ref_val:.3f}）。"
+                        " 该数据集在此时间分辨率下本身可预测性较低（AR(1) 亦为负），"
+                        " 模型依然在基线之上，属正常现象。"
+                    )
+                else:
+                    logger.warning(
+                        f"  ⛔ {_r2k}={_r2v:.3f} < 0：模型{_metric_desc}差于均值基线（R²=0），"
+                        "尚未从数据中学到有效信号。"
+                        " 请检查数据质量、atlas 加载、或降低学习率后重试。"
+                    )
 
             # ── 过拟合检测：训练/验证损失比超阈值时警告 ─────────────────
             if train_loss > 0 and val_loss > 0:
