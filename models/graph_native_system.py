@@ -1230,7 +1230,11 @@ class GraphNativeBrainModel(nn.Module):
         # Reconstruction loss per modality
         for node_type in self.node_types:
             if node_type in data.node_types and node_type in reconstructed:
-                target = data[node_type].x  # [N, T, C]
+                # Detach target: raw signal is fixed supervision (like a label).
+                # When EEG enhancement is active, data[node_type].x is the EEG
+                # handler output (requires_grad=True).  Detaching prevents an
+                # unintended gradient path through the handler via the target.
+                target = data[node_type].x.detach()  # [N, T, C]
                 recon = reconstructed[node_type]  # [N, T', C_out]
                 
                 # Align temporal dimensions: the decoder may produce T' ≠ T when
@@ -1460,9 +1464,13 @@ class GraphNativeBrainModel(nn.Module):
                     _T_ctx = T_ctx_dict.get(_nt)
                     if _T_ctx is None or _nt not in data.node_types:
                         continue
+                    # Detach future signal: it is fixed supervision, not a
+                    # differentiable target.  When EEG enhancement is active,
+                    # data[_nt].x has requires_grad=True; detaching prevents an
+                    # unintended gradient path through the EEG handler.
                     _future_sig = data[_nt].x[
                         :, _T_ctx:_T_ctx + _pred_sig.shape[1], :
-                    ]
+                    ].detach()
                     _n = min(_pred_sig.shape[1], _future_sig.shape[1])
                     if _n < 1:
                         logger.debug(
