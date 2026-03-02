@@ -327,6 +327,13 @@ class TestValidationWithFixtures:
         assert "r2_fmri" in r2_dict
         assert "pred_r2_eeg" in r2_dict
         assert "pred_r2_fmri" in r2_dict
+        # NPI-comparison metrics (V5.50): h=1 AR(1) baseline and skill scores
+        assert "ar1_r2_h1_eeg" in r2_dict, "h=1 AR(1) baseline for EEG must be present"
+        assert "ar1_r2_h1_fmri" in r2_dict, "h=1 AR(1) baseline for fMRI must be present"
+        assert "decorr_h1_eeg" in r2_dict, "h=1 skill score for EEG must be present"
+        assert "decorr_h1_fmri" in r2_dict, "h=1 skill score for fMRI must be present"
+        assert "pred_r2_h1_eeg" in r2_dict, "h=1 prediction R² for EEG must be present"
+        assert "pred_r2_h1_fmri" in r2_dict, "h=1 prediction R² for fMRI must be present"
 
     def test_validate_r2_values_are_finite(self, all_graphs):
         model = _make_model(prediction_steps=3)
