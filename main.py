@@ -1024,7 +1024,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
         num_runs=effective_num_runs,
         use_info_nce=config['model'].get('use_info_nce', True),
-        info_nce_temperature=config['model'].get('info_nce_temperature', 0.1),
+        info_nce_temperature=config['model'].get('info_nce_temperature', 1.0),
         use_reconstruction_loss=config['model'].get('use_reconstruction_loss', True),
     )
 
@@ -1805,8 +1805,8 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                     logger.warning(
                         f"  ⚠️ pred_r2_{_nt} 连续 3 次验证下降"
                         f" ({_pred_hist[-3]:.3f}→{_pred_hist[-2]:.3f}→{_pred_hist[-1]:.3f})。"
-                        " 可能原因: (1) InfoNCE 梯度竞争——建议调高 info_nce_temperature"
-                        " (0.5→1.0) 或降低 pred_nce 优先级 (2.0→1.0)；"
+                        " 可能原因: (1) InfoNCE 梯度竞争（temperature=1.0 已是推荐值）"
+                        "——若仍持续下降，可将 use_info_nce 设为 false（最后手段）；"
                         " (2) 学习率过高——建议降低至 1e-4；"
                         " (3) 早停过晚——当前最佳 pred_r2 已在更早 epoch 出现。"
                     )

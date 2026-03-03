@@ -568,7 +568,7 @@ class GraphNativeBrainModel(nn.Module):
         pred_step_weight_gamma: float = 1.0,
         num_runs: int = 0,
         use_info_nce: bool = True,
-        info_nce_temperature: float = 0.1,
+        info_nce_temperature: float = 1.0,
         use_reconstruction_loss: bool = True,
     ):
         """
@@ -649,8 +649,12 @@ class GraphNativeBrainModel(nn.Module):
                 Reference: Oord et al. (2018) CPC; Baevski et al. (2020) wav2vec 2.0.
             info_nce_temperature: Softmax temperature τ for InfoNCE loss.  Smaller τ
                 is more discriminative (sharper similarity distribution) but harder
-                to optimise on small datasets.  0.1 = standard value for brain signals
-                (SimCLR uses 0.1; wav2vec 2.0 uses 0.1).  Default 0.1 (V5.47).
+                to optimise on small datasets.  0.1 = standard value for large
+                datasets (SimCLR, wav2vec 2.0), but too aggressive for brain signals
+                with small datasets (n_items ≈ 3230 → loss_scale ≈ 81 → 50× gradient
+                suppression of pred_sig).  1.0 = V5.50 recommended value for
+                EEG/fMRI with low BOLD autocorrelation (ρ ≈ 0.23), balancing
+                InfoNCE and pred_sig gradients at ≈1.3:1.  Default 1.0 (V5.50).
             use_reconstruction_loss: Include the signal reconstruction loss
                 (recon_{nt}) in the training objective.  Default True.
                 Set False to train on prediction only (pred_* + pred_sig_* +
