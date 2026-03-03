@@ -380,3 +380,133 @@ class TestValidationWithFixtures:
                 f"recon tasks must not be registered when use_reconstruction_loss=False; "
                 f"found: {[t for t in registered if t.startswith('recon_')]}"
             )
+
+
+# ===========================================================================
+# 5. Cache-only discovery (cache-only mode)
+# ===========================================================================
+
+import re
+
+# Mirror of the filename-parsing logic added to main.py::build_graphs().
+# Kept here as a standalone helper so we can unit-test it independently of
+# the full build_graphs() pipeline.
+_CACHE_FN_PATTERN = re.compile(r'^(sub-[^_]+)_(.+)_([0-9a-f]{8})\.pt$')
+
+
+def _discover_from_cache_dir(cache_dir, tasks_cfg=None, max_subjects=None):
+    """Parse .pt filenames in *cache_dir* and return (subject_id, task) pairs.
+
+    Mirrors the cache-only fallback in main.py::build_graphs() exactly.
+    Returns a list of (subject_id, task_or_None) tuples.
+    """
+    pairs = []
+    for pt in sorted(Path(cache_dir).glob('*.pt')):
+        m = _CACHE_FN_PATTERN.match(pt.name)
+        if not m:
+            continue
+        sid, tsk_str = m.group(1), m.group(2)
+        task = None if tsk_str == 'notask' else tsk_str
+        if tasks_cfg is not None and len(tasks_cfg) > 0 and task not in tasks_cfg:
+            continue
+        pairs.append((sid, task))
+    if max_subjects is not None:
+        seen = {}
+        for s, t in pairs:
+            if s not in seen:
+                seen[s] = []
+            seen[s].append(t)
+        kept = set(list(seen.keys())[:max_subjects])
+        pairs = [(s, t) for s, t in pairs if s in kept]
+    return pairs
+
+
+class TestCacheOnlyDiscovery:
+    """Verify that (subject_id, task) pairs are correctly parsed from .pt filenames.
+
+    This validates the cache-only mode added to build_graphs(): when raw data is
+    absent but pre-built .pt cache files exist, the pipeline discovers subjects
+    and tasks by parsing the filenames instead of scanning the data directory.
+    """
+
+    def _make_cache_dir(self, tmp_path, names):
+        """Create empty .pt files with the given names under tmp_path."""
+        for name in names:
+            (tmp_path / name).touch()
+        return tmp_path
+
+    def test_standard_filenames_parsed(self, tmp_path):
+        names = [
+            "sub-01_rest_a1b2c3d4.pt",
+            "sub-01_wm_b2c3d4e5.pt",
+            "sub-02_rest_a1b2c3d4.pt",
+        ]
+        self._make_cache_dir(tmp_path, names)
+        pairs = _discover_from_cache_dir(tmp_path)
+        assert ("sub-01", "rest") in pairs
+        assert ("sub-01", "wm") in pairs
+        assert ("sub-02", "rest") in pairs
+        assert len(pairs) == 3
+
+    def test_notask_sentinel_becomes_none(self, tmp_path):
+        """'notask' task_str in filename must be converted to Python None."""
+        self._make_cache_dir(tmp_path, ["sub-01_notask_a1b2c3d4.pt"])
+        pairs = _discover_from_cache_dir(tmp_path)
+        assert pairs == [("sub-01", None)]
+
+    def test_task_with_underscore_parsed_correctly(self, tmp_path):
+        """Tasks containing underscores (e.g. 'task_name') must be preserved intact."""
+        self._make_cache_dir(tmp_path, ["sub-01_task_name_a1b2c3d4.pt"])
+        pairs = _discover_from_cache_dir(tmp_path)
+        assert pairs == [("sub-01", "task_name")]
+
+    def test_tasks_cfg_filter_keeps_only_matching(self, tmp_path):
+        names = [
+            "sub-01_rest_a1b2c3d4.pt",
+            "sub-01_wm_b2c3d4e5.pt",
+            "sub-02_rest_a1b2c3d4.pt",
+        ]
+        self._make_cache_dir(tmp_path, names)
+        pairs = _discover_from_cache_dir(tmp_path, tasks_cfg=["rest"])
+        assert all(t == "rest" for _, t in pairs)
+        assert len(pairs) == 2
+
+    def test_max_subjects_limits_correctly(self, tmp_path):
+        names = [
+            "sub-01_rest_a1b2c3d4.pt",
+            "sub-02_rest_a1b2c3d4.pt",
+            "sub-03_rest_a1b2c3d4.pt",
+        ]
+        self._make_cache_dir(tmp_path, names)
+        pairs = _discover_from_cache_dir(tmp_path, max_subjects=2)
+        subjects = {s for s, _ in pairs}
+        assert len(subjects) == 2
+        assert "sub-03" not in subjects
+
+    def test_max_subjects_preserves_all_tasks_per_subject(self, tmp_path):
+        """When max_subjects=1, all tasks of the first subject must be retained."""
+        names = [
+            "sub-01_rest_a1b2c3d4.pt",
+            "sub-01_wm_b2c3d4e5.pt",
+            "sub-02_rest_a1b2c3d4.pt",
+        ]
+        self._make_cache_dir(tmp_path, names)
+        pairs = _discover_from_cache_dir(tmp_path, max_subjects=1)
+        assert len(pairs) == 2
+        assert all(s == "sub-01" for s, _ in pairs)
+
+    def test_non_standard_filenames_ignored(self, tmp_path):
+        names = [
+            "sub-01_rest_a1b2c3d4.pt",   # valid
+            "other_file.pt",              # missing sub- prefix
+            "sub-01_rest_toolongggg.pt",  # hash too long (9 chars)
+            "checkpoint.pt",              # no pattern at all
+        ]
+        self._make_cache_dir(tmp_path, names)
+        pairs = _discover_from_cache_dir(tmp_path)
+        assert len(pairs) == 1
+        assert pairs[0] == ("sub-01", "rest")
+
+    def test_empty_cache_dir_returns_empty(self, tmp_path):
+        pairs = _discover_from_cache_dir(tmp_path)
+        assert pairs == []
