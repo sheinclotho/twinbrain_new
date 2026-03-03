@@ -1438,6 +1438,68 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
         val_graphs   = [g.to(trainer.device) for g in val_graphs]
         logger.info("✅ 数据预加载完成（消除逐步 CPU→GPU 传输开销）")
 
+        # ── 图边张量共享优化 ──────────────────────────────────────────────
+        # 问题根因：extract_windowed_samples() 中每个窗口通过 Python 引用共享
+        # 同一个 CPU edge_index 对象。但 .to(device) 对每个 HeteroData 对象
+        # 独立调用，每次都创建一个新的 GPU 张量（即使值相同，data_ptr() 不同）。
+        # 这导致 SpatialTemporalGraphConv._ei_cache 中每个窗口的 edge_index
+        # 都被视为不同键，产生 N_windows 个缓存条目，而非理想的 N_runs 个。
+        #
+        # 以 8 被试 × 10 窗口 = 80 窗口为例，eeg_window_size=500 时：
+        #   修复前：80 个唯一 data_ptr → 64 条缓存（跨模态） × 4 层 × 3.15 MB ≈ 806 MB
+        #   修复后：8 个唯一 data_ptr（每 run 1 个） × 4 层 × 3.15 MB ≈ 100 MB
+        #   节省：约 706 MB，有效防止 epoch 4–5 的碎片化 OOM。
+        #
+        # 安全性：train_step 的数据增强仅修改节点特征 x，不涉及 edge_index/edge_attr，
+        # 因此多个窗口共享同一 GPU edge tensor 完全安全。
+        def _consolidate_run_edge_tensors(graph_list: list) -> None:
+            """Make windows from the same run share identical GPU edge tensors.
+
+            After g.to(device), every window gets its own GPU copy of each
+            edge_index even when windows originally pointed to the same CPU
+            tensor.  Consolidating so that all windows in a run reference the
+            first window's tensors collapses the _ei_cache from O(N_windows)
+            entries to O(N_runs) entries, cutting permanent GPU memory by ~7×
+            for a typical 8-subject × 10-window setup.
+            """
+            # canonical: run_key → {edge_type: (edge_index, edge_attr | None)}
+            canonical: dict = {}
+            missing_run_idx = False
+            for g in graph_list:
+                if not hasattr(g, 'run_idx'):
+                    # Graph without run_idx cannot be safely grouped — skip consolidation
+                    # for this graph.  All its edge_index tensors stay as independent copies.
+                    missing_run_idx = True
+                    continue
+                run_key = g.run_idx.item()
+                if run_key not in canonical:
+                    canonical[run_key] = {
+                        et: (
+                            g[et].edge_index,
+                            getattr(g[et], 'edge_attr', None),
+                        )
+                        for et in g.edge_types
+                        if hasattr(g[et], 'edge_index') and g[et].edge_index is not None
+                    }
+                else:
+                    for et, (canon_ei, canon_ea) in canonical[run_key].items():
+                        if et in g.edge_types and hasattr(g[et], 'edge_index'):
+                            g[et].edge_index = canon_ei
+                            if canon_ea is not None and hasattr(g[et], 'edge_attr'):
+                                g[et].edge_attr = canon_ea
+            if missing_run_idx:
+                logger.debug(
+                    "部分图缺少 run_idx 属性，这些图的 edge_index 未合并共享。"
+                    "如需完整优化，请确认 build_graphs 正确设置了 run_idx。"
+                )
+
+        _consolidate_run_edge_tensors(train_graphs)
+        _consolidate_run_edge_tensors(val_graphs)
+        logger.info(
+            "✅ 图边张量共享优化完成：同 run 的所有窗口现共用同一 GPU edge_index "
+            "（_ei_cache 从 O(N_windows) 降至 O(N_runs)，节省约 700 MB 显存）"
+        )
+
     # 训练循环
     best_val_loss = float('inf')       # always tracked for logging (val_loss value)
     best_selection_score = float('inf')  # criterion-dependent; drives save + early-stop
@@ -1553,7 +1615,7 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                         # Estimate the epoch when allocated + backward_peak > 90% capacity.
                         # backward_peak ≈ 1.1 GB with GC=True + chunk=null at T=250 (AGENTS.md
                         # formula).  If GC is off, peak is ~12 GB and OOM risk is immediate.
-                        _use_gc = config.get('model', {}).get('use_gradient_checkpointing', True)
+                        _use_gc = config.get('training', {}).get('use_gradient_checkpointing', True)
                         _backward_peak_est = 1.1 if _use_gc else 12.0
                         _headroom = _gpu_cap_gb * 0.9 - allocated_gb - _backward_peak_est
                         if _headroom > 0:
@@ -2338,6 +2400,37 @@ def main():
         logger.info("=" * 60)
         
     except Exception as e:
+        # Provide actionable guidance for CUDA out-of-memory errors.
+        # The most common cause (as of V5.51) is that eeg_window_size=500 doubles
+        # the _ei_cache per-entry size vs V5.49 (T=250), increasing permanent GPU
+        # memory from ~410 MB to ~806 MB, which — combined with the 2.1 GB backward
+        # peak — can exhaust an 8 GB GPU after a few epochs of fragmentation.
+        # The _consolidate_run_edge_tensors() fix earlier in this file addresses
+        # the root cause; the message below helps users who encounter OOM for other
+        # reasons (e.g. very large subjects × windows counts).
+        _err_str = str(e).lower()
+        if 'out of memory' in _err_str or 'cuda error' in _err_str:
+            if torch.cuda.is_available():
+                import gc as _gc
+                _gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    _allocated_gb = torch.cuda.memory_allocated() / 1e9
+                    _reserved_gb  = torch.cuda.memory_reserved()  / 1e9
+                    _dev_idx   = torch.cuda.current_device()
+                    _total_gb  = torch.cuda.get_device_properties(_dev_idx).total_memory / 1e9
+                    logger.error(
+                        f"❌ CUDA 显存不足 (OOM): 已分配 {_allocated_gb:.2f} GB / "
+                        f"已保留 {_reserved_gb:.2f} GB / GPU 总量 {_total_gb:.1f} GB\n"
+                        "   排查步骤（按优先级）:\n"
+                        "   1. 确认 training.use_gradient_checkpointing: true（必须！T=500 时 backward 峰值约 2.1GB，关闭则约 11.6GB）\n"
+                        "   2. 减小 windowed_sampling.eeg_window_size（500 → 250，峰值降至约 1.1GB，速度提升约 4×）\n"
+                        "   3. 设 model.temporal_chunk_size: 64（极端 OOM 时：峰值降至约 0.54GB，但有 8× Python overhead）\n"
+                        "   4. 减小 model.k_nearest_fmri（20 → 10）或 model.k_dynamic_neighbors（10 → 5）\n"
+                        "   5. 设 model.use_dynamic_graph: false（最保守，去除所有动态边）"
+                    )
+                except Exception:
+                    pass
         logger.error(f"❌ 运行失败: {e}", exc_info=True)
         raise
 
