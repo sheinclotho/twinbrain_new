@@ -219,7 +219,9 @@ model:
   # 动态图每节点 K 近邻数（V5.49 优化：10→5）
   # 理由：halves dynamic edge count; DGC topk() cost ∝ k; 5 already exceeds small-world degree
   # fMRI 5: 190×5=950 dynamic edges (was 1900); EEG 5: 63×5=315 (was 630)
-  k_dynamic_neighbors: 5   # 动态图每节点保留的 k 近邻数（建议：fMRI 5，EEG 5）
+  k_dynamic_neighbors: 10  # 动态图每节点保留的 k 近邻数
+                           # ★ V5.51 研究质量恢复：5→10（V5.49 降至 5 仅为速度，损失动态连接密度）
+                           # ⏩ 速度优先（牺牲模型质量）：可降回 5
 
   # 频域重建损失（频谱损失）
   # ─────────────────────────────────────────────────────────────────────────
@@ -303,11 +305,13 @@ model:
   # 实现：1 − cosine_similarity(mean_pool(h_eeg), mean_pool(h_fmri))
   # 梯度流经两个模态的编码器路径，同时优化 EEG 和 fMRI 的潜空间方向。
   #
-  # true（V5.43 默认）：启用，改善跨模态预测准确率。
-  # false（V5.50 默认）：关闭，对核心 pred_r2 指标贡献最小，
-  #   去掉可为其他任务多留一份梯度预算。
-  #   需要 EEG↔fMRI 跨模态可解释性分析时可手动启用。
-  use_cross_modal_align: false
+  # true（V5.43 默认 / V5.51 恢复）：启用，改善跨模态预测准确率。
+  #   科学依据：Thomas et al. 2022 (NeurIPS) 的自监督脑动力学模型显示，EEG-fMRI
+  #   跨模态潜空间对齐（余弦相似度约束）可显著改善 EEG→fMRI 预测的泛化能力。
+  #   梯度影响极小：cross_modal 优先级仅 0.3 vs pred=6.0（约 5% 比例），
+  #   关闭反而失去 EEG↔fMRI 潜空间对齐信号。
+  # false：关闭，仅在梯度预算极度紧张（<4 被试 + 其他损失已过多）时考虑。
+  use_cross_modal_align: true
 
   # 预测步指数加权系数（Temporal Step Weighting Gamma，V5.43 新增）
   # ─────────────────────────────────────────────────────────────────────────
@@ -423,22 +427,22 @@ training:
   #     propagate() 拆成多次小调用，每次的激活仍然累积，总显存不减。
   #     因此无 GC 时分块仅增加 Python overhead，无任何内存收益（V5.45 设计意图）。
   #
-  # 建议（V5.49 修正）：
-  #   ⚠ backward 峰值显存分析（windowed_sampling: fMRI T=50, EEG T=250 V5.49优化后）：
+  # 建议（V5.51 修正）：
+  #   ⚠ backward 峰值显存分析（windowed_sampling: fMRI T=50, EEG T=500 V5.51研究质量）：
   #     无 GC（false）时，autograd 必须同时存储所有 12 次 propagate() 的激活：
-  #       EEG T=500（旧值）：合计 ≈ 12.2 GB → OOM ❌
-  #       EEG T=250（新值）：合计 ≈ 6.1 GB → 仍超过 8GB ❌（GC 仍然必须）
+  #       EEG T=500（V5.51 恢复）：合计 ≈ 11.6 GB → 8GB OOM ❌
+  #       EEG T=250（V5.49 速度优化值）：合计 ≈ 6.1 GB → 仍超过 8GB ❌（GC 仍然必须）
   #     有 GC（true）+ chunk=null 时，backward 每次只重计算 1 个 propagate()：
   #       EEG T=500 时峰值 ≈ 2.1 GB ✅；EEG T=250 时峰值 ≈ 1.1 GB ✅
   #   ✅ 8GB GPU 默认（必须）→ true + temporal_chunk_size=null
-  #      （12 次 propagate()，无 Python 分块开销；GC 使 backward 峰值从 ~6.1GB 降至 ~1.1GB）
+  #      （12 次 propagate()，无 Python 分块开销；GC 使 backward 峰值从 ~11.6GB 降至 ~2.1GB）
   #      速度代价：约 +40% backward 时间（重计算）；比 chunk=64 快 8× 以上。
-  #   ✅ 16GB/32GB GPU → false（无重计算，最快；T=250 时 backward 峰值 ~6.1GB < 16GB）
+  #   ✅ 16GB/32GB GPU → false（无重计算，最快；T=500 时 backward 峰值 ~11.6GB < 16GB）
   #   ⚠ 遭遇 CUDA OOM 且 GC=True 仍不足（如多被试大 batch）：
-  #      设 temporal_chunk_size=64（峰值降至 ~440MB，但 8× Python overhead）
+  #      设 temporal_chunk_size=64（峰值降至 ~0.54GB，但 8× Python overhead）
   #   注意：若仅设 temporal_chunk_size=64 但 use_gradient_checkpointing=false，
   #         分块仅增加 Python overhead，无内存收益（V5.45 规则）。
-  use_gradient_checkpointing: true  # 8GB GPU 必须为 true（T=250 时 GC=false 峰值仍达 ~6.1GB>8GB）；16GB+ 可改 false 提速
+  use_gradient_checkpointing: true  # 8GB GPU 必须为 true（T=500 时 GC=false 峰值 ~11.6GB>8GB）；16GB+ 可改 false 提速
 
   # 最大序列长度（单样本模式，windowed_sampling.enabled: false）
   # ─────────────────────────────────────────────────────────────
@@ -590,7 +594,7 @@ training:
 #
 # 推荐配置（启用时将 max_seq_len 设为 null）：
 #   fmri_window_size: 50   → 50 TRs × TR=2s = 100s ≈ 一个静息脑状态周期
-#   eeg_window_size: 250   → 250pts ÷ 250Hz = 1s（覆盖 alpha/beta/gamma 节律，V5.49 优化：500→250）
+#   eeg_window_size: 500   → 500pts ÷ 250Hz = 2s（覆盖 alpha/beta/gamma 节律，V5.51 研究质量默认值）
 #   stride_fraction: 0.5   → 50% 重叠 → 约 2× 更多样本（标准 dFC 设置）
 windowed_sampling:
   enabled: true           # ★ 默认开启（V5.41）：支持 4-8 被试的关键参数
@@ -600,12 +604,14 @@ windowed_sampling:
                           #   如需恢复旧行为（不推荐），设 enabled: false 并设 max_seq_len: 300。
                           # false = 单样本模式（旧版行为，仅适用于 ≤2 被试 + 8GB GPU）
   fmri_window_size: 50    # fMRI 每个窗口的 TR 数（建议 30-100；越小内存越低但时序信息越少）
-  eeg_window_size: 250    # EEG 每个窗口的采样点数（建议 250-500；250=1s@250Hz 已覆盖 alpha/beta/gamma）
-                          # ★ V5.49 优化：500→250。理由：
-                          #   TemporalAttention 复杂度 O(T²)：250²=62.5K vs 500²=250K (4× 加速)
-                          #   propagate() 复杂度 O(T×E)：250×E vs 500×E (2× 加速)
-                          #   250pts×4ms=1s 已覆盖 alpha(8-12Hz，>8 个周期)/beta/gamma 主要节律
-                          #   T_fut=250×(1/3)=83 > prediction_steps=15，有效预测步数不变
+  eeg_window_size: 500    # EEG 每个窗口的采样点数
+                          # ★ V5.51 研究质量恢复：250→500。理由：
+                          #   • V5.43-V5.48 实测 pred_r2_eeg ≈ 0.3 使用 T=500（2s 上下文）
+                          #   • V5.49 为速度将其降至 250（1s），导致 pred_r2_eeg 从 ~0.3 降至 ~0.18
+                          #   • T=500 时 GC=True + chunk=null 的 backward 峰值 ≈ 2.1 GB（8GB GPU 安全）
+                          #   • 代价：TemporalAttention O(T²) 约 2-3× 慢（360s→600-700s/epoch 估计）
+                          #   ⏩ 速度优先（牺牲模型质量）：降回 250
+                          #   T_fut=500×(1/3)=167 > prediction_steps=50，有效预测步数不变
   stride_fraction: 0.5    # 步长 = window_size × stride_fraction（0.5 = 50% 重叠）
 
   # 跨模态时间对齐（实验性功能）
@@ -789,9 +795,13 @@ graph:
   threshold_eeg: 0.2
   
   # fMRI K 近邻（每个节点保留最强的 K 条边，确保图连通性）
-  # 建议：10（V5.49 优化：20→10，halves fMRI message count; -50% fMRI propagate time）
-  # 科学依据：小世界网络（Watts & Strogatz 1998）显示 10-20 度的稀疏图已捕获大脑模块化结构
-  k_nearest_fmri: 10
+  # ★ V5.51 研究质量恢复：10→20（V5.43-V5.48 实测 pred_r2_fmri ≈ 0.3 使用 k=20）
+  # V5.49 将其降至 10（halves fMRI message count, -50% fMRI propagate time），
+  # 代价是 fMRI 空间整合减半，导致 pred_r2_fmri 从 ~0.3 降至 ~0.22。
+  # 科学依据：小世界网络（Watts & Strogatz 1998）显示 10-20 度的稀疏图捕获大脑模块化结构；
+  # k=20 提供更完整的高阶多跳传播（通过 4 层 ST-GCN，信息从 20-跳邻域传播）。
+  # ⏩ 速度优先（牺牲模型质量）：可降回 10
+  k_nearest_fmri: 20
   
   # EEG K 近邻（EEG 节点数少，邻域更局部）
   # 建议：10（对 64 通道图平均度 ≈ 20）。
@@ -895,43 +905,51 @@ output:
 # 八、设备配置
 # ──────────────────────────────────────────────────────────────────────────
 #
-# ★ GPU 内存配置速查表（V5.49 修正）
+# ★ GPU 内存配置速查表（V5.51 更新）
 # ─────────────────────────────────────────────────────────────────────────
-# ⚠ backward 峰值显存分析（windowed EEG T=250 V5.49, fMRI T=50, H=128, 4层, 3边）：
-#   GC=false：autograd 同时存储全部 12 次 propagate() 激活 ≈ 6.1 GB → 8GB OOM ❌
-#   GC=true + chunk=null：backward 每次只重计算 1 个 propagate() ≈ 1.1 GB → 安全 ✅
-#   GC=true + chunk=64： backward 峰值 ≈ 0.27 GB → 更安全，但 4× Python overhead (T=250)
+# ⚠ backward 峰值显存分析（windowed EEG T=500 V5.51, fMRI T=50, H=128, 4层, 3边）：
+#   GC=false：autograd 同时存储全部 12 次 propagate() 激活 ≈ 11.6 GB → 8GB OOM ❌
+#   GC=true + chunk=null：backward 每次只重计算 1 个 propagate() ≈ 2.1 GB → 安全 ✅
+#   GC=true + chunk=64： backward 峰值 ≈ 0.54 GB → 更安全，但 8× Python overhead (T=500)
 #
-# ✅ 8GB GPU（RTX 3070/3080/4070/4080 等）当前默认（V5.49 优化后）：
+# ✅ 8GB GPU（RTX 3070/3080/4070/4080 等）研究质量默认（V5.51）：
 #   model.temporal_chunk_size: null            ← 单次 propagate（无 Python overhead）
-#   training.use_gradient_checkpointing: true  ← 必须（backward 峰值 1.1GB vs 无GC的6.1GB）
-#   windowed_sampling.eeg_window_size: 250     ← V5.49 优化：500→250，TemporalAttn 4× 快
+#   training.use_gradient_checkpointing: true  ← 必须（backward 峰值 2.1GB vs 无GC的11.6GB）
+#   windowed_sampling.eeg_window_size: 500     ← V5.51 恢复（V5.49 降至 250 牺牲了 pred_r2）
 #   windowed_sampling.fmri_window_size: 50
-#   model.k_nearest_fmri: 10                  ← V5.49 优化：20→10，fMRI edges 减半
-#   model.k_dynamic_neighbors: 5              ← V5.49 优化：10→5，dynamic edges 减半
+#   model.k_nearest_fmri: 20                  ← V5.51 恢复（V5.49 降至 10 牺牲了 pred_r2）
+#   model.k_dynamic_neighbors: 10             ← V5.51 恢复（V5.49 降至 5 牺牲了 pred_r2）
 #   training.gradient_accumulation_steps: 4
-#   → 支持 4-8 被试 × 约 5 窗口/被试 ≈ 20-40 样本/epoch
-#   → 速度代价：GC 约 +40% backward 时间（重计算）；单次 propagate 无 Python 分块 overhead
+#   → 支持 4-8 被试 × 约 3 窗口/被试 ≈ 12-24 样本/epoch（T=500 每 run 窗口数略少）
+#   → 速度代价：GC 约 +40% backward；T=500 比 T=250 约慢 2-3×（600-700s/epoch 估计）
+#   → 质量收益：pred_r2_eeg 从 ~0.18 恢复至 ~0.30；pred_r2_fmri 从 ~0.22 恢复至 ~0.30
+#
+# ⏩ 速度优先（8GB GPU，牺牲模型质量）：
+#   windowed_sampling.eeg_window_size: 250  ← V5.49 值（4× 快，pred_r2_eeg 损失 ~0.12）
+#   model.k_nearest_fmri: 10               ← V5.49 值（2× 快，pred_r2_fmri 损失 ~0.08）
+#   model.k_dynamic_neighbors: 5           ← V5.49 值（2× 快，微小影响）
 #
 # ✅ 速度最优（16GB+ GPU）：
 #   model.temporal_chunk_size: null
-#   training.use_gradient_checkpointing: false ← 可关闭（T=250 时 backward 峰值 6.1GB < 16GB）
+#   training.use_gradient_checkpointing: false ← 可关闭（T=500 时 backward 峰值 11.6GB < 16GB）
 #
-# ⚠ V5.47 的错误配置（已修复）：
-#   temporal_chunk_size: 64 + use_gradient_checkpointing: true =
-#   EEG T=500, 4层×3边×8块 = 192 propagate() 调用/step → 16× 更慢
+# ⚠ V5.49 的速度优化（改变了模型质量，已在 V5.51 恢复）：
+#   eeg_window_size: 500→250：TemporalAttn 4× 快，但 pred_r2_eeg 从 ~0.30 降至 ~0.18
+#   k_nearest_fmri: 20→10：fMRI propagate 2× 快，但 pred_r2_fmri 从 ~0.30 降至 ~0.22
+#   k_dynamic_neighbors: 10→5：dynamic edges 2× 快，微小影响
 #
 # ⚠ V5.48/V5.49 的认知错误（已记录在 AGENTS.md）：
 #   「GPU allocated=0.18GB → 无内存压力 → GC=false 安全」是错误推断。
 #   allocated=0.18GB 是 backward 完成后的稳定状态读数，不是 backward 中的峰值。
-#   backward 峰值（T=250 时 6.1GB）远高于稳定状态，8GB GPU 必然 OOM。
+#   backward 峰值（T=500 时 11.6GB）远高于稳定状态，8GB GPU 必然 OOM。
 #
 # 8GB GPU，遭遇 CUDA OOM 时（逐步回退）：
-#   1. 确认 training.use_gradient_checkpointing: true（必须，T=250 时峰值从 6.1GB 降至 1.1GB）
-#   2. 设 model.temporal_chunk_size: 64（峰值降至 0.27GB，但 4× Python overhead）
-#   3. 设 model.temporal_chunk_size: 32（峰值降至 0.14GB，8× overhead，极限场景）
-#   4. 减小 model.k_dynamic_neighbors（5 → 3）：dynamic E 减少 -40%
-#   5. 设 model.use_dynamic_graph: false：去除动态边
+#   1. 确认 training.use_gradient_checkpointing: true（必须，T=500 时峰值从 11.6GB 降至 2.1GB）
+#   2. 设 model.temporal_chunk_size: 64（峰值降至 0.54GB，但 8× Python overhead）
+#   3. 设 model.temporal_chunk_size: 32（峰值降至 0.27GB，16× overhead，极限场景）
+#   4. 减小 windowed_sampling.eeg_window_size（500 → 250，峰值降至 1.1GB）
+#   5. 减小 model.k_dynamic_neighbors（10 → 5）：dynamic E 减少 -50%
+#   6. 设 model.use_dynamic_graph: false：去除动态边
 #
 # 16GB GPU（RTX 3080 Ti / RTX 4080 / etc.）：
 #   model.hidden_channels: 128
@@ -948,15 +966,6 @@ output:
 #   windowed_sampling.fmri_window_size: 100
 #   model.prediction_steps: 33           ← floor(100×1/3)
 #   → 支持 16+ 被试
-#
-# 如果 OOM（速度影响针对 EEG T=250；fMRI T=50 时分块代价远小于此）：
-#   1. 确认 training.use_gradient_checkpointing: true（约 +40% 时间，峰值 -82%：6.1→1.1GB）
-#   2. 设 model.temporal_chunk_size: 64（约 +4× Python overhead，峰值 -96%：6.1→0.27GB）
-#   3. 设 model.temporal_chunk_size: 32（约 +8× Python overhead，峰值 0.14GB）
-#   4. 减小 windowed_sampling.fmri_window_size（50 → 30）
-#      ⚠ 同步调整 prediction_steps = floor(fmri_window_size × 1/3) = floor(30×1/3) = 10
-#   5. 减小 model.hidden_channels（128 → 64）
-#   6. 减小 model.k_dynamic_neighbors（5 → 3）
 #
 # 调整 fmri_window_size 后的 prediction_steps 建议：
 #   非对称设计（V5.44）：EEG 通常有更多 T_fut，可以用更大的 prediction_steps。

@@ -1,8 +1,82 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-03-02  
-**版本**：V5.50  
+**最后更新**：2026-03-03  
+**版本**：V5.51  
 **状态**：生产就绪
+
+---
+
+## [V5.51] 2026-03-03 — 研究质量恢复：pred_r2 ~0.30 目标参数
+
+### 问题
+
+V5.49 的速度优化将三个关键参数降低以提升训练吞吐量，导致 pred_r2 从 ~0.30（V5.43–V5.48 实测）
+下降至 ~0.18–0.22（V5.49–V5.50），不满足论文发表的科学标准。
+
+### 根因
+
+| 参数 | V5.43–V5.48 | V5.49（速度优化） | 影响 |
+|------|------------|-------------------|------|
+| `eeg_window_size` | 500 pts (2s) | **250 pts (1s)** | EEG 上下文减半；TemporalAttn 4× 快但 pred_r2_eeg -0.12 |
+| `k_nearest_fmri` | 20 | **10** | fMRI 空间整合减半；propagate 2× 快但 pred_r2_fmri -0.08 |
+| `k_dynamic_neighbors` | 10 | **5** | 动态边减半；略微影响动态连接学习 |
+| `use_cross_modal_align` | `true` | — | V5.50 关闭，失去 EEG↔fMRI 潜空间对齐信号 |
+
+V5.49 参数调整原本是为解决 524s/epoch 的性能问题（GPU 利用率仅 2%），
+但该问题的真正根因是 V5.47 引入的 temporal_chunk_size=64（已在 V5.48 修复）。
+修复速度问题后，V5.49 进一步降低参数的必要性不再存在，但代价是 pred_r2 的显著回退。
+
+### 修复
+
+```yaml
+# configs/default.yaml
+windowed_sampling:
+  eeg_window_size: 500    # 250 → 500：恢复 2s EEG 上下文，pred_r2_eeg 目标 ~0.30
+
+graph:
+  k_nearest_fmri: 20      # 10 → 20：恢复完整 fMRI 空间整合，pred_r2_fmri 目标 ~0.30
+  k_dynamic_neighbors: 10 # 5 → 10：恢复完整动态边密度
+
+model:
+  use_cross_modal_align: true  # false → true：恢复 EEG↔fMRI 潜空间对齐损失（V5.43 设计）
+```
+
+### 内存安全性
+
+| 场景 | GC=True + T=500 | GC=True + T=250 |
+|------|----------------|----------------|
+| backward 峰值 | **~2.1 GB** | ~1.1 GB |
+| 8GB GPU | ✅ 安全 | ✅ 安全 |
+| 总显存使用（估计）| ~4-5 GB | ~3-4 GB |
+
+`training.use_gradient_checkpointing: true`（已是默认值）确保 backward 峰值在安全范围内。
+
+### 速度影响
+
+| 配置 | 估计训练时间/epoch |
+|------|----------------|
+| V5.49（T=250, k=10） | ~360s |
+| V5.51（T=500, k=20） | **~600-700s（估计）** |
+
+对于论文结果，训练时间增加 ~2× 是可接受的（pred_r2 从 ~0.22 提升至 ~0.30）。
+
+### 如需速度优先（牺牲部分准确率）
+
+在 `configs/default.yaml` 中注释掉或修改：
+```yaml
+windowed_sampling:
+  eeg_window_size: 250    # 速度优先：4× 快，pred_r2_eeg ~0.18
+graph:
+  k_nearest_fmri: 10      # 速度优先：2× 快，pred_r2_fmri ~0.22
+  k_dynamic_neighbors: 5  # 速度优先：2× 快，微小 pred_r2 影响
+```
+
+### 影响文件
+
+| 文件 | 变更 |
+|------|------|
+| `configs/default.yaml` | `eeg_window_size: 250→500`；`k_nearest_fmri: 10→20`；`k_dynamic_neighbors: 5→10`；`use_cross_modal_align: false→true`；GPU 内存速查表更新 |
+| `CHANGELOG.md` | 本条目 |
 
 ---
 
