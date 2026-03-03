@@ -1,8 +1,75 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-03-03  
-**版本**：V5.51  
+**版本**：V5.52  
 **状态**：生产就绪
+
+---
+
+## [V5.52] 2026-03-03 — 禁用 InfoNCE：恢复 V5.45/V5.46 速度与 pred_r2 ~0.30 质量
+
+### 问题
+
+V5.51 恢复了容量参数（T=500, k=20, k_dyn=10, cross_modal_align=true），但仍保留
+InfoNCE（V5.47 新增）。用户反馈"好版本当初训练速度比现在还快"，指出 V5.51 的修复方向
+虽然正确但不完整。
+
+### 根因：InfoNCE 计算开销超过 T 减小的收益
+
+V5.47 新增 InfoNCE 对比预测损失（对称 CLIP-style）。V5.49 为弥补 InfoNCE 导致的速度
+下降，将 T=500→250。但 InfoNCE 开销 > T 减小的节省：
+
+| 操作 | FLOPs/训练步 |
+|------|-------------|
+| InfoNCE fMRI（单向：3230×3230×128）| 1.34B |
+| InfoNCE EEG（单向：5229×5229×128） | 3.50B |
+| 双向对称（CLIP-style，×2）          | ×2 |
+| **总 InfoNCE 开销（双向）**         | **9.68B** |
+| T=500→250 节省的 TemporalAttn（4层）| 6.08B |
+| **净结果：InfoNCE 使 V5.50 比 V5.45 慢** | **+3.60B FLOPs** |
+
+这解释了为什么 V5.45/V5.46（T=500，无 InfoNCE）比 V5.50（T=250，有 InfoNCE）更快：
+- V5.45/V5.46：~100s/epoch（无 InfoNCE 开销）
+- V5.50：更慢（InfoNCE 超额抵消 T 减小的收益）
+
+### InfoNCE 对 pred_r2 的负面影响
+
+尽管经过多轮温度调优（0.1→0.5→1.0），InfoNCE 始终存在梯度竞争：
+- V5.50（temperature=1.0, priority=1.0）：effective_nce=8 vs pred_sig=6 → 1.3:1
+- 即使是 1.3:1，在低 BOLD 自相关数据（ρ≈0.23）上仍观察到 pred_r2 连续下降
+- 本质上：InfoNCE 迫使模型学习"区分未来"，而非"准确预测未来"；两个目标不完全等价
+
+### 为什么 pred_sig Pearson 分量已足够防止均值崩塌
+
+InfoNCE 的设计初衷是防止 pred_r2≤0（均值崩塌）。但：
+1. `pred_sig` 已有 Pearson 相关分量（weight=0.5），直接优化 pred_r2 所测量的时序形状
+2. V5.45/V5.46 无 InfoNCE，但 pred_r2 ≈ 0.30 > 0（未发生崩塌）
+3. `TemporalAttention(is_causal=True)`（V5.42 修复）消除了训练-验证偏差，这才是 pred_r2 的根本保障
+4. 因此 InfoNCE 在本场景中既不必要，又有额外代价
+
+### 修复
+
+```yaml
+# configs/default.yaml
+model:
+  use_info_nce: false   # true → false：消除 9.68B FLOPs/step + 梯度竞争
+```
+
+### 预期效果
+
+| 指标 | V5.50（T=250+InfoNCE） | V5.52（T=500, 无InfoNCE） |
+|------|------------------------|--------------------------|
+| 每步 FLOPs | 基准（含 9.68B InfoNCE） | -3.60B（InfoNCE消除 > T增大） |
+| 训练速度估计 | 慢于 V5.45/V5.46 | ~100-150s/epoch（接近 V5.45） |
+| pred_r2 目标 | ~0.20（InfoNCE梯度竞争） | **~0.30（V5.45/V5.46 验证值）** |
+| 均值崩塌风险 | 受 InfoNCE+Pearson 保护 | 仅 Pearson 保护（已充分） |
+
+### 影响文件
+
+| 文件 | 变更 |
+|------|------|
+| `configs/default.yaml` | `use_info_nce: true → false`；更新注释解释根因分析 |
+| `CHANGELOG.md` | 本条目 |
 
 ---
 
