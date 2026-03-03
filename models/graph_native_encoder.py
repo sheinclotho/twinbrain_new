@@ -256,8 +256,10 @@ class SpatialTemporalGraphConv(MessagePassing):
         #  • For dynamic-graph edges (freshly created each forward pass), data_ptr()
         #    changes every call → always a cache miss → recomputed normally.
         # Eviction: remove the oldest entry (insertion-order, Python 3.7+) when the
-        # cache reaches 64 entries.  Typical usage: 3 edge_types × 4 layers × a few
-        # runs = well below the limit; eviction rarely fires for small window counts.
+        # cache reaches 32 entries.  After the _consolidate_run_edge_tensors() fix in
+        # train_model(), all windows from the same run share the same GPU edge_index
+        # tensor, so the cache only needs O(N_runs) unique entries.  Typical usage:
+        # 3 edge_types × 4 layers × 8 runs = well below the 32-entry limit.
         self._ei_cache: dict = {}
         self.reset_parameters()
     
@@ -410,14 +412,19 @@ class SpatialTemporalGraphConv(MessagePassing):
                 # must not be cached to prevent stale-graph references across steps.
                 if not _ea_requires_grad:
                     # Evict oldest entry when cache is full (insert-order, Python 3.7+).
-                    # Limit set to 64: with typical 80–100 unique window edge_index ptrs,
-                    # 64 entries cover the most-recently-accessed windows with ~80% hit
-                    # rate while halving the permanent GPU memory versus the old 128-entry
-                    # limit.  Each entry stores (ei_chunk, ea_chunk) ≈ 1.6 MB; with 4
-                    # cross-modal STGConv layers that is 64 entries × 4 layers × 1.6 MB
-                    # ≈ 410 MB (vs 820 MB at 128).  The evicted entries are cheaply
-                    # recomputed (pure tensor creation, no heavy math).
-                    if len(self._ei_cache) >= 64:
+                    # Limit set to 32: after the _consolidate_run_edge_tensors() fix in
+                    # train_model(), windows from the same run share the same GPU
+                    # edge_index tensor, so the cache only needs O(N_runs) entries
+                    # instead of the old O(N_windows).  Typical usage with 8–16 runs:
+                    # well within 32 entries.
+                    #
+                    # Memory per entry depends on T (source window size) and E (edges):
+                    #   T=250, E=315 cross-modal: ei=[2,78750]→1.26MB, ea=[78750,1]→0.32MB → 1.58 MB
+                    #   T=500, E=315 cross-modal: ei=[2,157500]→2.52MB, ea=[157500,1]→0.63MB → 3.15 MB
+                    # At T=500: 32 entries × 4 cross-modal layers × 3.15 MB ≈ 403 MB (matches budget).
+                    # At T=250: 32 entries × 4 cross-modal layers × 1.58 MB ≈ 202 MB.
+                    # The old 64-entry limit at T=500 gave 806 MB — double the intended budget.
+                    if len(self._ei_cache) >= 32:
                         oldest_key = next(iter(self._ei_cache))
                         del self._ei_cache[oldest_key]
                     self._ei_cache[_cache_key] = (ei_chunk, ea_chunk)
