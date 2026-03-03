@@ -1,8 +1,46 @@
 # TwinBrain V5 — 更新日志
 
 **最后更新**：2026-03-03  
-**版本**：V5.52  
+**版本**：V5.53  
 **状态**：生产就绪
+
+---
+
+## [V5.53] 2026-03-03 — 修复 epoch 5 CUDA 碎片 OOM：回退 V5.51 大参数，恢复 V5.49 稳定配置
+
+### 问题
+
+V5.51/V5.52 恢复了 `eeg_window_size=500, k_nearest_fmri=20, k_dynamic_neighbors=10`
+（研究质量参数），但这些参数在 8GB GPU 上导致：
+1. **epoch 5 崩溃**：错误发生在 `lin_msg(x_j)` → `torch.nn.utils.parametrizations`（spectral_norm OOM）
+2. **训练极慢**：~500s/epoch（期望 ~100s）
+
+### 根因：_ei_cache 持久张量 + 动态边碎片化累积
+
+- T=500 时 _ei_cache 持久 GPU 张量约 410 MB，vs T=250 时约 210 MB
+- 每 forward 的动态边临时块 11.4 MB（T=500）vs 5.7 MB（T=250）
+- 4 epochs × 80 steps = 320 步循环后，CUDA 碎片达到临界点 → spectral_norm OOM
+
+参见 AGENTS.md 新增条目 [2026-03-03] 详细分析。
+
+### 修复
+
+| 参数 | V5.51 值 | V5.53 修复 | 效果 |
+|------|----------|------------|------|
+| `eeg_window_size` | 500 | **250** | 4× TemporalAttn, 2× propagate, 碎片减慢 2× |
+| `k_nearest_fmri` | 20 | **10** | fMRI 边数减半, _ei_cache 减半 |
+| `k_dynamic_neighbors` | 10 | **5** | 动态边减半, 临时张量减半 |
+
+### 保留
+
+- PR #74 cache-only training mode（无需原始数据的缓存训练）
+- PR #73 _consolidate_run_edge_tensors（O(N_windows)→O(N_runs) 缓存优化）
+
+### 预期结果
+
+- epoch 5+ OOM：消除
+- 速度：~100-150s/epoch（vs 500s+）
+- pred_r2_eeg ≈ 0.19-0.22；pred_r2_fmri ≈ 0.19-0.25
 
 ---
 

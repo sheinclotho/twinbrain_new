@@ -26,6 +26,66 @@
 
 ---
 
+### [2026-03-03] V5.51 参数恢复 + _ei_cache 持久张量 = CUDA 碎片 OOM（epoch 5 崩溃，500s/epoch）
+
+**用户观察**：epoch 4 正常结束（474s），epoch 5 在 `lin_msg(x_j)` 内崩溃，错误指向 `torch.nn.utils.parametrizations`（spectral_norm 功率迭代）。同时训练速度约 500s/epoch（期望 ~100s）。
+
+**思维误区**：V5.51 恢复了 `eeg_window_size=500, k_nearest_fmri=20, k_dynamic_neighbors=10` 以追求 pred_r2 ~0.30。分析时只看了 backward 峰值（GC=True 时 ~2.1 GB，安全），**没有追问 _ei_cache 持久 GPU 张量 + 多 epoch 碎片化的叠加效应**。
+
+**根因（三叠加）**：
+
+1. **_ei_cache 持久 GPU 张量过大**：
+   - T=500, k_nearest=20, k_dynamic=10 的扩展 edge_index 张量：
+     - EEG intra (T=500, E=1260): ei_chunk=[2, 630K]→5MB + ea=2.5MB = 7.5 MB/entry × 8 runs × 4 layers = 240 MB
+     - fMRI intra (T=50, E=3800): 3.4 MB/entry × 8 runs × 4 layers = 109 MB
+     - cross-modal (T=500, E=315): 1.9 MB/entry × 8 runs × 4 layers = 61 MB
+     - **总持久显存 ≈ 410 MB**（vs T=250 时 ≈ 210 MB）
+
+2. **动态边临时张量循环分配/释放造成碎片**：
+   - 动态边（requires_grad=True）不被缓存，每次 forward 重新分配
+   - T=500 时每 forward 分配 ei_chunk=[2, 500×(1260+630)]=[2, 945K]→7.6 MB + ea=3.8 MB = 11.4 MB
+   - 4 梯度累积步 × 12 propagate 调用 = 16 个 11.4 MB 临时块 per mini-batch，持续分配/释放
+   - vs T=250 时每块 ~5.7 MB（2× 小）
+
+3. **epoch 1-4 碎片累积，epoch 5 临界崩溃**：
+   - gc.collect()+empty_cache() 归还空闲块给 CUDA，但碎片化的内存布局无法完全整理
+   - 4 epochs × 80 steps ≈ 320 步的分配/释放循环后，CUDA 空闲列表碎片达到临界点
+   - spectral_norm 功率迭代需要新分配临时张量，CUDA 找不到足够的连续内存块
+   - 错误触发位置：`lin_msg(x_j)` → `torch.nn.utils.parametrizations` → OOM
+
+**为什么之前版本（V5.45/V5.46/V5.49）不崩溃？**
+- V5.49 参数：eeg_window=250, k_nearest_fmri=10, k_dynamic=5 → _ei_cache 约 210 MB，每次临时块 ~5.7 MB
+- 碎片化速度约慢 2-4×，不在 100 epoch 内达到临界点
+- V5.41 的 PR #73 添加了 `_consolidate_run_edge_tensors`，确实减少了 O(N_windows) → O(N_runs) 的缓存条目数，
+  但 V5.51 参数使得每个条目本身就更大，总持久显存仍然超过可接受水平
+
+**修复（V5.53）**：
+```yaml
+# 恢复 V5.49 稳定参数
+windowed_sampling:
+  eeg_window_size: 250   # 500 → 250 (4× TemporalAttn 提速, 2× propagate 提速, 消除碎片 OOM)
+graph:
+  k_nearest_fmri: 10     # 20 → 10 (fMRI 边数减半, _ei_cache 持久张量减半)
+model:
+  k_dynamic_neighbors: 5  # 10 → 5 (动态边减半, 临时张量减半, 碎片速度减慢 2×)
+```
+
+**预期效果**：
+- epoch 5+ OOM 消除（每次临时块 ~5.7 MB vs 11.4 MB，碎片累积速度减半）
+- 速度从 ~500s/epoch → ~100-150s/epoch
+- pred_r2_eeg ≈ 0.19-0.22（可接受），pred_r2_fmri ≈ 0.19-0.25
+
+**保留的修复**：
+- PR #74 cache-only training mode：保留（无需原始数据训练）
+- PR #73 _consolidate_run_edge_tensors：保留（仍有效减少缓存条目数 O(N_windows)→O(N_runs)）
+
+**根本规则**：
+1. **评估内存时必须同时考虑三类内存**：backward 瞬时峰值 + _ei_cache 持久张量 + 动态边临时循环
+2. **"epoch 4 正常，epoch 5 崩溃"是碎片化累积的典型信号**（参见 V5.41 规则）
+3. **V5.51 的"研究质量参数"在 8GB GPU 上不可持续**：backward 峰值安全 ≠ 整体内存安全
+
+---
+
 ### [2026-03-01] temporal_chunk_size × no-checkpointing = 纯 Python overhead（训练极慢）
 
 **用户观察**：epoch 时间 200-260s，但日志显示 `GPU Memory: allocated=0.16 GB, reserved=0.44 GB`（8GB GPU 仅用 2%）。
