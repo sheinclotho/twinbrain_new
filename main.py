@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
 from collections import defaultdict, Counter
@@ -40,6 +41,12 @@ from models.graph_native_mapper import GraphNativeBrainMapper
 from models.graph_native_system import GraphNativeBrainModel, GraphNativeTrainer
 from utils.helpers import setup_logging, set_seed, save_config, create_output_dir
 from utils.visualization import plot_training_curves
+
+
+# Cache-only mode: compiled once at import time for efficiency.
+# Format: {subject_id}_{task_str}_{8-hex-char hash}.pt
+# subject_id follows BIDS convention (sub-XXX, no underscores); task_str may contain underscores.
+_CACHE_FILENAME_RE = re.compile(r'^(sub-[^_]+)_(.+)_([0-9a-f]{8})\.pt$')
 
 
 def truncate_timeseries(ts: np.ndarray, max_len: int) -> np.ndarray:
@@ -409,10 +416,9 @@ def build_graphs(config: dict, logger: logging.Logger):
         # Infer the expected number of parcels from the atlas file name.
         # Pattern: "schaeferNNN" → NNN parcels; "aal116" → 116; etc.
         # Falls back to None (unknown) for non-standard names.
-        import re as _re
-        _m = _re.search(r'_?(\d{2,4})_?[Pp]arcels', atlas_path.name)
+        _m = re.search(r'_?(\d{2,4})_?[Pp]arcels', atlas_path.name)
         if _m is None:
-            _m = _re.search(r'[Ss]chaefer(\d+)', atlas_path.name)
+            _m = re.search(r'[Ss]chaefer(\d+)', atlas_path.name)
         expected_n_rois: Optional[int] = int(_m.group(1)) if _m else None
         try:
             try:
@@ -580,10 +586,52 @@ def build_graphs(config: dict, logger: logging.Logger):
         for t in subject_tasks:
             all_pairs.append((subject_id, t))
 
+    # ── 缓存专用模式（cache-only fallback）───────────────────────────────────
+    # 当原始数据目录不含任何 sub-* 被试文件夹，但图缓存目录已存在 .pt 文件时，
+    # 直接从缓存文件名解析 (subject_id, task) 对，完全跳过原始数据访问。
+    # 典型场景：本地完成数据预处理并生成缓存图后，仅将 .pt 缓存文件上传到云端训练。
+    if not all_pairs and cache_dir is not None and cache_dir.is_dir():
+        # 文件名格式: {subject_id}_{task_str}_{8位十六进制哈希}.pt
+        # subject_id 遵循 BIDS 规范（sub-XXX，不含下划线），task_str 可含下划线。
+        # 正则表达式 _CACHE_FILENAME_RE 在模块级别编译（see top of file）。
+        _cache_discovered: List[tuple] = []
+        for _pt in sorted(cache_dir.glob('*.pt')):
+            _m = _CACHE_FILENAME_RE.match(_pt.name)
+            if not _m:
+                continue
+            _sid, _tsk_str = _m.group(1), _m.group(2)
+            _task: Optional[str] = None if _tsk_str == 'notask' else _tsk_str
+            # tasks_cfg 过滤：仅加载配置中指定的任务
+            if tasks_cfg is not None and len(tasks_cfg) > 0 and _task not in tasks_cfg:
+                continue
+            _cache_discovered.append((_sid, _task))
+        if _cache_discovered:
+            logger.info(
+                f"[缓存专用模式] 原始数据目录 ({data_loader.data_root}) 中未发现被试文件夹。"
+                f" 从图缓存目录发现 {len(_cache_discovered)} 个 (被试, 任务) 组合，"
+                f" 将直接使用缓存图训练（无需原始 EEG/fMRI 文件）。"
+            )
+            all_pairs = _cache_discovered
+            # max_subjects_cfg：按首次出现顺序保留前 N 个被试的所有任务
+            if max_subjects_cfg:
+                _seen_subj = {}
+                for _s, _t in all_pairs:
+                    if _s not in _seen_subj:
+                        _seen_subj[_s] = []
+                    _seen_subj[_s].append(_t)
+                _kept_subj = set(list(_seen_subj.keys())[:max_subjects_cfg])
+                all_pairs = [(_s, _t) for _s, _t in all_pairs if _s in _kept_subj]
+
     if not all_pairs:
         raise ValueError(
-            "未发现任何被试-任务组合，请检查数据路径配置。"
-            f" data.root_dir={config['data']['root_dir']!r}"
+            "未发现任何被试-任务组合。"
+            f" 原始数据目录 ({config['data']['root_dir']!r}) 中未找到 sub-* 文件夹，"
+            + (
+                f" 图缓存目录 ({cache_dir}) 中也未找到匹配的 .pt 缓存文件。"
+                if cache_dir is not None
+                else " 若仅上传了预处理缓存图（无原始数据），请在配置中设置"
+                     " data.cache.enabled=true 并确认 data.cache.dir 路径正确。"
+            )
         )
 
     logger.info(f"发现 {len(all_pairs)} 个被试-任务组合")

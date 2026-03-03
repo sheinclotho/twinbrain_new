@@ -11,12 +11,13 @@
 2. [创建 GPU 集群 / 实例](#2-创建-gpu-集群--实例)  
 3. [配置 Docker 镜像](#3-配置-docker-镜像)  
 4. [挂载本地训练数据](#4-挂载本地训练数据)  
-5. [克隆代码并安装依赖](#5-克隆代码并安装依赖)  
-6. [选择训练配置文件](#6-选择训练配置文件)  
-7. [启动训练](#7-启动训练)  
-8. [监控与查看结果](#8-监控与查看结果)  
-9. [常见问题排查](#9-常见问题排查)  
-10. [停止实例与费用管理](#10-停止实例与费用管理)  
+5. [推荐：本地预处理生成缓存图后上传（跳过云端数据预处理）](#5-推荐本地预处理生成缓存图后上传)  
+6. [克隆代码并安装依赖](#6-克隆代码并安装依赖)  
+7. [选择训练配置文件](#7-选择训练配置文件)  
+8. [启动训练](#8-启动训练)  
+9. [监控与查看结果](#9-监控与查看结果)  
+10. [常见问题排查](#10-常见问题排查)  
+11. [停止实例与费用管理](#11-停止实例与费用管理)  
 
 ---
 
@@ -270,9 +271,116 @@ df -h /data
 
 ---
 
-## 5. 克隆代码并安装依赖
+## 5. 推荐：本地预处理生成缓存图后上传
 
-### 5.1 克隆代码
+> **这是云端训练最高效的方式。**  
+> 数据预处理（atlas 分区、连通性估计）在本地一次性完成，上传轻量的 `.pt` 缓存图即可，
+> 云端实例开机后直接跳过所有耗时的预处理步骤，立刻开始训练。
+
+### 5.1 为什么推荐这种方式？
+
+| 方式 | 云端启动训练耗时 | 需上传文件 | 需要云端安装 nilearn/MNE | 备注 |
+|------|----------------|-----------|------------------------|------|
+| 上传原始数据（EEG + fMRI） | 每次重启都需数分钟至数十分钟 | 原始文件（可达数十 GB） | ✅ 必须 | 标准方式 |
+| **上传预处理缓存图** | **几乎为零（直接读取 .pt）** | **仅 .pt 文件（通常 < 1 GB）** | **❌ 不需要** | **推荐方式** |
+
+### 5.2 在本地生成缓存图
+
+确保本地已安装完整依赖（包括 nilearn、MNE），然后在本地运行一次训练：
+
+```bash
+# 在本地执行（使用 CPU 即可，只需运行到缓存生成完毕后 Ctrl+C 停止）
+cd /path/to/twinbrain_new
+python main.py --config configs/default.yaml
+```
+
+程序会：
+1. 读取原始 EEG/fMRI 数据（仅一次）
+2. 完成 atlas 分区、连通性估计
+3. 将预处理结果保存为 `.pt` 缓存图（位于 `outputs/graph_cache/`）
+4. 开始训练（此时可以 Ctrl+C 停止，缓存已保存）
+
+### 5.3 确认缓存图文件
+
+```bash
+ls outputs/graph_cache/
+# 期望输出（文件名格式：{被试ID}_{任务}_{8位哈希}.pt）：
+# sub-01_rest_a1b2c3d4.pt
+# sub-02_rest_a1b2c3d4.pt
+# sub-03_GRADON_a1b2c3d4.pt
+# ...
+
+# 确认每个被试都有对应的缓存文件
+ls outputs/graph_cache/ | wc -l  # 文件数应 = 被试数 × 任务数
+```
+
+> **重要**：同一套数据在相同配置下只需生成一次缓存图。
+> 之后修改训练超参数（学习率、epoch 数、模型大小等）不会影响缓存图，无需重新生成。
+> 只有修改以下配置才需要重新生成（会自动产生新哈希）：
+> `atlas`、`graph` 拓扑参数、`eeg_connectivity_method`、`dti_structural_edges`。
+
+### 5.4 将缓存图上传到云端实例
+
+```bash
+# 在本地终端执行（将 <IP> 替换为云端实例 IP）
+
+# 方式 A：SCP 直接传输（简单，适合 < 5 GB）
+scp -r outputs/graph_cache/ root@<IP>:/root/twinbrain_new/outputs/graph_cache/
+
+# 方式 B：rsync（推荐，支持断点续传、增量更新）
+rsync -avzP outputs/graph_cache/ root@<IP>:/root/twinbrain_new/outputs/graph_cache/
+
+# 方式 C：先上传到 OSS，再在云端实例上下载（适合数据量大或多实例）
+ossutil cp -r outputs/graph_cache oss://twinbrain-data/graph_cache/ -u
+# 在云端实例上：
+ossutil cp -r oss://twinbrain-data/graph_cache/ /root/twinbrain_new/outputs/graph_cache/ -u
+```
+
+### 5.5 云端配置：无需原始数据即可训练
+
+TwinBrain V5 内置**缓存专用模式**：当 `root_dir` 下没有 `sub-*` 原始数据目录，
+但 `cache.dir` 下已有 `.pt` 缓存文件时，程序会自动从缓存文件名解析被试和任务信息，
+**完全跳过原始数据加载**，直接进入训练。
+
+在云端实例上，只需确保以下配置正确（`root_dir` 可以指向一个不存在或空的目录）：
+
+```yaml
+# configs/default.yaml（云端版本）
+data:
+  root_dir: "/root/twinbrain_new/outputs/graph_cache"  # 可任意填写，不需要包含原始数据
+  
+  cache:
+    enabled: true                                        # ← 必须为 true
+    dir: "outputs/graph_cache"                          # ← 缓存图所在目录（与上传路径一致）
+```
+
+> 程序启动时会打印：  
+> `[缓存专用模式] 原始数据目录 (...) 中未发现被试文件夹，从图缓存目录发现 N 个 (被试, 任务) 组合，将直接使用缓存图训练（无需原始 EEG/fMRI 文件）。`  
+> 这是正常的，说明缓存专用模式已成功启用。
+
+### 5.6 快速验证缓存专用模式
+
+```bash
+cd /root/twinbrain_new
+
+# 快速验证：只跑 1 个 epoch，确认能读取缓存图并启动训练
+python3 -c "
+import yaml, sys
+cfg = yaml.safe_load(open('configs/default.yaml'))
+cfg['training']['epochs'] = 1
+yaml.dump(cfg, open('/tmp/test_cfg.yaml', 'w'), allow_unicode=True)
+" && python3 main.py --config /tmp/test_cfg.yaml
+
+# 期望输出包含：
+# [缓存专用模式] 原始数据目录 (...) 中未发现被试文件夹 ...
+# Epoch 1 | train_loss=X.XXXX ...
+```
+
+---
+
+## 6. 克隆代码并安装依赖
+
+### 6.1 克隆代码
 
 ```bash
 # SSH 登录实例
@@ -286,7 +394,7 @@ git clone https://github.com/sheinclotho/twinbrain_new.git
 cd twinbrain_new
 ```
 
-### 5.2 安装 PyTorch Geometric（关键依赖，顺序不可乱）
+### 6.2 安装 PyTorch Geometric（关键依赖，顺序不可乱）
 
 PyTorch Geometric（PyG）需要与 PyTorch 版本严格匹配，必须先安装 PyTorch 再安装 PyG：
 
@@ -309,13 +417,13 @@ pip install torch-geometric==2.3.1
 > 必须与 `torch.__version__` 和 `torch.version.cuda` 完全一致，
 > 否则会出现 `GLIBCXX` 或 `symbol not found` 错误。
 
-### 5.3 安装其余依赖
+### 6.3 安装其余依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 5.4 安装 nilearn（fMRI atlas 分区，必需）
+### 6.4 安装 nilearn（fMRI atlas 分区，必需）
 
 ```bash
 pip install nilearn
@@ -324,7 +432,7 @@ pip install nilearn
 python3 -c "from nilearn import datasets; print('nilearn OK')"
 ```
 
-### 5.5 安装 MNE（EEG 数据加载，必需）
+### 6.5 安装 MNE（EEG 数据加载，必需）
 
 ```bash
 pip install mne
@@ -333,7 +441,7 @@ pip install mne
 python3 -c "import mne; print('MNE', mne.__version__)"
 ```
 
-### 5.6 完整一键安装脚本
+### 6.6 完整一键安装脚本
 
 以上步骤可合并为一个 shell 脚本，方便下次复用：
 
@@ -377,9 +485,9 @@ bash /root/setup_twinbrain.sh
 
 ---
 
-## 6. 选择训练配置文件
+## 7. 选择训练配置文件
 
-### 6.1 修改数据路径
+### 7.1 修改数据路径
 
 打开配置文件，将 `root_dir` 改为你挂载的数据路径：
 
@@ -392,7 +500,7 @@ sed -i 's|root_dir: "F:/twinbrain_v3/test_file3"|root_dir: "/data/my_data"|g' \
 grep "root_dir" configs/default.yaml
 ```
 
-### 6.2 按 GPU 显存选择配置文件
+### 7.2 按 GPU 显存选择配置文件
 
 | GPU 显存 | 配置文件 | 说明 |
 |---------|---------|------|
@@ -401,7 +509,7 @@ grep "root_dir" configs/default.yaml
 | 24-32 GB | `configs/config_32gb.yaml` | 更大模型（H=256），更长预测视界 |
 | 40+ GB (A100) | `configs/config_32gb.yaml` + 手动放大 | 可将 `hidden_channels` 改为 512 |
 
-### 6.3 A100 / H100 进一步放大参数
+### 7.3 A100 / H100 进一步放大参数
 
 ```bash
 # 创建 A100 专用配置（在 config_32gb.yaml 基础上覆盖）
@@ -429,7 +537,7 @@ device:
 EOF
 ```
 
-### 6.4 编辑 root_dir（各配置文件均需修改）
+### 7.4 编辑 root_dir（各配置文件均需修改）
 
 如果你使用的是非 `default.yaml` 配置文件，由于它们是覆盖式配置，
 `root_dir` 在 `default.yaml` 中定义，修改一次即可：
@@ -449,9 +557,9 @@ print('root_dir 已更新为 /data/my_data')
 
 ---
 
-## 7. 启动训练
+## 8. 启动训练
 
-### 7.1 首次启动（前台运行，验证环境）
+### 8.1 首次启动（前台运行，验证环境）
 
 ```bash
 cd /root/twinbrain_new
@@ -483,7 +591,7 @@ python3 main.py --config configs/config_32gb.yaml
 > ls atlases/  # 应有 Schaefer2018_200Parcels_7Networks_order_FSLMNI152_1mm.nii 等文件
 > ```
 
-### 7.2 后台运行（长期训练推荐）
+### 8.2 后台运行（长期训练推荐）
 
 使用 `nohup` 或 `tmux`，防止 SSH 断开后训练中断：
 
@@ -519,7 +627,7 @@ echo "训练 PID: $!"   # 记录进程号，用于后续停止
 tail -f outputs/train.log
 ```
 
-### 7.3 从断点恢复训练
+### 8.3 从断点恢复训练
 
 如果训练被中断（SSH 断开、实例重启），使用 `--resume` 参数继续：
 
@@ -534,9 +642,9 @@ python3 main.py --config configs/config_32gb.yaml \
 
 ---
 
-## 8. 监控与查看结果
+## 9. 监控与查看结果
 
-### 8.1 实时日志
+### 9.1 实时日志
 
 ```bash
 # 查看最新日志
@@ -546,7 +654,7 @@ tail -f outputs/train.log
 grep -E "Epoch|r2_eeg|r2_fmri|pred_r2|best" outputs/train.log | tail -50
 ```
 
-### 8.2 TensorBoard 可视化
+### 9.2 TensorBoard 可视化
 
 TwinBrain 训练过程会自动保存 TensorBoard 日志到 `outputs/` 目录。
 
@@ -565,7 +673,7 @@ tensorboard --logdir=outputs/ --port=6006 --host=0.0.0.0 &
 > # 然后访问 http://localhost:6006
 > ```
 
-### 8.3 训练结果文件
+### 9.3 训练结果文件
 
 所有结果保存在 `outputs/twinbrain_v5_<时间戳>/` 目录下：
 
@@ -581,7 +689,7 @@ outputs/twinbrain_v5_20260301_120000/
 └── graph_cache/           ← 预处理后的图缓存（下次加速）
 ```
 
-### 8.4 将结果下载到本地
+### 9.4 将结果下载到本地
 
 ```bash
 # 从本地终端执行
@@ -591,7 +699,7 @@ scp -r root@<IP>:/root/twinbrain_new/outputs/twinbrain_v5_20260301_120000 ./
 rsync -avzP root@<IP>:/root/twinbrain_new/outputs/ ./outputs/
 ```
 
-### 8.5 关键训练指标速查
+### 9.5 关键训练指标速查
 
 | 指标 | 研究可用标准 | 早期训练（< 20 epoch）正常范围 |
 |------|------------|-------------------------------|
@@ -605,7 +713,7 @@ rsync -avzP root@<IP>:/root/twinbrain_new/outputs/ ./outputs/
 
 ---
 
-## 9. 常见问题排查
+## 10. 常见问题排查
 
 ### Q1：`N_fmri = 1`，只有 1 个 fMRI 节点
 
@@ -717,7 +825,7 @@ ls /root/twinbrain_new/outputs/graph_cache/
 
 ---
 
-## 10. 停止实例与费用管理
+## 11. 停止实例与费用管理
 
 ### 10.1 保存工作并释放实例
 
@@ -749,7 +857,38 @@ ossutil cp -r /root/twinbrain_new/outputs oss://twinbrain-data/outputs/ -u
 
 ## 快速参考：完整命令序列
 
-以下是从零开始到训练启动的最精简命令序列（适合熟悉流程后的快速执行）：
+以下提供两种常见工作流的精简命令序列。
+
+### 工作流 A：仅上传缓存图（推荐，最快开始训练）
+
+> **前提**：已在本地运行过 `python main.py` 生成了 `outputs/graph_cache/*.pt` 文件。
+
+```bash
+# ① 登录
+ssh root@<IP>
+
+# ② 克隆代码并安装依赖
+git clone https://github.com/sheinclotho/twinbrain_new.git && cd twinbrain_new
+bash /root/setup_twinbrain.sh  # 约 5-10 分钟（首次）
+
+# ③ 上传缓存图（在本地执行）
+rsync -avzP outputs/graph_cache/ root@<IP>:/root/twinbrain_new/outputs/graph_cache/
+
+# ④ 确认缓存专用模式配置（cache.enabled=true 且 cache.dir 指向正确位置）
+grep -A5 "cache:" /root/twinbrain_new/configs/default.yaml
+# 确认输出包含: enabled: true
+
+# ⑤ 启动训练（tmux 保护，防断线）
+tmux new -s twinbrain
+python3 main.py --config configs/config_32gb.yaml 2>&1 | tee outputs/train.log
+# Ctrl+B 然后 D 退出 tmux，训练继续后台运行
+
+# ⑥ 查看进度
+tmux attach -t twinbrain   # 重连查看实时日志
+# 日志中会出现：[缓存专用模式] 从图缓存目录发现 N 个 (被试, 任务) 组合 ...
+```
+
+### 工作流 B：上传原始数据（标准方式）
 
 ```bash
 # ① 登录
@@ -786,4 +925,4 @@ tail -f outputs/train.log
 
 ---
 
-**版本**：V5 Cloud Deploy Guide v1.0 | **适用于**：英博云（cloud.yingboai.com）| **更新**：2026-03-03
+**版本**：V5 Cloud Deploy Guide v1.1 | **适用于**：英博云（cloud.yingboai.com）| **更新**：2026-03-03
