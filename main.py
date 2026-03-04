@@ -1071,7 +1071,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         use_cross_modal_align=config['model'].get('use_cross_modal_align', True),
         pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
         num_runs=effective_num_runs,
-        use_info_nce=config['model'].get('use_info_nce', True),
+        use_info_nce=config['model'].get('use_info_nce', False),
         info_nce_temperature=config['model'].get('info_nce_temperature', 1.0),
         use_reconstruction_loss=config['model'].get('use_reconstruction_loss', True),
     )
@@ -1904,19 +1904,26 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                     )
 
             # ── pred_r2 连续下降趋势检测 ──────────────────────────────────────
-            # 如果 pred_r2 连续 3 次验证均下降（而非偶发波动），可能是 InfoNCE
-            # 与 pred_sig 梯度竞争加剧，或学习率过高导致预测头振荡。
+            # 如果 pred_r2 连续 3 次验证均下降（而非偶发波动），可能是梯度竞争
+            # 加剧，或学习率过高导致预测头振荡。
+            _use_info_nce = getattr(trainer.model, 'use_info_nce', False)
             for _nt in sorted(trainer.model.node_types):
                 _hist_key = f'val_pred_r2_{_nt}'
                 _pred_hist = trainer.history.get(_hist_key, [])
                 if len(_pred_hist) >= 3 and all(
                     _pred_hist[-i] < _pred_hist[-i - 1] for i in range(1, 3)
                 ):
+                    if _use_info_nce:
+                        _nce_hint = (
+                            " (1) InfoNCE 梯度竞争（temperature=1.0 已是推荐值）"
+                            "——若仍持续下降，可将 use_info_nce 设为 false（最后手段）；"
+                        )
+                    else:
+                        _nce_hint = " (1) cross_modal_align 或其他辅助损失梯度竞争；"
                     logger.warning(
                         f"  ⚠️ pred_r2_{_nt} 连续 3 次验证下降"
                         f" ({_pred_hist[-3]:.3f}→{_pred_hist[-2]:.3f}→{_pred_hist[-1]:.3f})。"
-                        " 可能原因: (1) InfoNCE 梯度竞争（temperature=1.0 已是推荐值）"
-                        "——若仍持续下降，可将 use_info_nce 设为 false（最后手段）；"
+                        f" 可能原因:{_nce_hint}"
                         " (2) 学习率过高——建议降低至 1e-4；"
                         " (3) 早停过晚——当前最佳 pred_r2 已在更早 epoch 出现。"
                     )
