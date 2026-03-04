@@ -266,3 +266,94 @@ python reference/consciousness_example.py
 
 所有模块均依赖项目已有的核心依赖（PyTorch、PyG），无额外外部依赖。
 `visualization_consciousness.py` 额外需要 `matplotlib` 和 `seaborn`（已在项目中使用）。
+
+---
+
+## 附录：三项核查报告
+
+> 以下内容回应用户的三项核查请求。
+
+---
+
+### 核查一：跨模态注意力机制的实现状态
+
+**结论：生产训练中已部分实现，但与 `reference/advanced_attention.py` 中的 `CrossModalAttention` 是不同的实现方式。**
+
+当前生产代码（`models/graph_native_system.py`）中存在两个跨模态机制：
+
+| 机制 | 所在位置 | 是否在训练中启用 | 性质 |
+|------|---------|--------------|------|
+| `_cross_modal_align_loss` | `graph_native_system.py:441` | ✅ 是（`use_cross_modal_align=True`，V5.43） | 损失层面的对齐：强制 EEG 和 fMRI 的全局均值潜向量方向一致（CMC 风格余弦对齐） |
+| 图消息传递中的跨模态边 | `graph_native_encoder.py` | ✅ 是 | `('eeg', 'projects_to', 'fmri')` 边上的 ST-GCN 消息传递，实现 EEG→fMRI 的图级信息传递 |
+| `CrossModalAttention`（MHA） | `reference/advanced_attention.py` | ❌ 否（在 reference/ 中） | 显式双向多头交叉注意力，尚未集成到主训练流程 |
+
+**关键区别**：
+
+- 当前生产代码中的"跨模态"是通过**图边消息传递（GNN）+ 损失对齐**实现的，不是注意力机制。
+- `reference/CrossModalAttention` 是基于 `nn.MultiheadAttention` 的显式交叉注意力，功能更强，但尚未集成。
+- 两种方式并不互斥：图消息传递捕获拓扑结构，显式注意力捕获所有节点对的全局关系。集成路线见 reference/README.md §集成路线图建议。
+
+---
+
+### 核查二：GWT 和 IIT 模块的科学性评估
+
+**GWT（全局工作空间理论）** — 实现有效，科学争议不影响使用
+
+| 方面 | 评估 |
+|------|------|
+| 近期证伪进展 | 2023 年 Adversarial Collaboration（Mashour et al., Science 2023）对 GWT 和 IIT 进行了直接对比实验，部分结果不支持 IIT 的预测，但 **GWT 的预测基本得到验证**（后顶叶皮层活动与意识状态相关） |
+| `GlobalWorkspaceIntegrator` 的本质 | 多头注意力实现的竞争-广播机制，在工程上等价于 Transformer 的 self-attention。即使 GWT 理论被修正，这个注意力机制本身作为特征提取器仍然有效 |
+| 对 TwinBrain 的影响 | GWT 模块可以安全使用，将其视为"全脑注意力池化"而非意识理论的严格实现 |
+
+**IIT（整合信息论）** — Φ 计算有严重近似，科学上应谨慎使用
+
+| 方面 | 评估 |
+|------|------|
+| 近期证伪进展 | 2023 年对比实验数据更支持 GWT 而非 IIT（前额叶早期活动的预测被否定）。IIT 3.0 的 Φ 计算本身在理论上也受到质疑（Doerig et al., 2021 *Neuroscience & Biobehavioral Reviews*） |
+| `IntegratedInformationCalculator` 的近似程度 | 代码注释明确说明是"简化近似"（随机分区法，非严格 MIP 搜索）。真正的 IIT Φ 计算是 NP-hard，当前实现实质上是"有效信息流的余弦相似度均值"，与严格 IIT 定义相去甚远 |
+| 对 TwinBrain 的影响 | 如果要发表研究声称测量了 Φ，当前实现**不可直接使用**。但如果仅作为"系统整合度"的近似指标用于分类任务，实用价值保留。**建议**：在论文中将其定义为"图信息整合指数（GII）"而非严格 IIT Φ，以避免科学误导 |
+
+**综合建议**：
+- 可以保留 `ConsciousnessModule` 作为辅助任务，但将描述改为"全脑信息整合状态分类"而非"意识状态检测"
+- 在任何科学发表中，避免直接引用 IIT 理论框架描述当前 Φ 近似计算
+
+---
+
+### 核查三：Predictive Coding 与扰动分析设计的匹配度
+
+**问题分析**：
+
+用户的设计哲学是：
+
+```
+X(t+1) = f(X(t))          # 自主动力系统
+X(t) → X(t) + δ → f → trajectory  # 刺激 = 状态扰动
+```
+
+研究的是"**内在动力学响应性质（intrinsic response）**"，而非受控系统。
+
+**`reference/predictive_coding.py` 与该设计的匹配度**：
+
+| 组件 | 与用户设计的匹配度 | 说明 |
+|------|--------------------|------|
+| `PredictiveCodingLayer` | ⭐ 低 | 是层级感知模型（Rao & Ballard 1999），建模的是自顶向下预测误差最小化，不是动力系统扰动响应 |
+| `HierarchicalPredictiveCoding` | ⭐ 低 | 同上，是感知推断模型，不是时序轨迹仿真 |
+| `ActiveInference` | ⭐⭐ 中 | `transition_model`（状态转移模型）在概念上与用户的 `f(X(t))` 对应，但设计目标是行动选择而非扰动仿真 |
+| `compute_free_energy_loss` | ⭐⭐⭐ 高 | 可以作为预测器的附加损失项，对齐用户的"内在动力学学习"目标（精度加权预测误差 ≈ 让模型更好地学习 f） |
+
+**当前 TwinBrain 与用户设计的实际对齐**：
+
+用户描述的扰动分析框架在**生产代码中已有直接对应实现**：
+
+```
+models/graph_native_system.py:
+  simulate_intervention()          ← X(t) + δ → f → trajectory（impulse 模式）
+  compute_effective_connectivity() ← 系统级响应矩阵（时间平均 EC）
+```
+
+而 `unity_integration/perturbation_analyzer.py`（本次新增）补充了：
+- `compute_response_matrix()` — 保留时间分辨率的 R[i,j,k]（sustained/impulse 两种模式）
+- `analyze_response_matrix()` — 空间传播率、时间衰减、传播延迟分析
+- `validate_response_matrix()` — 跨初始状态一致性验证
+
+**建议**：`reference/predictive_coding.py` 中的 `compute_free_energy_loss` 可以集成为预测器的额外损失约束（让模型更好地学习内在动力学），但 `PredictiveCodingLayer` 和 `HierarchicalPredictiveCoding` 与用户的扰动分析设计无直接关联。
