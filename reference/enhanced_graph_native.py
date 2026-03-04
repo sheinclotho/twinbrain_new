@@ -20,10 +20,10 @@ from torch_geometric.data import HeteroData
 from typing import Dict, List, Optional, Tuple
 import logging
 
-from .graph_native_system import GraphNativeBrainModel, GraphNativeTrainer
-from .consciousness_module import ConsciousnessModule
-from .advanced_attention import CrossModalAttention, SpatialTemporalAttention
-from .predictive_coding import HierarchicalPredictiveCoding, compute_free_energy_loss
+from models.graph_native_system import GraphNativeBrainModel, GraphNativeTrainer
+from reference.consciousness_module import ConsciousnessModule
+from reference.advanced_attention import CrossModalAttention, SpatialTemporalAttention
+from reference.predictive_coding import HierarchicalPredictiveCoding, compute_free_energy_loss
 
 # AMP imports mirrored from graph_native_system
 try:

@@ -633,7 +633,10 @@ def build_graphs(config: dict, logger: logging.Logger):
             # tasks_cfg 过滤：仅加载配置中指定的任务
             if tasks_cfg is not None and len(tasks_cfg) > 0 and _task not in tasks_cfg:
                 continue
-            # 去重：同一 (被试, 任务) 仅记录一次（不同哈希 → 加载时以当前哈希为准）
+            # 去重：同一 (被试, 任务) 仅记录一次。
+            # 若同一组合存在多个哈希不同的缓存文件（来自历史配置变更），
+            # 加载时以「当前配置哈希」为准：_graph_cache_key() 计算精确文件名，
+            # 不匹配的历史文件会触发缓存未命中警告（cache_only 模式）或自动重建（常规模式）。
             if (_sid, _task) not in _seen_pairs:
                 _seen_pairs.add((_sid, _task))
                 _cache_discovered.append((_sid, _task))
@@ -643,8 +646,8 @@ def build_graphs(config: dict, logger: logging.Logger):
             for _s, _t in _cache_discovered:
                 _task_counts[_t] = _task_counts.get(_t, 0) + 1
             _task_summary = ', '.join(
-                f"{_t or 'notask'}×{_n}" for _t, _n in sorted(
-                    _task_counts.items(), key=lambda x: (x[0] or '')
+                f"{(_t or 'notask')}×{_n}" for _t, _n in sorted(
+                    _task_counts.items(), key=lambda x: (x[0] or 'notask')
                 )
             )
             logger.info(
