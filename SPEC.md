@@ -178,16 +178,14 @@ Output: HeteroData (node features [N, T, H])
 
 ### 2.7 预测评估指标体系（V5.47+，科学严谨性设计）
 
-TwinBrain 的验证循环（`GraphNativeTrainer.validate()`，`models/graph_native_system.py`）输出
-九项指标，分四个层次衡量模型的真实预测能力。本节给出每项指标在代码中的**精确计算公式**，
-所有公式均与实现一一对应，可作为复现参考。
+`GraphNativeTrainer.validate()`（`models/graph_native_system.py`）输出九项指标，覆盖重建质量、预测能力和与 AR(1) 基线的相对技能。本节给出每项指标的**精确计算公式**及简要说明，所有公式均与代码实现一一对应。
 
-理解这些指标需要区分两个完全不同的"基线"：
+两个不同的基线：
 
-| 基线 | 含义 | R² 为 0 的语义 |
-|------|------|--------------|
-| **均值基线** | 永远预测信号的全局均值 | R² = 0：与"总是猜均值"持平 |
-| **AR(1) 自相关基线** | 把最后一帧重复作为所有未来预测 | 这个基线自身的 R² 可能很高（高自相关信号）或很负（长程预测时信号已变化） |
+| 基线 | 定义 | 特点 |
+|------|------|------|
+| **均值基线**（R²=0 参考点） | 永远预测信号的全局均值 | R²=0 表示模型等价于"总是猜均值" |
+| **AR(1) 自相关基线** | 把上下文最后一帧复制到所有未来步 | 对高自相关信号（如 BOLD）h=1 极强（免费 R²≈0.7–0.9），对多步预测通常为负 |
 
 ---
 
@@ -215,24 +213,18 @@ $$
 
 **代码位置**：`GraphNativeTrainer._r2_from_accum(ss_res, ss_raw, ss_sum, ss_cnt)`
 
-所有 R² 指标共用同一套单遍在线累加器，避免"逐样本均值"导致的乐观偏差：
+所有 R² 指标共用同一套单遍在线累加器（避免"逐样本均值"导致的乐观偏差）。对全量样本用代数恒等式 $SS_{\text{tot}} = \sum y_i^2 - n\bar{y}^2$ 代替两次扫描：
 
 $$
 \bar{y} = \frac{\sum y_i}{n}, \qquad SS_{\text{tot}} = \sum y_i^2 - n\,\bar{y}^2
 $$
-
-（代数恒等式：$\sum(y_i - \bar{y})^2 = \sum y_i^2 - n\bar{y}^2$，无需二次扫描）
 
 $$
 \boxed{R^2 = 1 - \frac{SS_{\text{res}}}{SS_{\text{tot}}}, \qquad
 SS_{\text{res}} = \sum(y_i - \hat{y}_i)^2}
 $$
 
-当 $SS_{\text{tot}} \leq 10^{-12}$（信号为常数）时返回 $R^2 = 0$。
-取值域：$(-\infty, 1]$；$R^2 = 1$ 为完美，$R^2 = 0$ 与均值预测持平，$R^2 < 0$ 差于均值。
-
-> **注**：代码累加的是全样本（所有节点 × 所有时间步 × 所有通道）的标量和，
-> 因此 $\bar{y}$ 是**全局均值**而非逐样本均值，这消除了传统按样本计算 R² 时忽略样本间方差的系统性偏高。
+当 $SS_{\text{tot}} \leq 10^{-12}$（信号为常数）时返回 $R^2 = 0$。取值域 $(-\infty, 1]$；$R^2=1$ 完美，$R^2=0$ 等于均值预测，$R^2<0$ 差于均值。
 
 ---
 
@@ -240,25 +232,12 @@ $$
 
 **代码位置**：`validate()` → 重建 R² 累加器，键名 `r2_{node_type}`
 
-衡量编码器–解码器的信号重建质量（自编码器能力）。
-
-**计算过程**：
-
-1. 对验证集每个样本，前向传播得到重建信号 $\hat{\mathbf{X}} \in \mathbb{R}^{N \times T' \times C}$
-2. 对齐目标与重建的时间维度：$T_{\min} = \min(T, T')$
-3. 累加残差平方和与目标统计量：
+衡量编码器–解码器的信号重建质量。对验证集每个样本，将重建信号 $\hat{\mathbf{X}}$ 与原始信号 $\mathbf{X}$ 对齐到 $T_{\min} = \min(T, T')$ 后，累加残差：
 
 $$
-SS_{\text{res}}^{\text{recon}} \mathrel{+}= \sum_{n,t,c} \bigl(X_{n,t,c} - \hat{X}_{n,t,c}\bigr)^2
+SS_{\text{res}}^{\text{recon}} \mathrel{+}= \sum_{n,t,c} \bigl(X_{n,t,c} - \hat{X}_{n,t,c}\bigr)^2, \qquad
+\text{r2}_{nt} = 1 - \frac{SS_{\text{res}}^{\text{recon}}}{SS_{\text{tot}}^{\text{recon}}}
 $$
-
-$$
-\sum y^2 \mathrel{+}= \sum_{n,t,c} X_{n,t,c}^2, \quad
-\sum y \mathrel{+}= \sum_{n,t,c} X_{n,t,c}, \quad
-n \mathrel{+}= N \cdot T_{\min} \cdot C
-$$
-
-4. 遍历全部样本后代入 §2.7.1 公式得到 `r2_{nt}`。
 
 ---
 
@@ -266,20 +245,7 @@ $$
 
 **代码位置**：`validate()` → 信号空间预测 R² 累加器，键名 `pred_r2_{node_type}`
 
-衡量"在完全不知道未来的前提下"预测未来信号的能力。这是最重要的数字孪生能力指标。
-
-**因果编码保证**（六步流程）：
-
-| 步骤 | 操作 | 目的 |
-|------|------|------|
-| 1 | 计算 $T_{\text{ctx}} = \lfloor T \times 2/3 \rfloor$ | 确定上下文/未来分割点 |
-| 2 | 构造上下文数据 $\mathbf{X}_{:T_{\text{ctx}}}$（只保留前 $T_{\text{ctx}}$ 步原始信号） | 切断对未来的访问 |
-| 3 | 对上下文数据重新编码（独立的 forward pass，无梯度） | 消除 Conv1d 边界泄漏，保证因果性 |
-| 4 | 调用 `predictor.predict_next(h_ctx, num_steps=S)` 生成预测潜向量 | 自回归预测 |
-| 5 | 经 `GraphPredictionPropagator` 在图上传播预测 | 系统级脑区交互 |
-| 6 | 解码为信号空间 $\hat{\mathbf{Y}} \in \mathbb{R}^{N \times S \times C}$；与真实未来 $\mathbf{X}_{T_{\text{ctx}}:T_{\text{ctx}}+S}$ 比较 | 计算 pred_r2 |
-
-**累加公式**（同 §2.7.1，作用于未来段）：
+最重要的数字孪生能力指标：在完全不知道未来的前提下，预测未来信号的准确程度。**因果保证**：验证时对前 $T_{\text{ctx}}$ 步重新独立编码（新的 forward pass，无梯度），避免双向注意力对未来信息的访问。随后调用 `predictor.predict_next(h_ctx, num_steps=S)` 自回归生成预测，经 `GraphPredictionPropagator` 图传播后解码，与真实未来段对比：
 
 $$
 SS_{\text{res}}^{\text{pred}} \mathrel{+}= \sum_{n,h,c} \bigl(Y_{n,h,c} - \hat{Y}_{n,h,c}\bigr)^2, \quad h = 1, \ldots, S
@@ -295,24 +261,14 @@ $$
 
 **代码位置**：`validate()` → `ar1_ss_res` 累加器，键名 `ar1_r2_{node_type}`
 
-零参数基线：在所有 $h = 1, \ldots, S$ 步都预测上下文最后一帧（常数外推）。
+零参数基线：对所有 $h = 1, \ldots, S$ 步一律预测上下文最后一帧（常数外推），与 `pred_r2` 共享 $SS_{\text{tot}}^{\text{pred}}$ 统计量：
 
 $$
-\hat{Y}_{n,h,c}^{\text{AR(1)}} = X_{n,\, T_{\text{ctx}}-1,\, c} \quad \forall h
+\hat{Y}_{n,h,c}^{\text{AR(1)}} = X_{n,\, T_{\text{ctx}}-1,\, c} \quad \forall h, \qquad
+\text{ar1\_r2}_{nt} = 1 - \frac{\sum_{n,h,c}(Y_{n,h,c} - X_{n,T_{\text{ctx}}-1,c})^2}{SS_{\text{tot}}^{\text{pred}}}
 $$
 
-$$
-SS_{\text{res}}^{\text{AR(1)}} \mathrel{+}= \sum_{n,h,c} \bigl(Y_{n,h,c} - X_{n,\, T_{\text{ctx}}-1,\, c}\bigr)^2
-$$
-
-与 `pred_r2` **共享** $SS_{\text{tot}}$ 的统计量（$\sum y^2$，$\sum y$，$n$），最终：
-
-$$
-\text{ar1\_r2}_{nt} = 1 - \frac{SS_{\text{res}}^{\text{AR(1)}}}{SS_{\text{tot}}^{\text{pred}}}
-$$
-
-> **注**：`ar1_r2` 可以为负。当预测步数多（例如 15 步 = fMRI 30s）时，
-> 恒等外推比预测全局均值更差，这是信号已发生实质变化的正常物理表现，不是 bug。
+`ar1_r2` 对多步预测通常为负：对多步预测（如 15 步），AR(1) 基线（重复最后一帧）的累积误差通常超过均值基线，导致 `ar1_r2 < 0`，这是信号时序变化的预期结果，不是 bug。
 
 ---
 
@@ -382,16 +338,13 @@ $$
 
 #### 2.7.8 h=1 去相关技能分数（`decorr_h1_{nt}`）★ NPI 可比
 
-**代码位置**：`validate()` 末尾，`decorr_h1 = (pred_r2_h1 - ar1_r2_h1) / max(1e-3, 1.0 - ar1_r2_h1)`，键名 `decorr_h1_{node_type}`
+**代码位置**：`validate()` 末尾，键名 `decorr_h1_{node_type}`
 
 $$
 \boxed{\text{decorr\_h1}_{nt} = \frac{\text{pred\_r2\_h1}_{nt} - \text{ar1\_r2\_h1}_{nt}}{\max(10^{-3},\; 1 - \text{ar1\_r2\_h1}_{nt})}}
 $$
 
-与 NPI（Luo et al., *Nature Methods* 2025）的 3→1 预测直接可比：
-- `decorr_h1 > 0`：TwinBrain 的单步预测超越纯自相关，确实学到了神经动力学
-- `decorr_h1 = 0`：等价于 AR(1)（仅利用自相关）
-- `decorr_h1 < 0`（多步训练时 EEG 可能出现）：见 §2.7.9 梯度竞争解释
+与 NPI（Luo et al., *Nature Methods* 2025）的 3→1 预测直接可比：`decorr_h1 > 0` 表示 TwinBrain 单步预测超越纯自相关；`decorr_h1 < 0` 且 `decorr > 0` 是物理预期的梯度竞争（见 §2.7.11），非模型失败。
 
 ---
 
@@ -421,42 +374,38 @@ $$
 
 #### 2.7.10 训练损失与评估指标的对应关系
 
-`compute_loss()` 在训练时计算以下损失（不直接出现在验证报告中，但影响最终 `pred_r2`）：
+`compute_loss()` 计算以下三类损失驱动 `pred_r2` 的提升（不直接出现在验证报告中）：
 
 **① 潜空间预测损失 `pred_{nt}`**（快速收敛锚）
 
-$$
-L_{\text{pred}} = \frac{1}{S} \sum_{h=1}^{S} w_h \cdot \ell\bigl(\hat{z}_h,\; z_h^{\text{fut}}\bigr)
-$$
-
-其中 $\ell$ 为 Huber（$\delta=1$）或 MSE，由 `loss_type` 决定；步权重（`pred_step_weight_gamma = γ`）：
+在 latent 空间对未来 $S$ 步做步权重加权的 Huber/MSE 监督。$\gamma>0$ 时远步权重更大（偏向长程），$\gamma=0$ 时等权：
 
 $$
-w_h = \frac{\exp\!\left(\gamma \cdot \frac{h-1}{S-1}\right)}{\frac{1}{S}\sum_{h'}\exp\!\left(\gamma \cdot \frac{h'-1}{S-1}\right)}, \quad h = 1, \ldots, S
+L_{\text{pred}} = \frac{1}{S} \sum_{h=1}^{S} w_h \cdot \ell\bigl(\hat{z}_h,\; z_h^{\text{fut}}\bigr), \qquad
+w_h = \frac{\exp\!\left(\gamma \cdot \frac{h-1}{S-1}\right)}{\frac{1}{S}\sum_{h'}\exp\!\left(\gamma \cdot \frac{h'-1}{S-1}\right)}
 $$
 
-（均值归一化，保持损失量级不变；$\gamma = 0$ 时退化为等权，$\gamma > 0$ 时远步权重更大）
+**② 信号空间预测损失 `pred_sig_{nt}`**（直接对齐 `pred_r2` 指标）
 
-**② 信号空间预测损失 `pred_sig_{nt}`**（直接对齐 `pred_r2` 评估指标）
+在原始信号空间监督，同时优化幅度（Huber）和时序形状（Pearson 相关），确保解码器在预测潜向量上也能泛化：
 
 $$
 L_{\text{pred\_sig}} = \ell\bigl(\hat{Y}_{:S},\; Y_{\text{fut},:S}\bigr) + 0.5 \cdot \bigl(1 - r(\hat{Y}_{:S},\; Y_{\text{fut},:S})\bigr)
 $$
 
-第一项 Huber/MSE 对齐幅度，第二项 Pearson 相关损失对齐时序形状（权重 0.5，见 V5.39）：
-
 $$
 r(\hat{Y}, Y) = \frac{\sum_{n,h,c}(\hat{Y}_{n,h,c} - \bar{\hat{Y}})( Y_{n,h,c} - \bar{Y})}{\sqrt{\sum_{n,h,c}(\hat{Y}_{n,h,c}-\bar{\hat{Y}})^2 \cdot \sum_{n,h,c}(Y_{n,h,c}-\bar{Y})^2}}
 $$
 
-**③ InfoNCE 对比预测损失 `pred_nce_{nt}`**（防均值崩塌，V5.47+，可关闭）
+**③ InfoNCE 对比预测损失 `pred_nce_{nt}`**（防均值崩塌，V5.47+，默认开启）
+
+对 batch 内所有其他 (节点, 步) 对作为负样本，用余弦相似度做对比学习，防止预测器退化为预测常数均值：
 
 $$
 L_{\text{NCE}} = -\frac{1}{N \cdot S} \sum_{n,h} \log \frac{\exp(\text{sim}(\hat{z}_{n,h},\; z_{n,h}^+) / \tau)}{\sum_{n',h'} \exp(\text{sim}(\hat{z}_{n,h},\; z_{n',h'}) / \tau)}
 $$
 
-其中 $\text{sim}(\cdot,\cdot)$ 为余弦相似度，$\tau$ 为温度参数（`info_nce_temperature`，默认 1.0），
-负样本为 batch 内所有其他 (节点, 步) 对（$N \times S - 1$ 个）。
+$\text{sim}(\cdot,\cdot)$ 为余弦相似度，$\tau$ 为温度参数（`info_nce_temperature`，默认 1.0）。
 
 ---
 
@@ -464,37 +413,18 @@ $$
 
 | 模态 | 采样率 | h=1 间隔 | `ar1_r2_h1` | `decorr_h1` 目标 |
 |------|--------|---------|-------------|-----------------|
-| EEG  | 250 Hz | 4 ms    | ≈ 0.8–0.9   | 可为负（多步训练取舍） |
+| EEG  | 250 Hz | 4 ms    | ≈ 0.8–0.9   | 多步训练时可为负（梯度竞争，见下） |
 | fMRI | 0.5 Hz | 2 s     | ≈ 0.7–0.9   | > 0 为目标 |
 
-对于 **多步预测**（TwinBrain 核心任务）：
-- EEG 15 步 = 60 ms：跨越 alpha 周期（83 ms），`ar1_r2` 急剧下降至 < 0
-- fMRI 15 步 = 30 s：超出 HRF 主要响应时程（8–12 s），`ar1_r2` 同样严重下降
+多步预测（15 步 = EEG 60ms / fMRI 30s）会把参数推向"学习时序周期模式"，而非"复制上一帧"。两种策略梯度方向不同，导致多步训练时 `decorr_h1_eeg < 0` 而 `decorr_eeg > 0` — 这是**物理预期的取舍**，不是模型失败。判读规则：
 
-#### decorr_h1 为负时的三级判读
-
-`decorr_h1_{nt} < 0` 的含义和严重程度**取决于同时发生的事**：
-
-| 条件组合 | 含义 | 警报级别 |
+| 条件组合 | 含义 | 严重程度 |
 |---------|------|---------|
-| `decorr_h1 < 0` 且 `decorr > 0` | **物理预期的梯度竞争**（见下文） | ℹ️ INFO |
-| `decorr_h1 < 0` 且 `decorr < 0` | 模型单步和多步均未超越 AR(1) | ⛔ WARNING |
-| `pred_r2_h1 < 0`（差于均值基线） | 绝对失败 | ⛔ WARNING |
+| `decorr_h1 < 0` 且 `decorr > 0` | 梯度竞争，多步有效 | ℹ️ INFO |
+| `decorr_h1 < 0` 且 `decorr < 0` | 单步和多步均差于 AR(1) | ⛔ WARNING |
+| `pred_r2 < 0`（差于均值基线） | 绝对失败 | ⛔ WARNING |
 
-#### 梯度竞争：为何长程训练不能自动改善单步预测
-
-1. **训练损失对所有步求和**：$L = \sum_h w_h \cdot \ell(\hat{Y}_h, Y_h)$，参数对 $h=1,\ldots,S$ 的误差共同负责。
-2. **h=1 的最优策略 ≠ h=S 的最优策略**：单步最优是"接近恒等映射"（利用自相关），长步最优是"捕捉时序周期性"，两者需要不同的参数配置。
-3. **预测器联合生成所有步**：参数必须在各 horizon 间折中；优化 h=5–15 的梯度会把网络引向"学习时序周期模式"而非"复制上一帧"。
-4. **如需改善 decorr_h1 > 0**（可选）：设 `pred_step_weight_gamma < 0`（偏向近步）或对 h=1 单独加权；代价是远步预测能力（decorr）略有下降。
-
-#### NPI 自相关分析
-
-**背景**：NPI（Luo et al., *Nature Methods* 2025）使用 3 个 TR 上下文预测 1 个 TR，未报告 `decorr_h1`。
-对于 BOLD（ρ ≈ 0.85–0.95），AR(1) 可免费获得 R² ≈ 0.7–0.9；AR(3) 进一步利用自相关历史，
-其性能增益可能完全来自自相关，而非真实神经动力学。
-
-TwinBrain 显式报告 `decorr_h1`，使这一分离可被量化验证。
+**NPI 对比说明**：NPI（Luo et al., *Nature Methods* 2025）做 3→1 预测，未报告 `decorr_h1`。对于高自相关 BOLD（ρ≈0.85–0.95），AR(1) 单步可免费获得 R²≈0.7–0.9，NPI 部分性能增益可能来自自相关而非真实神经动力学。`decorr_h1` 是量化这一分离的客观指标。
 
 ---
 
@@ -507,6 +437,8 @@ TwinBrain 显式报告 `decorr_h1`，使这一分离可被量化验证。
 | `decorr_{nt}`（多步技能） | > 0 即有效；> 0.3 为良好 | > 0 即有效；> 0.3 为良好 | — |
 | `pred_r2_h1_{nt}`（h=1） | < `ar1_r2_h1` 可接受（见上文） | ≥ `ar1_r2_h1` 为目标 | NPI 对标 |
 | `decorr_h1_{nt}`（h=1 技能） | 可为负（多步训练取舍） | > 0 为目标 | NPI 对标 |
+
+> **可视化工具**：训练结束后，运行 `python plot_log.py outputs/<run_dir>/` 可从 `training.log` 自动解析以上指标并生成 2×2 训练曲线图（`training_curves.png`）。详见 `plot_log.py` 文件头注释。
 
 ---
 
