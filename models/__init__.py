@@ -1,17 +1,14 @@
 """
-TwinBrain Models Module
-=======================
+TwinBrain — 生产模型模块
+========================
 
-Exports all model components including:
-- Base graph-native models
-- Consciousness modules (GWT, IIT)
-- Advanced attention mechanisms
-- Predictive coding
-- Enhanced models
-- Digital twin inference engine (V5.44)
+仅导出主训练流程（main.py / val.py）实际使用的组件。
+
+高级实验性模块（意识建模、预测编码、增强注意力等）已移至
+``reference/`` 目录，附带完整说明文档（reference/README.md）。
 """
 
-# Base models
+# 图原生基础模型
 from .graph_native_system import (
     GraphNativeBrainModel,
     GraphNativeTrainer,
@@ -21,86 +18,25 @@ from .graph_native_encoder import (
     GraphNativeEncoder,
     SpatialTemporalGraphConv,
 )
-from .graph_native_mapper import (
-    GraphNativeBrainMapper,
-)
+from .graph_native_mapper import GraphNativeBrainMapper
 
-# Optimization modules
+# 优化模块
 from .adaptive_loss_balancer import AdaptiveLossBalancer
 from .eeg_channel_handler import EnhancedEEGHandler
 from .advanced_prediction import EnhancedMultiStepPredictor
 
-# Digital twin inference engine (V5.44)
+# 数字孪生推理引擎（V5.44）
 from .digital_twin_inference import TwinBrainDigitalTwin
 
-# Consciousness modules (new)
-from .consciousness_module import (
-    ConsciousnessModule,
-    GlobalWorkspaceIntegrator,
-    IntegratedInformationCalculator,
-    ConsciousnessStateClassifier,
-    CONSCIOUSNESS_STATES,
-)
-
-# Advanced attention (new)
-from .advanced_attention import (
-    CrossModalAttention,
-    SpatialTemporalAttention,
-    GraphAttentionWithEdges,
-    HierarchicalAttention,
-    ContrastiveAttention,
-)
-
-# Predictive coding (new)
-from .predictive_coding import (
-    PredictiveCodingLayer,
-    HierarchicalPredictiveCoding,
-    ActiveInference,
-    PredictiveBrainModel,
-    compute_free_energy_loss,
-)
-
-# Enhanced models (new)
-from .enhanced_graph_native import (
-    ConsciousGraphNativeBrainModel,
-    EnhancedGraphNativeTrainer,
-    create_enhanced_model,
-)
-
 __all__ = [
-    # Base models
     'GraphNativeBrainModel',
     'GraphNativeTrainer',
     'GraphNativeDecoder',
     'GraphNativeEncoder',
     'SpatialTemporalGraphConv',
     'GraphNativeBrainMapper',
-    # Optimization
     'AdaptiveLossBalancer',
     'EnhancedEEGHandler',
     'EnhancedMultiStepPredictor',
-    # Digital twin inference engine (V5.44)
     'TwinBrainDigitalTwin',
-    # Consciousness
-    'ConsciousnessModule',
-    'GlobalWorkspaceIntegrator',
-    'IntegratedInformationCalculator',
-    'ConsciousnessStateClassifier',
-    'CONSCIOUSNESS_STATES',
-    # Attention
-    'CrossModalAttention',
-    'SpatialTemporalAttention',
-    'GraphAttentionWithEdges',
-    'HierarchicalAttention',
-    'ContrastiveAttention',
-    # Predictive coding
-    'PredictiveCodingLayer',
-    'HierarchicalPredictiveCoding',
-    'ActiveInference',
-    'PredictiveBrainModel',
-    'compute_free_energy_loss',
-    # Enhanced models
-    'ConsciousGraphNativeBrainModel',
-    'EnhancedGraphNativeTrainer',
-    'create_enhanced_model',
 ]

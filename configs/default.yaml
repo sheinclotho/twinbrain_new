@@ -139,6 +139,24 @@ data:
     enabled: true
     dir: "outputs/graph_cache"
 
+    # ── 云端训练专用选项 ─────────────────────────────────────────────────────
+    # cache_only: true — 完全跳过原始数据目录扫描，仅从 .pt 缓存图文件加载。
+    #
+    # 云端训练步骤：
+    #   1. 本地完成所有被试的数据预处理（运行一次 main.py，生成 .pt 缓存图）
+    #   2. 将 outputs/graph_cache/*.pt 上传到云端同路径
+    #   3. 云端 config 中：
+    #        data.root_dir: ""  # 或任意路径，不需要存在
+    #        data.cache.enabled: true
+    #        data.cache.cache_only: true
+    #        data.cache.dir: "outputs/graph_cache"  # 与本地一致
+    #   4. 运行 python main.py，完全从缓存图训练，无需原始 EEG/fMRI 数据
+    #
+    # 注意：云端使用的 config 中，图相关参数（graph.*、atlas、windowed_sampling 等）
+    #       必须与生成缓存时的本地 config 完全一致，否则哈希不匹配，缓存文件无法被识别。
+    #       data.root_dir 不参与哈希计算，可以随意修改。
+    cache_only: false
+
 # ──────────────────────────────────────────────────────────────────────────
 # 二、模型结构
 # ──────────────────────────────────────────────────────────────────────────

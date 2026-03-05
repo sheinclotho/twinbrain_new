@@ -567,7 +567,7 @@ class GraphNativeBrainModel(nn.Module):
         use_cross_modal_align: bool = True,
         pred_step_weight_gamma: float = 1.0,
         num_runs: int = 0,
-        use_info_nce: bool = True,
+        use_info_nce: bool = False,
         info_nce_temperature: float = 1.0,
         use_reconstruction_loss: bool = True,
     ):

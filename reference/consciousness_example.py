@@ -24,12 +24,12 @@ from typing import Dict, List
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from models import (
+from reference.enhanced_graph_native import (
     create_enhanced_model,
     EnhancedGraphNativeTrainer,
-    CONSCIOUSNESS_STATES,
 )
-from utils.visualization import ConsciousnessVisualizer
+from reference.consciousness_module import CONSCIOUSNESS_STATES
+from reference.visualization_consciousness import ConsciousnessVisualizer
 from torch_geometric.data import HeteroData
 
 # Setup logging

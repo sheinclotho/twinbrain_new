@@ -494,6 +494,15 @@ def build_graphs(config: dict, logger: logging.Logger):
     # ── 图缓存设置 ──────────────────────────────────────────────
     cache_cfg = config['data'].get('cache', {})
     cache_enabled = cache_cfg.get('enabled', False)
+    # cache_only=true: 跳过所有原始数据扫描，仅从 .pt 缓存图文件加载。
+    # 典型场景：云端训练时，仅上传 outputs/graph_cache/*.pt 而无原始 EEG/fMRI 数据。
+    cache_only_mode: bool = bool(cache_cfg.get('cache_only', False))
+    if cache_only_mode and not cache_enabled:
+        logger.warning(
+            "data.cache.cache_only=true 但 data.cache.enabled=false。"
+            " 缓存专用模式需要缓存目录，已自动启用 cache.enabled=true。"
+        )
+        cache_enabled = True
     cache_dir: Optional[Path] = None
     if cache_enabled:
         # 相对路径相对于项目根目录（即 main.py 所在目录）解析，
@@ -568,7 +577,25 @@ def build_graphs(config: dict, logger: logging.Logger):
     _max_sub = config['data'].get('max_subjects')
     max_subjects_cfg = int(_max_sub) if _max_sub else None  # 0 / null → None
 
-    subject_dirs = sorted(data_loader.data_root.glob("sub-*"))
+    # cache_only=true: 明确跳过原始数据目录扫描，全部依赖缓存图。
+    if cache_only_mode:
+        subject_dirs = []
+        logger.info(
+            "[缓存专用模式] cache_only=true — 跳过原始数据目录扫描，"
+            f" 将从缓存目录 ({cache_dir}) 直接加载所有图数据。"
+        )
+    else:
+        # 使用 try/except 保证：当 data_root 在云端不存在时不崩溃，
+        # 而是触发下方的缓存专用模式自动回退。
+        try:
+            subject_dirs = sorted(data_loader.data_root.glob("sub-*"))
+        except OSError:
+            subject_dirs = []
+            logger.info(
+                f"数据根目录不可访问 ({data_loader.data_root})，"
+                " 将尝试从缓存图自动加载。"
+                " 若为云端训练场景，建议在 config 中设置 data.cache.cache_only: true。"
+            )
     if max_subjects_cfg:
         subject_dirs = subject_dirs[:max_subjects_cfg]
 
@@ -586,15 +613,17 @@ def build_graphs(config: dict, logger: logging.Logger):
         for t in subject_tasks:
             all_pairs.append((subject_id, t))
 
-    # ── 缓存专用模式（cache-only fallback）───────────────────────────────────
-    # 当原始数据目录不含任何 sub-* 被试文件夹，但图缓存目录已存在 .pt 文件时，
-    # 直接从缓存文件名解析 (subject_id, task) 对，完全跳过原始数据访问。
-    # 典型场景：本地完成数据预处理并生成缓存图后，仅将 .pt 缓存文件上传到云端训练。
+    # ── 缓存专用模式（自动回退 or 显式启用）──────────────────────────────────
+    # 触发条件：
+    #   A. cache_only=true（显式） — 用户明确告知无原始数据（云端训练场景）
+    #   B. all_pairs 为空（自动回退） — data_root 不存在或无 sub-* 文件夹
+    # 两种情况均从缓存文件名解析 (subject_id, task) 对，完全跳过原始数据访问。
+    # 文件名格式: {subject_id}_{task_str}_{8位十六进制哈希}.pt
+    # 注：同一 (subject_id, task) 若存在多个哈希不同的缓存文件（来自不同配置的历史运行），
+    #     以当前配置哈希为准；其余文件被忽略（不影响功能，只占用磁盘空间）。
     if not all_pairs and cache_dir is not None and cache_dir.is_dir():
-        # 文件名格式: {subject_id}_{task_str}_{8位十六进制哈希}.pt
-        # subject_id 遵循 BIDS 规范（sub-XXX，不含下划线），task_str 可含下划线。
-        # 正则表达式 _CACHE_FILENAME_RE 在模块级别编译（see top of file）。
         _cache_discovered: List[tuple] = []
+        _seen_pairs: set = set()
         for _pt in sorted(cache_dir.glob('*.pt')):
             _m = _CACHE_FILENAME_RE.match(_pt.name)
             if not _m:
@@ -604,34 +633,55 @@ def build_graphs(config: dict, logger: logging.Logger):
             # tasks_cfg 过滤：仅加载配置中指定的任务
             if tasks_cfg is not None and len(tasks_cfg) > 0 and _task not in tasks_cfg:
                 continue
-            _cache_discovered.append((_sid, _task))
+            # 去重：同一 (被试, 任务) 仅记录一次。
+            # 若同一组合存在多个哈希不同的缓存文件（来自历史配置变更），
+            # 加载时以「当前配置哈希」为准：_graph_cache_key() 计算精确文件名，
+            # 不匹配的历史文件会触发缓存未命中警告（cache_only 模式）或自动重建（常规模式）。
+            if (_sid, _task) not in _seen_pairs:
+                _seen_pairs.add((_sid, _task))
+                _cache_discovered.append((_sid, _task))
         if _cache_discovered:
+            # 按任务名再次分组，输出便于排查的任务分布日志
+            _task_counts: Dict[Optional[str], int] = {}
+            for _s, _t in _cache_discovered:
+                _task_counts[_t] = _task_counts.get(_t, 0) + 1
+            _task_summary = ', '.join(
+                f"{(_t or 'notask')}×{_n}" for _t, _n in sorted(
+                    _task_counts.items(), key=lambda x: (x[0] or 'notask')
+                )
+            )
             logger.info(
-                f"[缓存专用模式] 原始数据目录 ({data_loader.data_root}) 中未发现被试文件夹。"
-                f" 从图缓存目录发现 {len(_cache_discovered)} 个 (被试, 任务) 组合，"
-                f" 将直接使用缓存图训练（无需原始 EEG/fMRI 文件）。"
+                f"[缓存专用模式] 从图缓存目录发现 {len(_cache_discovered)} 个 (被试, 任务) 组合"
+                + (f"（任务过滤: {tasks_cfg}）" if tasks_cfg else "")
+                + f"  |  任务分布: {_task_summary}"
+                + "  |  将直接使用缓存图训练（无需原始 EEG/fMRI 文件）。"
             )
             all_pairs = _cache_discovered
-            # max_subjects_cfg：按首次出现顺序保留前 N 个被试的所有任务
+            # max_subjects_cfg：按字母顺序保留前 N 个被试的所有任务
             if max_subjects_cfg:
-                _seen_subj = {}
-                for _s, _t in all_pairs:
-                    if _s not in _seen_subj:
-                        _seen_subj[_s] = []
-                    _seen_subj[_s].append(_t)
-                _kept_subj = set(list(_seen_subj.keys())[:max_subjects_cfg])
+                _all_subj_sorted = sorted(set(_s for _s, _ in all_pairs))
+                _kept_subj = set(_all_subj_sorted[:max_subjects_cfg])
                 all_pairs = [(_s, _t) for _s, _t in all_pairs if _s in _kept_subj]
 
     if not all_pairs:
+        _hint = ""
+        if cache_dir is not None:
+            _hint = (
+                f" 图缓存目录 ({cache_dir}) 中也未找到匹配的 .pt 缓存文件。"
+                " 云端训练步骤：① 本地运行一次生成缓存；② 上传 outputs/graph_cache/*.pt；"
+                " ③ 云端配置 data.cache.enabled: true + data.cache.cache_only: true"
+                " + data.root_dir 可设为任意路径。"
+            )
+        else:
+            _hint = (
+                " 若仅上传了预处理缓存图（无原始数据），请在配置中设置"
+                " data.cache.enabled: true, data.cache.cache_only: true"
+                " 并确认 data.cache.dir 路径正确。"
+            )
         raise ValueError(
             "未发现任何被试-任务组合。"
-            f" 原始数据目录 ({config['data']['root_dir']!r}) 中未找到 sub-* 文件夹，"
-            + (
-                f" 图缓存目录 ({cache_dir}) 中也未找到匹配的 .pt 缓存文件。"
-                if cache_dir is not None
-                else " 若仅上传了预处理缓存图（无原始数据），请在配置中设置"
-                     " data.cache.enabled=true 并确认 data.cache.dir 路径正确。"
-            )
+            f" 原始数据目录 ({config['data']['root_dir']!r}) 中未找到 sub-* 文件夹。"
+            + _hint
         )
 
     logger.info(f"发现 {len(all_pairs)} 个被试-任务组合")
@@ -710,6 +760,15 @@ def build_graphs(config: dict, logger: logging.Logger):
 
         # ── 缓存未命中：加载原始数据并构建图 ─────────────────────
         # 只有在缓存中找不到预构建图时，才执行耗时的 EEG/fMRI 原始数据加载与预处理。
+        if cache_only_mode:
+            # cache_only=true 时不允许回退到原始数据加载，跳过此样本并给出明确提示。
+            logger.warning(
+                f"[缓存专用模式] 缓存未命中，跳过 {subject_id}/{task}。"
+                f" 预期缓存文件: {cache_key}。"
+                " 原因可能是：① 该被试的缓存文件未上传；② 云端 config 与生成缓存时的 config 不一致"
+                " （图参数、atlas、windowed_sampling 等，修改这些参数会改变缓存文件名哈希）。"
+            )
+            continue
         logger.debug(f"缓存未命中，加载原始数据: {subject_id}/{task}")
         subject_data = data_loader.load_subject(subject_id, task)
         if not subject_data:
@@ -1071,7 +1130,7 @@ def create_model(config: dict, logger: logging.Logger, num_subjects: int = 0, nu
         use_cross_modal_align=config['model'].get('use_cross_modal_align', True),
         pred_step_weight_gamma=config['model'].get('pred_step_weight_gamma', 1.0),
         num_runs=effective_num_runs,
-        use_info_nce=config['model'].get('use_info_nce', True),
+        use_info_nce=config['model'].get('use_info_nce', False),
         info_nce_temperature=config['model'].get('info_nce_temperature', 1.0),
         use_reconstruction_loss=config['model'].get('use_reconstruction_loss', True),
     )
@@ -1904,19 +1963,26 @@ def train_model(model, graphs, config: dict, logger: logging.Logger,
                     )
 
             # ── pred_r2 连续下降趋势检测 ──────────────────────────────────────
-            # 如果 pred_r2 连续 3 次验证均下降（而非偶发波动），可能是 InfoNCE
-            # 与 pred_sig 梯度竞争加剧，或学习率过高导致预测头振荡。
+            # 如果 pred_r2 连续 3 次验证均下降（而非偶发波动），可能是梯度竞争
+            # 加剧，或学习率过高导致预测头振荡。
+            _use_info_nce = getattr(trainer.model, 'use_info_nce', False)
             for _nt in sorted(trainer.model.node_types):
                 _hist_key = f'val_pred_r2_{_nt}'
                 _pred_hist = trainer.history.get(_hist_key, [])
                 if len(_pred_hist) >= 3 and all(
                     _pred_hist[-i] < _pred_hist[-i - 1] for i in range(1, 3)
                 ):
+                    if _use_info_nce:
+                        _nce_hint = (
+                            " (1) InfoNCE 梯度竞争（temperature=1.0 已是推荐值）"
+                            "——若仍持续下降，可将 use_info_nce 设为 false（最后手段）；"
+                        )
+                    else:
+                        _nce_hint = " (1) cross_modal_align 或其他辅助损失梯度竞争；"
                     logger.warning(
                         f"  ⚠️ pred_r2_{_nt} 连续 3 次验证下降"
                         f" ({_pred_hist[-3]:.3f}→{_pred_hist[-2]:.3f}→{_pred_hist[-1]:.3f})。"
-                        " 可能原因: (1) InfoNCE 梯度竞争（temperature=1.0 已是推荐值）"
-                        "——若仍持续下降，可将 use_info_nce 设为 false（最后手段）；"
+                        f" 可能原因:{_nce_hint}"
                         " (2) 学习率过高——建议降低至 1e-4；"
                         " (3) 早停过晚——当前最佳 pred_r2 已在更早 epoch 出现。"
                     )
