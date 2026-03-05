@@ -243,6 +243,73 @@ class TestCrossModalEdges:
         assert (ea >= 0).all(), "Edge weights should be non-negative (|Pearson r|)"
         assert (ea <= 1).all(), "Edge weights should be at most 1.0 (|Pearson r| ∈ [0,1])"
 
+    def test_hrf_lag_produces_valid_edges(self):
+        """HRF lag compensation must still produce valid cross-modal edges."""
+        mapper = GraphNativeBrainMapper(device="cpu")
+        graph = torch.load(
+            FIXTURE_DIR / "sub-test02_EOEC_testfixture.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        cross = mapper.create_simple_cross_modal_edges(
+            graph, k_cross_modal=3, hrf_lag_tr=2
+        )
+        assert cross is not None, "HRF-lagged edge construction returned None"
+        ei, ea = cross
+        assert ei.shape[0] == 2, "edge_index must have 2 rows"
+        assert ea.shape == (ei.shape[1], 1), "edge_attr shape mismatch"
+        N_eeg = graph["eeg"].num_nodes
+        N_fmri = graph["fmri"].num_nodes
+        assert ei[0].max().item() < N_eeg, "EEG source index out of range"
+        assert ei[1].max().item() < N_fmri, "fMRI destination index out of range"
+        assert (ea >= 0).all() and (ea <= 1).all(), "Edge weights must be in [0, 1]"
+
+    def test_hrf_lag_0_and_no_lag_produce_same_edges(self):
+        """hrf_lag_tr=0 must behave identically to the default (no lag)."""
+        mapper = GraphNativeBrainMapper(device="cpu")
+        graph = torch.load(
+            FIXTURE_DIR / "sub-test01_EOEC_testfixture.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        cross_default = mapper.create_simple_cross_modal_edges(graph, k_cross_modal=3)
+        cross_lag0 = mapper.create_simple_cross_modal_edges(
+            graph, k_cross_modal=3, hrf_lag_tr=0
+        )
+        assert cross_default is not None and cross_lag0 is not None
+        assert torch.equal(cross_default[0], cross_lag0[0]), \
+            "hrf_lag_tr=0 edge_index differs from default"
+        assert torch.allclose(cross_default[1], cross_lag0[1]), \
+            "hrf_lag_tr=0 edge_attr differs from default"
+
+    def test_hrf_lag_larger_than_time_series_falls_back_gracefully(self):
+        """When lag ≥ T-1 the lag is silently skipped; result equals no-lag baseline."""
+        mapper = GraphNativeBrainMapper(device="cpu")
+        graph = torch.load(
+            FIXTURE_DIR / "sub-test01_EOEC_testfixture.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
+        # T_fmri=25 in this fixture; a lag of 30 exceeds T-1 and must fall back to no-lag
+        T_fmri = graph["fmri"].x.shape[1]
+        oversized_lag = T_fmri + 5
+        cross_fallback = mapper.create_simple_cross_modal_edges(
+            graph, k_cross_modal=3, hrf_lag_tr=oversized_lag
+        )
+        cross_no_lag = mapper.create_simple_cross_modal_edges(
+            graph, k_cross_modal=3, hrf_lag_tr=0
+        )
+        assert cross_fallback is not None, "Oversized lag must still produce edges (fallback)"
+        assert cross_no_lag is not None
+        ei_fb, ea_fb = cross_fallback
+        ei_nl, ea_nl = cross_no_lag
+        assert ei_fb.shape[0] == 2
+        # Fallback with oversized lag must produce the same edges as no-lag
+        assert torch.equal(ei_fb, ei_nl), \
+            "Oversized lag should fall back to no-lag edge_index"
+        assert torch.allclose(ea_fb, ea_nl), \
+            "Oversized lag should fall back to no-lag edge_attr"
+
 
 # ===========================================================================
 # 3. One-epoch training

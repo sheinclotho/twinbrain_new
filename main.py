@@ -144,6 +144,14 @@ def load_config(config_path: str = None) -> dict:
 _DEFAULT_FMRI_WINDOW_SIZE = 50
 _DEFAULT_EEG_WINDOW_SIZE = 500
 
+# ── HRF 覆盖所需的 EEG 最小窗口大小（250Hz 采样率下）──────────────
+# 血氧动力学响应函数（HRF）峰值延迟约 4–6 s（Buxton et al. 1998）。
+# 为使 EEG 窗口包含引发当前 BOLD 响应的神经前驱活动，窗口应 ≥ 4s。
+# 250Hz × 4s = 1000 pts（保守下界）；250Hz × 6s = 1500 pts（完整覆盖）。
+# ★ 内存约束：1000 pts 在 8GB GPU 上可能触发 CUDA OOM（V5.53 回退到 250 pts）。
+#   若 GPU ≥ 16GB，可安全使用 1000–1500 pts 以获得更好的跨模态预测能力。
+_HRF_MIN_EEG_WINDOW_SAMPLES = 1000  # @ 250 Hz = 4s
+
 
 def _graph_cache_key(subject_id: str, task: Optional[str], config: dict) -> str:
     """为图缓存生成稳定的文件名。
@@ -254,6 +262,31 @@ def extract_windowed_samples(
     ws_ref = window_sizes[ref_type]
     T_ref = T_per_type[ref_type]
     stride = max(1, int(ws_ref * stride_fraction))
+
+    # ── HRF 覆盖警告 ──────────────────────────────────────────────────────
+    # 当 EEG 窗口不足以覆盖 HRF 延迟（4–6s）时，EEG 窗口内的神经活动
+    # 不是导致当前 fMRI BOLD 响应的直接前驱（血氧响应峰值在神经活动后 4–6s）。
+    # 注意：跨模态边权重基于完整 run 的时滞相关性（graph.hrf_lag_tr），
+    # 仍能捕捉正确的神经血管耦合方向；窗口短只影响"窗口内特征的生理时效性"。
+    if 'eeg' in node_types and 'fmri' in node_types:
+        ws_eeg = window_sizes.get('eeg', _DEFAULT_EEG_WINDOW_SIZE)
+        eeg_sr = getattr(full_graph.get('eeg', full_graph[node_types[0]]), 'sampling_rate', 250.0)
+        if eeg_sr is None:
+            eeg_sr = 250.0
+        eeg_sr = float(eeg_sr)
+        ws_eeg_sec = ws_eeg / eeg_sr if eeg_sr > 0 else 0.0
+        if 0 < ws_eeg_sec < 4.0:
+            _hrf_warn = (
+                f"⚠️  EEG 窗口 ({ws_eeg} pts = {ws_eeg_sec:.1f}s @ {eeg_sr:.0f}Hz)"
+                f" 短于 HRF 延迟下界 4s。BOLD 响应对应的神经前驱活动（t−4~6s）"
+                f" 未完整纳入 EEG 窗口，跨模态预测质量可能受限。"
+                f" 若 GPU ≥ 16GB，可将 windowed_sampling.eeg_window_size 提升至"
+                f" 1000（4s）或 1500（6s）pts 以覆盖完整 HRF 前驱窗口。"
+                f" 当前配置（{ws_eeg} pts）在 8GB GPU 上已验证稳定；"
+                f" 跨模态边权重仍基于全 run 时滞相关性（graph.hrf_lag_tr），"
+                f" EEG→fMRI 方向性得到保障。"
+            )
+            logger.warning(_hrf_warn)
 
     if ws_ref >= T_ref:
         # 窗口覆盖完整序列：无法再分割，退化为原始单样本
@@ -719,6 +752,7 @@ def build_graphs(config: dict, logger: logging.Logger):
                         _cross = mapper.create_simple_cross_modal_edges(
                             full_graph,
                             k_cross_modal=config['graph'].get('k_cross_modal', 5),
+                            hrf_lag_tr=config['graph'].get('hrf_lag_tr', 0),
                         )
                         if _cross is not None:
                             full_graph['eeg', 'projects_to', 'fmri'].edge_index = _cross[0]
@@ -934,6 +968,7 @@ def build_graphs(config: dict, logger: logging.Logger):
                     cross_result = mapper.create_simple_cross_modal_edges(
                         built_graph,
                         k_cross_modal=config['graph'].get('k_cross_modal', 5),
+                        hrf_lag_tr=config['graph'].get('hrf_lag_tr', 0),
                     )
                     if cross_result is not None:
                         cross_edges, cross_weights = cross_result
