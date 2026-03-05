@@ -25,13 +25,17 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Minimum number of time-points required for a meaningful Pearson correlation.
+# With fewer than this many samples the z-score denominator can be near-zero
+# and the correlation estimate is statistically unreliable.
+_MIN_CORR_POINTS: int = 2
+
 
 def _row_zscore(mat: torch.Tensor) -> torch.Tensor:
     """Row-wise z-score normalisation.  Returns (mat - row_mean) / (row_std + eps)."""
     mu  = mat.mean(dim=1, keepdim=True)
     std = mat.std(dim=1, keepdim=True) + 1e-8
     return (mat - mu) / std
-
 
 class GraphNativeBrainMapper:
     """
@@ -592,6 +596,7 @@ class GraphNativeBrainMapper:
         merged_data: HeteroData,
         connection_ratio: float = 0.1,
         k_cross_modal: int = 5,
+        hrf_lag_tr: int = 0,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
         Create cross-modal edges for merged heterograph.
@@ -607,6 +612,20 @@ class GraphNativeBrainMapper:
         Laufs 2008).  Using temporal correlation as edge weight lets the
         model allocate more cross-modal message-passing capacity to EEG
         channels that genuinely drive the BOLD response in each ROI.
+
+        **HRF delay compensation (hrf_lag_tr > 0)**:
+        The haemodynamic response function (HRF) introduces a ~4–6 s delay
+        between neural activity and the peak BOLD response (Buxton et al. 1998;
+        Logothetis 2001).  At TR=2 s this corresponds to 2–3 TRs.  By shifting
+        the EEG time-series earlier by ``hrf_lag_tr`` steps in the pooled
+        time-grid before computing Pearson correlation, we model:
+
+            EEG(t) → neural activity → BOLD(t + hrf_lag)
+
+        rather than the biologically incorrect simultaneous alignment
+        EEG(t) ↔ fMRI(t).  The result is that cross-modal edges connect EEG
+        channels whose *past* activity best predicts each fMRI ROI's current
+        BOLD — a more faithful representation of neurovascular coupling.
 
         **Fallback (random)**: Used when T_eeg ≠ T_fmri and temporal
         interpolation is not appropriate (e.g. the modalities come from
@@ -624,6 +643,11 @@ class GraphNativeBrainMapper:
             k_cross_modal: Top-k fMRI ROIs per EEG channel for correlation-based
                 edges.  Default 5 gives ≈5×N_eeg edges — comparable in density
                 to the intra-modal k-nearest graphs.
+            hrf_lag_tr: HRF delay in fMRI TR units applied to cross-modal
+                edge weight computation.  EEG time-series is shifted earlier
+                by this many steps (in the pooled fMRI-rate time grid) before
+                computing Pearson correlation with fMRI.  Default 0 (no lag,
+                backward-compatible).  Recommended value: 2 (≈4 s at TR=2 s).
 
         Returns:
             (edge_index [2, E], edge_attr [E, 1]) or None if modalities absent.
@@ -690,12 +714,35 @@ class GraphNativeBrainMapper:
                         fmri_ts.unsqueeze(0), T_target
                     ).squeeze(0)           # [N_fmri, T_target]
 
+                # ── HRF delay compensation ──────────────────────────────────
+                # The haemodynamic response function introduces a ~4–6 s delay
+                # between neural activity and the BOLD peak (Buxton 1998).
+                # When hrf_lag_tr > 0 we compute:
+                #   corr( eeg_ts[:, :-lag], fmri_ts[:, lag:] )
+                # i.e. EEG at time t predicts fMRI at time t+lag, which is the
+                # biologically correct neurovascular coupling direction.
+                # We fall back to no-lag if fewer than _MIN_CORR_POINTS would remain.
+                lag = int(hrf_lag_tr)
+                if lag > 0 and T_target - lag >= _MIN_CORR_POINTS:
+                    eeg_ts_c   = eeg_ts[:, :-lag]   # [N_eeg,  T_target-lag]
+                    fmri_ts_c  = fmri_ts[:, lag:]   # [N_fmri, T_target-lag]
+                    T_corr = T_target - lag
+                    logger.debug(
+                        f"HRF lag compensation: correlating EEG[0:{T_target-lag}] "
+                        f"with fMRI[{lag}:{T_target}] "
+                        f"(hrf_lag_tr={lag}, T_corr={T_corr})"
+                    )
+                else:
+                    eeg_ts_c  = eeg_ts
+                    fmri_ts_c = fmri_ts
+                    T_corr = T_target
+
                 # ── Pearson correlation matrix [N_eeg, N_fmri] ─────────────
                 # Row-wise z-score so that corr[i,j] = <z_eeg_i, z_fmri_j> / T
-                eeg_z  = _row_zscore(eeg_ts)   # [N_eeg, T]
-                fmri_z = _row_zscore(fmri_ts)  # [N_fmri, T]
+                eeg_z  = _row_zscore(eeg_ts_c)   # [N_eeg, T_corr]
+                fmri_z = _row_zscore(fmri_ts_c)  # [N_fmri, T_corr]
 
-                corr = torch.mm(eeg_z, fmri_z.T) / T_target  # [N_eeg, N_fmri]
+                corr = torch.mm(eeg_z, fmri_z.T) / T_corr  # [N_eeg, N_fmri]
                 corr = torch.abs(corr)  # unsigned connectivity (same as intra-modal)
 
                 # ── Top-k per EEG channel ───────────────────────────────────
@@ -708,9 +755,10 @@ class GraphNativeBrainMapper:
                 edge_index = torch.stack([src, dst], dim=0)      # [2, N_eeg*k]
                 edge_attr  = topk_vals.reshape(-1, 1).clamp(0.0, 1.0)  # [N_eeg*k, 1]
 
+                lag_info = f", HRF lag={lag} TR" if lag > 0 else ""
                 logger.info(
                     f"Created {edge_index.shape[1]} correlation-based cross-modal edges "
-                    f"(top-{k} per EEG channel, mean |r|={edge_attr.mean().item():.3f})"
+                    f"(top-{k} per EEG channel, mean |r|={edge_attr.mean().item():.3f}{lag_info})"
                 )
                 return edge_index, edge_attr
 

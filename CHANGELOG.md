@@ -1,8 +1,49 @@
 # TwinBrain V5 — 更新日志
 
-**最后更新**：2026-03-03  
-**版本**：V5.53  
+**最后更新**：2026-03-05  
+**版本**：V5.54  
 **状态**：生产就绪
+
+---
+
+## [V5.54] 2026-03-05 — HRF 延迟感知的跨模态边权重（神经血管耦合方向修正）
+
+### 背景
+
+GPT 对 EEG-fMRI 跨模态时间对齐提出了科学审查，核心发现：跨模态边权重基于零延迟
+Pearson 相关性（EEG(t) ↔ fMRI(t)），但 HRF 物理约束要求 EEG(t) 驱动 fMRI(t+4~6s)。
+这意味着边权重捕捉的是错误的因果方向。
+
+### 根因
+
+`create_simple_cross_modal_edges()` 将 EEG 和 fMRI 下采样到同一时间格后直接计算
+相关性，未引入 EEG 超前 fMRI 的时间偏移。在强 HRF 场景下，零延迟相关 |r| 偏低，
+影响跨模态消息传递的权重分配质量。
+
+### 修复
+
+| 项目 | 变更 |
+|------|------|
+| `graph_native_mapper.py` | `create_simple_cross_modal_edges()` 新增 `hrf_lag_tr: int = 0` 参数。`lag > 0` 时计算 `corr(EEG[:-lag], fMRI[lag:])` |
+| `main.py` | 两处 `create_simple_cross_modal_edges()` 调用新增 `hrf_lag_tr=config['graph'].get('hrf_lag_tr', 0)` |
+| `main.py` | `extract_windowed_samples()` 新增常量 `_HRF_MIN_EEG_WINDOW_SAMPLES=1000` 及运行时警告（EEG 窗口 < 4s 时提示 NVC 前驱覆盖不足） |
+| `configs/default.yaml` | `graph.hrf_lag_tr: 2`（TR=2s 时对应 4s HRF 延迟补偿，Buxton 1998） |
+| `tests/test_training_with_fixtures.py` | 新增 3 个 HRF lag 测试用例（lag=2 有效、lag=0 与默认等价、lag 超大回退安全） |
+
+### 架构决策
+
+- **GPT 建议的完整 HRF convolution 特征变换**（Method A）作为 future work 记录；
+  本次仅在边权重层面实现时滞，不增加可学习参数，稳定性最高。
+- **EEG 窗口大小保持 250 pts (1s)**：受 8GB GPU 内存约束，提升至 GPT 建议的 1000+ pts
+  会触发 CUDA OOM（V5.53 已验证）。通过 `hrf_lag_tr` 在图级别保证 NVC 方向性。
+- **架构不变**：TwinBrain 的异质图卷积（EEG↔fMRI 双向消息传递）比 GPT 建议的
+  单向 EEG→fMRI decoder 更具信息表达能力，保留。
+
+### 预期效果
+
+- 跨模态边权重 |r| 提升（HRF 对齐相关性通常强于零延迟相关性）
+- EEG→fMRI 消息传递方向性改善（消息来自神经活动而非同时 BOLD 状态）
+- pred_r2_fmri 预期小幅提升（跨模态消息携带更多 NVC 信息）
 
 ---
 

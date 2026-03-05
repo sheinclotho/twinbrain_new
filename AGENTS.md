@@ -26,6 +26,31 @@
 
 ---
 
+### [2026-03-05] EEG-fMRI 跨模态边权重未考虑 HRF 延迟（零延迟相关性偏差）
+
+**GPT 提问**：跨模态预测是否正确考虑了 HRF 延迟（EEG 超前 fMRI 4–6s）？
+
+**分析结论**：
+- **GPT 的架构建议**（EEG encoder → shared latent → HRF transform → fMRI decoder）与 TwinBrain 当前架构不同。TwinBrain 使用异质图卷积：EEG 节点通过跨模态边向 fMRI 节点传递消息，两种模态都预测自身未来（非直接 EEG→fMRI 映射）。架构差异不代表问题，但跨模态边权重的生物学正确性确实值得改进。
+- **已修复的盲区**：`create_simple_cross_modal_edges()` 使用零延迟 Pearson 相关性（EEG(t) 与 fMRI(t) 同时对齐）计算边权重。但 HRF 物理约束是 EEG(t) 驱动 fMRI(t+4~6s)，零延迟相关性捕捉的是"EEG(t) 与 fMRI(t) 直接相关"，在强 HRF 场景下这种相关性较弱或方向错误。
+- **正确做法**：计算 `corr(EEG_pooled[:, :-lag], fMRI[:, lag:])` — EEG 超前 fMRI 2 TR（4s），这才是神经血管耦合（NVC）的正确因果方向（Logothetis 2001, Buxton 1998）。
+
+**修复（V5.54 / PR #76）**：
+- `create_simple_cross_modal_edges(hrf_lag_tr=0)` 新增参数，`default.yaml graph.hrf_lag_tr: 2`
+- 边权重从 `corr(EEG, fMRI)` 改为 `corr(EEG[:-lag], fMRI[lag:])` 当 lag>0 时
+- 增加 EEG 窗口短于 4s 的运行时警告（解释限制和权衡）
+
+**什么未改变（刻意保留）**：
+- EEG 窗口大小（250 pts = 1s）：受 8GB GPU 内存约束，无法提升至 GPT 建议的 1000+ pts（4s）。但此限制通过文档和警告明确说明。
+- 架构（异质图 GNN）：GPT 建议的 EEG encoder→HRF transform→fMRI decoder 是一种更直接的设计，但会丢失 TwinBrain 的多项优势（图拓扑、双向消息传递、per-node 时序编码）。保留当前架构，通过改进边权重提升 NVC 方向性。
+
+**根本规则**：
+1. **跨模态边权重必须考虑生理延迟**：零延迟相关性对 EEG-fMRI 跨模态系统来说几乎总是次优的。HRF 是已知的物理事实，应显式建模。
+2. **"EEG 窗口短 = 跨模态预测无效"是过度简化**：跨模态边基于全 run 时滞相关性，窗口短只影响"每步 EEG 特征的时效性"，不影响图拓扑的 NVC 方向性。
+3. **GPT 建议中的 Method A（HRF convolution）最接近本修复**：我们在边权重层面实现了 HRF 时滞，而非在特征空间做卷积。前者更简洁（不增加参数），后者可作为 future work。
+
+---
+
 ### [2026-03-03] V5.51 参数恢复 + _ei_cache 持久张量 = CUDA 碎片 OOM（epoch 5 崩溃，500s/epoch）
 
 **用户观察**：epoch 4 正常结束（474s），epoch 5 在 `lin_msg(x_j)` 内崩溃，错误指向 `torch.nn.utils.parametrizations`（spectral_norm 功率迭代）。同时训练速度约 500s/epoch（期望 ~100s）。
