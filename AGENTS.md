@@ -26,6 +26,56 @@
 
 ---
 
+### [2026-03-06] FC 图拓扑使用全序列数据——泄露分析与结论
+
+**背景**：GPT 提出了 FC 图泄露清单（V5.57），要求系统性检查预测功能中的未来信息泄露风险。
+
+**检查项目与结论**：
+
+| 检查项 | 结论 | 理由 |
+|--------|------|------|
+| FC 边权重使用全序列 | ⚠️ 理论风险 | 标准 dFC 范式，见下方分析 |
+| 跨模态边权重使用全序列 | ⚠️ 理论风险 | 同上 |
+| 预测路径（TemporalAttention） | ✅ 无泄露 | is_causal=True（V5.42 修复） |
+| compute_loss() 上下文切分 | ✅ 无泄露 | 仅用 h[:, :T_ctx, :] 作为预测上下文 |
+| validate() 因果再编码 | ✅ 无泄露 | 重新编码仅 T_ctx 步的原始信号 |
+| 图缓存设计 | ✅ 无泄露 | 存储全序列图，跨模态边在加载时从特征重建 |
+
+**FC 图拓扑全序列使用的分析**：
+
+`map_fmri_to_graph`、`map_eeg_to_graph`、`create_simple_cross_modal_edges` 均在
+`build_graphs()` 中对完整 run 的时序数据计算相关性。`extract_windowed_samples`
+将完整图的 edge_index 共享给所有滑动窗口。
+
+**理论风险**：对于训练窗口 `[t_start, t_end]`，其 edge_index 包含了对
+`[t_end, T_full]` 的相关性信息（该窗口的"未来"）。
+
+**为何实践影响极小**：
+1. edge_attr 仅编码节点间的**平均结构关系**（|Pearson r|），而非未来时刻的具体信号值
+2. **节点特征 x 严格只含当前窗口的数据**——这是信号值的唯一来源，不含未来
+3. GNN 消息传递的内容来自节点特征（x），边权重只控制消息的**强度**（routing strength），无法还原未来信号值
+4. 预测方向性保障来自底层机制（TemporalAttention.is_causal=True），与 FC 图拓扑无关
+5. 这是动态功能连接（dFC）研究的标准范式：全序列 FC 作为结构支架，窗口特征作为动态脑状态快照（Hutchison 2013, NeuroImage; Chang & Glover 2010, NeuroImage）
+
+**已验证的代码路径**（无泄露）：
+- `TemporalAttention(is_causal=True)`：每个时间位置只能看到 [0..t] 的历史信息
+- `compute_loss()` 中 `T_ctx = int(T * _PRED_CONTEXT_RATIO)`，仅 h[:, :T_ctx, :] 用于预测
+- `validate()` 中 `context_data[nt].x = data[nt].x[:, :T_ctx, :]` 重新编码
+- 节点特征 x 在 `extract_windowed_samples` 中严格切片为 `x_full[:, t_start_nt:t_end_nt, :]`
+
+**修复（V5.57）**：
+- 在 `extract_windowed_samples`、`create_simple_cross_modal_edges`、
+  `map_fmri_to_graph`、`map_eeg_to_graph` 中添加了明确的注释，说明全序列 FC
+  是有意的架构设计，并解释了为何不构成关键数据泄露
+- **无代码逻辑变更**——经分析确认无需重写 FC 构建逻辑
+
+**规则**：
+1. **FC 图拓扑 vs 信号值**：FC 图拓扑使用全序列数据是 dFC 的标准做法，不等同于信号值泄露。评估泄露时必须区分这两类信息。
+2. **预测方向性保障的核心**是 TemporalAttention(is_causal=True) 和 validate() 因果再编码，与 FC 图拓扑无关。
+3. **GPT 泄露清单**中 #2（预测图构建顺序）、#4（缓存设计）、#5（测试策略）已通过系统性代码审查确认无问题；#1/#3（FC 边权重）为理论风险，已在代码中明确注释。
+
+---
+
 ### [2026-03-05] EEG-fMRI 跨模态边权重未考虑 HRF 延迟（零延迟相关性偏差）
 
 **GPT 提问**：跨模态预测是否正确考虑了 HRF 延迟（EEG 超前 fMRI 4–6s）？

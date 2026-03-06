@@ -258,7 +258,14 @@ class GraphNativeBrainMapper:
         
         # Build graph structure (if not already built)
         if connectivity_matrix is None:
-            # Use temporal correlation as connectivity
+            # Use temporal correlation as connectivity.
+            # NOTE: Computes correlation over the FULL timeseries passed in.
+            # In windowed_sampling mode (main.py::build_graphs), this is called
+            # with the complete run before windowing.  The resulting edge_index
+            # is then shared across all sliding windows from this run.
+            # This is intentional — the FC topology acts as a structural scaffold
+            # (standard dFC practice; see extract_windowed_samples for full
+            # leakage analysis).
             # GPU-accelerated correlation (5-10x faster than numpy.corrcoef)
             connectivity_matrix = self._compute_correlation_gpu(timeseries)
         
@@ -346,7 +353,11 @@ class GraphNativeBrainMapper:
         
         # Build connectivity if not provided
         if connectivity_matrix is None:
-            # Use coherence-based connectivity
+            # Computes connectivity over the FULL timeseries passed in.
+            # In windowed_sampling mode this is called with the complete run;
+            # the resulting edge_index is shared across all windows (intentional
+            # dFC design — see map_fmri_to_graph and extract_windowed_samples
+            # for the full FC leakage analysis).
             connectivity_matrix = self._compute_eeg_connectivity(timeseries)
         
         # Build graph structure
@@ -636,6 +647,37 @@ class GraphNativeBrainMapper:
         Returns both edge_index AND edge_attr so that cross-modal messages
         are treated consistently with intra-modal edges (which carry
         correlation-based edge_attr from build_graph_structure).
+
+        **Design note — full-run correlation and FC leakage analysis**:
+        This method is called with ``merged_data`` that contains the full-run
+        node features (``x``), so the cross-modal edge weights are computed
+        from the entire recording session.  When the graph is later split into
+        sliding windows for training (see ``extract_windowed_samples``), all
+        windows share these same edge weights.
+
+        For a training window at ``[t_start, t_end]``, the edge weights
+        technically include correlation signal from ``[t_end, T_full]`` — the
+        "future" relative to that window.
+
+        However, this is **not a critical data leakage** for the following
+        reasons:
+
+        1. Edge weights only encode the *average structural relationship*
+           between an EEG channel and an fMRI ROI (|Pearson r|), NOT the
+           specific signal value at any future time step.
+        2. Node features (``x``) are strictly sliced to the current window
+           — the model never directly sees future signal values through the
+           node features.
+        3. The prediction path's causal guarantees are enforced at a deeper
+           level: ``TemporalAttention(is_causal=True)`` and ``validate()``'s
+           causal re-encoding of only T_ctx steps.
+        4. This "full-run FC as structural scaffold" paradigm is standard in
+           dynamic functional connectivity (dFC) research (Hutchison 2013;
+           Chang & Glover 2010).
+
+        This is an intentional architectural choice, not a bug.  The
+        problem statement (V5.57 checklist) acknowledges: "FC 图泄露属于
+        理论风险，对短期预测/动态模拟影响通常有限。可选策略：标记警告即可。"
 
         Args:
             merged_data: HeteroData with 'eeg' and 'fmri' nodes.
