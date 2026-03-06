@@ -351,9 +351,4 @@ models/graph_native_system.py:
   compute_effective_connectivity() ← 系统级响应矩阵（时间平均 EC）
 ```
 
-而 `unity_integration/perturbation_analyzer.py`（本次新增）补充了：
-- `compute_response_matrix()` — 保留时间分辨率的 R[i,j,k]（sustained/impulse 两种模式）
-- `analyze_response_matrix()` — 空间传播率、时间衰减、传播延迟分析
-- `validate_response_matrix()` — 跨初始状态一致性验证
-
 **建议**：`reference/predictive_coding.py` 中的 `compute_free_energy_loss` 可以集成为预测器的额外损失约束（让模型更好地学习内在动力学），但 `PredictiveCodingLayer` 和 `HierarchicalPredictiveCoding` 与用户的扰动分析设计无直接关联。
