@@ -192,7 +192,7 @@ def _compute_partial_correlation(timeseries: np.ndarray) -> np.ndarray:
     # 归一化为相关系数尺度
     diag_sqrt = np.sqrt(np.abs(np.diag(precision)))
     # 避免除以零
-    diag_sqrt[diag_sqrt == 0] = 1.0
+    diag_sqrt[diag_sqrt < 1e-10] = 1.0
     partial_corr = -precision / np.outer(diag_sqrt, diag_sqrt)
     np.fill_diagonal(partial_corr, 0.0)
     return partial_corr
@@ -212,11 +212,10 @@ def _compute_wideband_coherence(timeseries: np.ndarray) -> np.ndarray:
     # 跨频率平均互谱矩阵
     cross_spectral = F @ F.conj().T / n_freq  # [N, N]
     # 振幅 MSC
-    power = np.real(np.diag(cross_spectral)).copy()  # .copy() 确保可写
-    power[power <= 0] = 1e-12
+    power = np.maximum(np.real(np.diag(cross_spectral)), 1e-12)
     coherence = np.abs(cross_spectral) ** 2 / np.outer(power, power)
-    coherence = np.clip(coherence, 0.0, 1.0)
-    coherence = coherence.copy()  # 确保可写（某些 numpy 操作返回只读视图）
+    # 确保对角线为 0（fill_diagonal 需要可写数组）
+    coherence = np.clip(coherence, 0.0, 1.0).copy()
     np.fill_diagonal(coherence, 0.0)
     return coherence.astype(np.float32)
 

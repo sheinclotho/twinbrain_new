@@ -71,7 +71,12 @@ class TestFontConfiguration:
         _configure_matplotlib_fonts(use_latex_math=False)
 
     def test_no_glyph_8321_warning_in_eigenvalue_plot(self, small_timeseries):
-        """绘制特征值谱图时不应产生 Glyph 8321 (Unicode 下标₁) 警告。"""
+        """绘制特征值谱图时不应产生 Glyph 8321 (Unicode 下标字符，如 U+2081) 警告。
+
+        Glyph 8321 对应 Unicode 下标字符 '1' (U+2081)，在 Windows 的 Microsoft YaHei
+        等字体中缺失。正确的解决方案是使用 matplotlib MathText ($\\lambda_1$) 而非
+        Unicode 下标字符。
+        """
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
@@ -96,12 +101,17 @@ class TestFontConfiguration:
             )
             plt.close("all")
 
+        # Glyph 8321 是 Unicode 下标字符 '1' (U+2081) 在字体中缺失的警告
+        # 检查方式：警告消息中同时包含 "Glyph" 和 "8321"（或字符 U+2081 的描述）
         glyph_8321_warnings = [
             w for w in caught
-            if "Glyph" in str(w.message) and "8321" in str(w.message)
+            if issubclass(w.category, UserWarning)
+            and "Glyph" in str(w.message)
+            and ("8321" in str(w.message) or "\u2081" in str(w.message)
+                 or "SUBSCRIPT ONE" in str(w.message).upper())
         ]
         assert len(glyph_8321_warnings) == 0, (
-            f"仍存在 Glyph 8321 警告: {glyph_8321_warnings}"
+            f"仍存在 Glyph 8321 (Unicode 下标) 警告: {glyph_8321_warnings}"
         )
 
     def test_mathtext_labels_used_instead_of_unicode_subscript(self):
@@ -246,15 +256,20 @@ class TestResponseMatrix:
         assert np.array_equal(nodes1, nodes2)
 
     def test_mode_sampled_different_seeds_differ(self, test_fc):
-        """不同 seed 通常应产生不同的采样结果（N>3 时概率极高）。"""
+        """不同 seed 应产生不同的采样结果（N≥4 时概率极高）。"""
         from brain_dynamics.phase1.response_matrix import select_stimulation_nodes
         N = test_fc.shape[0]
         if N <= 3:
-            pytest.skip("N 太小，无法测试随机性")
-        nodes1 = select_stimulation_nodes(test_fc, mode="sampled", n_nodes=2, seed=1)
-        nodes2 = select_stimulation_nodes(test_fc, mode="sampled", n_nodes=2, seed=2)
-        # 不强制要求不同（理论上可能相同），只是概率极低
-        # 这里只验证 seed 机制不会报错
+            pytest.skip("N 太小，不同 seed 几乎必然选相同节点")
+        # 枚举多对 seed，验证至少有一次结果不同（避免假阳性）
+        all_same = True
+        for s1, s2 in [(1, 2), (10, 20), (100, 200)]:
+            nodes1 = select_stimulation_nodes(test_fc, mode="sampled", n_nodes=2, seed=s1)
+            nodes2 = select_stimulation_nodes(test_fc, mode="sampled", n_nodes=2, seed=s2)
+            if not np.array_equal(nodes1, nodes2):
+                all_same = False
+                break
+        assert not all_same, "不同 seed 的随机采样结果全部相同，seed 机制可能失效"
 
     def test_mode_indices_exact_nodes(self, test_fc):
         """mode='indices' 应选择精确的指定节点。"""

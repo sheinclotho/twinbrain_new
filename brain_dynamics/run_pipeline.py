@@ -123,12 +123,14 @@ def load_timeseries(path: str, logger: logging.Logger) -> np.ndarray:
             f"时序数据形状错误: {ts.shape}，应为 [N_rois, T]（2D 矩阵）。"
         )
 
-    # 确保 N < T（ROI 数量通常小于时间点数量）
+    # 确保 N < T（ROI 数量通常远小于时间点数量）
     if ts.shape[0] > ts.shape[1]:
         logger.warning(
             f"时序数据形状 {ts.shape} 中 N_rois > T，"
-            f"可能需要转置（当前按行=ROI、列=时间处理）。"
+            f"自动转置为 [N_rois={ts.shape[1]}, T={ts.shape[0]}]。"
+            f"若这不是期望的，请检查输入文件的行/列方向。"
         )
+        ts = ts.T
 
     N, T = ts.shape
     logger.info(f"时序数据: N_rois={N}, T={T}")

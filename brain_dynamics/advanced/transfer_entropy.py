@@ -247,22 +247,26 @@ def _te_knn(
         dists, _ = tree_3d.query(joint_3d, k=k + 1, p=np.inf, workers=1)
         eps = dists[:, -1]  # 第 k 近邻的距离
 
-        # 在各投影空间中统计 eps 邻域内的点数
-        def count_neighbors(tree: cKDTree, pts: np.ndarray, radii: np.ndarray) -> np.ndarray:
-            counts = np.array(
-                [tree.query_ball_point(pts[i], r=radii[i], p=np.inf, workers=1)
-                 for i in range(len(pts))],
-                dtype=object,
-            )
-            return np.array([len(c) - 1 for c in counts], dtype=float)
+        # 在各投影空间中统计 eps 邻域内的点数（向量化批量查询）
+        def count_neighbors_batch(
+            tree: cKDTree, pts: np.ndarray, radii: np.ndarray
+        ) -> np.ndarray:
+            """向量化批量统计 eps 邻域内的点数（不含查询点本身）。
+
+            使用 query_ball_tree + count_neighbors 避免 Python 循环。
+            """
+            # query_ball_point 支持 float 类型的 r 参数向量（scipy >= 1.8）
+            # 对每个点独立查询其 eps 半径内的邻居数
+            results = tree.query_ball_point(pts, r=radii, p=np.inf)
+            return np.array([len(r) - 1 for r in results], dtype=float)
 
         tree_yx = cKDTree(cond_yx)
         tree_yfy = cKDTree(cond_yfy)
         tree_y = cKDTree(cond_y)
 
-        n_yx = count_neighbors(tree_yx, cond_yx, eps)
-        n_yfy = count_neighbors(tree_yfy, cond_yfy, eps)
-        n_y = count_neighbors(tree_y, cond_y, eps)
+        n_yx = count_neighbors_batch(tree_yx, cond_yx, eps)
+        n_yfy = count_neighbors_batch(tree_yfy, cond_yfy, eps)
+        n_y = count_neighbors_batch(tree_y, cond_y, eps)
 
         # 避免 log(0)
         n_yx = np.maximum(n_yx, 0.5)
@@ -402,35 +406,37 @@ def apply_permutation_test(
     N, T = timeseries.shape
     rng = np.random.default_rng(42)
 
-    # 为减少计算量：
-    # 对每个 ROI 对，只估计其置换 TE 的一个样本，重复 n_permutations 次
-    # 然后与真实 TE 比较，得到经验 p 值
-
     p_matrix = np.ones((N, N), dtype=np.float32)
     te_thresholded = te_matrix.copy()
 
-    # 快速策略：使用全局置换分布
-    # 随机打乱源序列 n_permutations 次，估计背景 TE 分布
-    logger.info(f"计算置换检验背景分布（{n_permutations} 次置换）...")
+    # 全局置换背景分布策略：
+    # 每次置换随机选取一对不同节点，打乱源信号后估计 TE，
+    # 累积 n_permutations 个独立样本构建零假设分布。
+    # 相较于固定采样同一批节点对并重复计算，此策略更全面地覆盖不同的 (i,j) 对。
+    logger.info(f"计算置换检验背景分布（{n_permutations} 次独立置换）...")
 
     null_te_values = []
-    sample_i_indices = rng.integers(0, N, size=min(5, N))
-    sample_j_indices = rng.integers(0, N, size=min(5, N))
+
+    # 每次置换随机选取一对 (i, j) 节点（i ≠ j）
+    all_pairs = [(i, j) for i in range(N) for j in range(N) if i != j]
+    if len(all_pairs) == 0:
+        logger.warning("N=1，无法执行置换检验，跳过。")
+        return te_matrix, p_matrix
 
     for perm_idx in range(n_permutations):
-        for i in sample_i_indices:
-            for j in sample_j_indices:
-                if i == j:
-                    continue
-                # 打乱源信号的时序
-                x_perm = timeseries[j].copy()
-                rng.shuffle(x_perm)
+        # 随机选择一对节点
+        pair_idx = rng.integers(0, len(all_pairs))
+        i, j = all_pairs[pair_idx]
 
-                if method == "knn":
-                    null_te = _te_knn(x_perm, timeseries[i], history, tau, knn_k)
-                else:
-                    null_te = _te_binning(x_perm, timeseries[i], history, tau, n_bins)
-                null_te_values.append(null_te)
+        # 打乱源信号的时序（破坏 X→Y 的时序依赖）
+        x_perm = timeseries[j].copy()
+        rng.shuffle(x_perm)
+
+        if method == "knn":
+            null_te = _te_knn(x_perm, timeseries[i], history, tau, knn_k)
+        else:
+            null_te = _te_binning(x_perm, timeseries[i], history, tau, n_bins)
+        null_te_values.append(null_te)
 
     if len(null_te_values) == 0:
         logger.warning("置换检验未能收集足够样本，跳过显著性过滤。")

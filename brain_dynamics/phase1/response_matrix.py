@@ -182,7 +182,9 @@ def compute_response_matrix_linear(
         alpha_safe = 0.9 / (spectral_radius + 1e-8)
         logger.warning(
             f"传播系数 α={alpha:.3f} × 谱半径={spectral_radius:.3f} ≥ 1，"
-            f"矩阵级数不收敛。自动调整 α={alpha_safe:.4f} 以保证稳定性。"
+            f"矩阵级数不收敛（(I-αW) 奇异）。"
+            f"自动调整 α={alpha_safe:.4f} 以保证稳定性。"
+            f"若要保持 α={alpha:.3f}，请在配置中设置 linear_propagation_alpha ≤ {alpha_safe:.4f}。"
         )
         alpha = alpha_safe
 
