@@ -1,0 +1,217 @@
+# TwinBrain — 脑动力学分析流水线配置
+# ====================================================
+# 用法：python brain_dynamics/run_pipeline.py --config brain_dynamics/config/dynamics.yaml
+#
+# 核心理念：
+#   该流水线基于训练好的 TwinBrain 模型或直接从原始 fMRI 时序数据
+#   分析大脑功能动力学，包括：
+#     Phase 1 — 结构分析（特征值谱、响应矩阵）
+#     Phase 2 — 高级分析（传递熵、信息流）
+
+# ──────────────────────────────────────────────────────────────────────────
+# 一、输入 / 输出路径
+# ──────────────────────────────────────────────────────────────────────────
+input:
+  # fMRI 时序数据路径 (numpy .npy 或 .npz 格式，形状 [N_rois, T])
+  # 若使用 TwinBrain 模型生成，则此项可为 null，从 model_checkpoint 自动推断
+  timeseries_path: null
+
+  # TwinBrain 模型检查点路径（可选）
+  # 若提供，Phase 1 响应矩阵将通过数字孪生仿真生成（更准确）
+  # 若为 null，直接从 timeseries_path 的 fMRI 数据分析
+  model_checkpoint: null
+
+  # TR（重复时间，秒）
+  tr: 2.0
+
+  # ROI 标签文件路径（可选，JSON / CSV）
+  roi_labels_path: null
+
+output:
+  # 输出根目录
+  output_dir: "outputs/dynamics_pipeline"
+
+  # 保存图像格式 (png, svg, pdf)
+  figure_format: "png"
+
+  # 图像 DPI
+  dpi: 120
+
+  # 图像字体设置
+  # ─────────────────────────────────────────────────────────────────────────
+  # 重要：Windows 用 Microsoft YaHei 等中文字体通常缺少数学符号（如 λ₁ 的下标）。
+  # 推荐使用 matplotlib 内置数学文本（$...$ 语法）而非 Unicode 下标字符。
+  # 此处 use_latex_math: true 会自动将轴标签中的下标转为 $...$ 格式。
+  use_latex_math: true
+
+  # 是否将中文标签转为英文（解决部分字体缺失中文字形的问题）
+  # false: 保留中文标签（需要确保系统安装了支持中文的字体）
+  # true: 所有轴标签使用英文（完全避免字体问题）
+  use_english_labels: false
+
+# ──────────────────────────────────────────────────────────────────────────
+# 二、Phase 1 — 结构分析
+# ──────────────────────────────────────────────────────────────────────────
+phase1:
+  enabled: true
+
+  # 功能连接矩阵（FC Matrix）
+  fc:
+    # FC 计算方法：
+    #   "pearson"  — Pearson 相关系数（最常用，适合静息态 fMRI）
+    #   "partial"  — 偏相关系数（控制了其他 ROI 的间接影响，更直接的连通性估计）
+    #   "coherence" — 频谱相干性（适合分析特定频段的耦合）
+    method: "pearson"
+
+    # 是否对 FC 矩阵进行 Fisher's r-to-z 变换（提高正态性）
+    # 建议：true，特别是在进行统计推断时
+    fisher_z: false
+
+    # 连接强度阈值（绝对值）：低于此阈值的连接置零
+    # null = 不阈值化（保留所有连接，包括弱/负相关）
+    # 典型值：0.2（弱过滤），0.3（中等过滤），0.5（强过滤）
+    threshold: null
+
+  # 特征值谱分析（Eigenvalue Spectrum Analysis）
+  eigenvalue:
+    # 是否启用特征值分析
+    enabled: true
+
+    # 显示的特征值数量（top-k 最大特征值）
+    # null = 显示全部
+    n_top: null
+
+    # 是否绘制复数特征值（针对非对称 FC 矩阵，如有向图）
+    # 对于 Pearson FC（对称矩阵），复数特征值均为实数，此项无影响
+    plot_complex: true
+
+    # Marchenko-Pastur 随机矩阵理论边界
+    # ─────────────────────────────────────────────────────────────────────
+    # 科学依据：对于独立高斯时序组成的 N×T 相关矩阵，Marchenko-Pastur (1967) 给出
+    # 随机噪声特征值的理论上界 λ_max = σ² × (1 + √(N/T))²
+    # 高于此上界的特征值被认为携带了真实的神经信号（非噪声）。
+    # Ref: Marčenko & Pastur (1967), Math. USSR-Sb 1(4):457.
+    show_marchenko_pastur_bound: true
+
+  # 响应矩阵（Response Matrix）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 科学含义：对每个"刺激节点"施加单位扰动 δ（模拟 TMS / 光遗传学刺激），
+  # 记录系统动态响应传播到其他节点的模式，形成 N×N_stim 响应矩阵。
+  # 这是"数字孪生 TMS 仿真"的核心输出，可用于评估脑区因果影响力。
+  #
+  # 两种计算模式：
+  #   a) 基于 TwinBrain 模型（model_checkpoint 非 null）：
+  #      使用 TwinBrainDigitalTwin.simulate_intervention() 执行完整的
+  #      编码→扰动→预测→解码 流程，结果最准确。
+  #   b) 直接 FC 线性传播（model_checkpoint 为 null）：
+  #      response ≈ (I - αW)⁻¹ δ，其中 W 为 FC 矩阵，α 为衰减系数。
+  #      这是一阶线性近似，适用于无预训练模型的场景。
+  response_matrix:
+    enabled: true
+
+    # 刺激节点选择
+    # ─────────────────────────────────────────────────────────────────────
+    stimulation:
+      # 刺激模式：
+      #   "all"     — 刺激所有节点（最全面，N 次仿真，计算开销大）
+      #   "sampled" — 随机采样 n_nodes 个节点（默认，适合快速探索）
+      #   "indices" — 刺激指定索引列表（由 node_indices 参数指定）
+      #   "hubs"    — 自动选择度中心度最高的 n_nodes 个枢纽节点
+      mode: "sampled"
+
+      # 当 mode="sampled" 或 mode="hubs" 时，刺激的节点数量
+      # 注意：mode="all" 时此参数被忽略
+      n_nodes: 10
+
+      # 当 mode="indices" 时，指定要刺激的节点索引列表（0-based）
+      # 例：[0, 10, 50, 100]（刺激特定脑区，如 DMN 核心节点）
+      node_indices: null
+
+      # 随机采样的随机种子（mode="sampled" 时有效）
+      # null = 不固定种子（每次运行结果不同）
+      seed: 42
+
+    # 扰动幅度（标准差单位）
+    # 1.0 = 1 个标准差扰动（TMS 典型模拟值）
+    perturbation_amplitude: 1.0
+
+    # 线性传播衰减系数（仅用于无模型的 FC 线性传播模式）
+    # α 控制信号在 FC 图上的传播衰减；建议值 0.1-0.3
+    # 过大（>0.5）可能导致数值不稳定
+    linear_propagation_alpha: 0.2
+
+# ──────────────────────────────────────────────────────────────────────────
+# 三、高级分析（Advanced Analysis）
+# ──────────────────────────────────────────────────────────────────────────
+advanced:
+  enabled: true
+
+  # 传递熵（Transfer Entropy, TE）
+  # ─────────────────────────────────────────────────────────────────────────
+  # 科学含义：TE(X→Y) = H(Y_t+τ | Y_past) - H(Y_t+τ | Y_past, X_past)
+  # 测量"知道 X 的历史是否能降低对 Y 未来的不确定性"，即有向信息流。
+  #
+  # 重要说明：
+  #   1. TE 总是 ≥ 0 nat（非负性）
+  #   2. TE(i→i) = 自传递熵，实现中通常置零（无科学意义）
+  #   3. 平均 TE 计算应排除对角线（i==j），否则大量零值拉低均值
+  #   4. 非对称性 = mean(|TE_ij - TE_ji|) / (mean(TE_ij + TE_ji) + ε)
+  #      而非 mean(TE_ij - TE_ji)（后者正负抵消后接近 0，无意义）
+  transfer_entropy:
+    enabled: true
+
+    # TE 估计方法：
+    #   "binning"  — 等宽分箱，快速但对连续信号精度有限
+    #   "knn"      — k 近邻熵估计（Kraskov et al. 2004），对连续信号更准确
+    #                但计算开销为 O(N² × T × log T)，N>100 时较慢
+    #   "symbolic" — 符号化 TE（Staniek & Lehnertz 2008），适合非线性信号
+    method: "knn"
+
+    # 历史步长（Embedding dimension / order）
+    # ─────────────────────────────────────────────────────────────────────
+    # 科学依据：TE 估计需要指定用多少历史步 k 预测未来 1 步。
+    #   太小（k=1）: 欠拟合，遗漏长程依赖
+    #   太大（k>T/20）: 样本不足，估计方差大
+    #   fMRI 建议值：k=1~3（TR=2s，BOLD 自相关在 3-6 TRs 内）
+    #   EEG 建议值：k=3~10（高时间分辨率，可捕捉更长的因果链）
+    history_steps: 1
+
+    # 预测步长（τ，预测未来 τ 步之后的值）
+    # fMRI 建议：tau=1（直接因果影响）或 tau=2-3（考虑 HRF 延迟）
+    tau: 1
+
+    # kNN 方法的近邻数（method="knn" 时有效）
+    # 建议：4-8。太小则方差大，太大则偏差大（Kraskov 2004 建议 k=4）
+    knn_k: 4
+
+    # binning 方法的箱数（method="binning" 时有效）
+    # 建议：3-10。对于 T=190 TRs，3-5 箱比较合适
+    # Scott 规则自动计算：n_bins = int(T^(1/3) * 1.5)
+    n_bins: "auto"  # "auto" 使用 Scott/FD 规则
+
+    # TE 矩阵的统计显著性检验
+    # ─────────────────────────────────────────────────────────────────────
+    # 通过时间置换检验（permutation test）估计零假设下的 TE 分布，
+    # 只保留显著高于噪声水平的 TE 值。
+    statistical_test:
+      enabled: true
+      # 置换次数（越多越准确，但更慢；50 次适合探索，200 次适合发表）
+      n_permutations: 50
+      # 显著性水平
+      alpha: 0.05
+
+    # 仅计算 TE 矩阵的子集（当 N 很大时节省计算时间）
+    # null = 计算全矩阵（N×N 对，N² 次 TE 计算）
+    # "upper_triangle" = 只计算上三角（TE(i→j) 其中 i<j），然后对称化
+    subset: null
+
+  # Granger 因果分析（可选）
+  # ─────────────────────────────────────────────────────────────────────────
+  granger_causality:
+    enabled: false
+
+    # 最大滞后阶数（VAR 模型的阶数）
+    max_lag: 3
+
+    # 显著性阈值（F 检验 p 值）
+    p_threshold: 0.05
