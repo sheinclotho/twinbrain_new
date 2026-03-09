@@ -187,7 +187,6 @@ Output: HeteroData (node features [N, T, H])
 | **均值基线**（R²=0 参考点） | 永远预测信号的全局均值 | R²=0 表示模型等价于"总是猜均值" |
 | **AR(1) 自相关基线** | 把上下文最后一帧复制到所有未来步 | 对高自相关信号（如 BOLD）h=1 极强（免费 R²≈0.7–0.9），对多步预测通常为负 |
 
----
 
 #### 2.7.0 前置：上下文切分与最小序列约束
 
@@ -204,7 +203,7 @@ $$
 **有效预测步数**（避免浪费算力预测超出实际信号长度的未来）：
 
 $$
-S = \min(\text{prediction\_steps},\; \max(1, T_{\text{fut}}))
+S = \min(\text{prediction_steps},; \max(1, T_{\text{fut}}))
 $$
 
 ---
@@ -213,15 +212,15 @@ $$
 
 **代码位置**：`GraphNativeTrainer._r2_from_accum(ss_res, ss_raw, ss_sum, ss_cnt)`
 
-所有 R² 指标共用同一套单遍在线累加器（避免"逐样本均值"导致的乐观偏差）。对全量样本用代数恒等式 $SS_{\text{tot}} = \sum y_i^2 - n\bar{y}^2$ 代替两次扫描：
+所有 R² 指标共用同一套单遍在线累加器（避免“逐样本均值”导致的乐观偏差）。对全量样本用代数恒等式 $SS_{\text{tot}} = \sum y_i^2 - n\bar{y}^2$ 代替两次扫描：
 
 $$
-\bar{y} = \frac{\sum y_i}{n}, \qquad SS_{\text{tot}} = \sum y_i^2 - n\,\bar{y}^2
+\bar{y} = \frac{\sum y_i}{n}, \qquad SS_{\text{tot}} = \sum y_i^2 - n,\bar{y}^2
 $$
 
 $$
-\boxed{R^2 = 1 - \frac{SS_{\text{res}}}{SS_{\text{tot}}}, \qquad
-SS_{\text{res}} = \sum(y_i - \hat{y}_i)^2}
+R^2 = 1 - \frac{SS_{\text{res}}}{SS_{\text{tot}}}, \qquad
+SS_{\text{res}} = \sum(y_i - \hat{y}_i)^2
 $$
 
 当 $SS_{\text{tot}} \leq 10^{-12}$（信号为常数）时返回 $R^2 = 0$。取值域 $(-\infty, 1]$；$R^2=1$ 完美，$R^2=0$ 等于均值预测，$R^2<0$ 差于均值。
@@ -232,11 +231,21 @@ $$
 
 **代码位置**：`validate()` → 重建 R² 累加器，键名 `r2_{node_type}`
 
-衡量编码器–解码器的信号重建质量。对验证集每个样本，将重建信号 $\hat{\mathbf{X}}$ 与原始信号 $\mathbf{X}$ 对齐到 $T_{\min} = \min(T, T')$ 后，累加残差：
+衡量编码器–解码器的信号重建质量。对验证集每个样本，将重建信号 $\hat{\mathbf{X}}$ 与原始信号 $\mathbf{X}$ 对齐到
 
 $$
-SS_{\text{res}}^{\text{recon}} \mathrel{+}= \sum_{n,t,c} \bigl(X_{n,t,c} - \hat{X}_{n,t,c}\bigr)^2, \qquad
-\text{r2}_{nt} = 1 - \frac{SS_{\text{res}}^{\text{recon}}}{SS_{\text{tot}}^{\text{recon}}}
+T_{\min} = \min(T, T')
+$$
+
+后，累加残差：
+
+$$
+SS_{\text{res}}^{\text{recon}} \mathrel{+}= \sum_{n,t,c} \bigl(X_{n,t,c} - \hat{X}_{n,t,c}\bigr)^2
+$$
+
+$$
+\text{r2}*{nt} =
+1 - \frac{SS*{\text{res}}^{\text{recon}}}{SS_{\text{tot}}^{\text{recon}}}
 $$
 
 ---
@@ -245,14 +254,22 @@ $$
 
 **代码位置**：`validate()` → 信号空间预测 R² 累加器，键名 `pred_r2_{node_type}`
 
-最重要的数字孪生能力指标：在完全不知道未来的前提下，预测未来信号的准确程度。**因果保证**：验证时对前 $T_{\text{ctx}}$ 步重新独立编码（新的 forward pass，无梯度），避免双向注意力对未来信息的访问。随后调用 `predictor.predict_next(h_ctx, num_steps=S)` 自回归生成预测，经 `GraphPredictionPropagator` 图传播后解码，与真实未来段对比：
+最重要的数字孪生能力指标：在完全不知道未来的前提下，预测未来信号的准确程度。
+
+**因果保证**：验证时对前 $T_{\text{ctx}}$ 步重新独立编码（新的 forward pass，无梯度），避免双向注意力对未来信息的访问。随后调用 `predictor.predict_next(h_ctx, num_steps=S)` 自回归生成预测，经 `GraphPredictionPropagator` 图传播后解码，与真实未来段对比：
 
 $$
-SS_{\text{res}}^{\text{pred}} \mathrel{+}= \sum_{n,h,c} \bigl(Y_{n,h,c} - \hat{Y}_{n,h,c}\bigr)^2, \quad h = 1, \ldots, S
+SS_{\text{res}}^{\text{pred}} \mathrel{+}=
+\sum_{n,h,c} \bigl(Y_{n,h,c} - \hat{Y}_{n,h,c}\bigr)^2
+\qquad h = 1, \ldots, S
 $$
 
 $$
-\text{pred\_r2}_{nt} = 1 - \frac{SS_{\text{res}}^{\text{pred}}}{SS_{\text{tot}}^{\text{pred}}}
+\text{pred_r2}_{nt}
+===================
+
+1 -
+\frac{SS_{\text{res}}^{\text{pred}}}{SS_{\text{tot}}^{\text{pred}}}
 $$
 
 ---
@@ -264,8 +281,22 @@ $$
 零参数基线：对所有 $h = 1, \ldots, S$ 步一律预测上下文最后一帧（常数外推），与 `pred_r2` 共享 $SS_{\text{tot}}^{\text{pred}}$ 统计量：
 
 $$
-\hat{Y}_{n,h,c}^{\text{AR(1)}} = X_{n,\, T_{\text{ctx}}-1,\, c} \quad \forall h, \qquad
-\text{ar1\_r2}_{nt} = 1 - \frac{\sum_{n,h,c}(Y_{n,h,c} - X_{n,T_{\text{ctx}}-1,c})^2}{SS_{\text{tot}}^{\text{pred}}}
+\hat{Y}*{n,h,c}^{\text{AR(1)}} =
+X*{n,, T_{\text{ctx}}-1,, c}
+\qquad \forall h
+$$
+
+$$
+\text{ar1_r2}_{nt}
+==================
+
+1 -
+\frac{
+\sum_{n,h,c}
+(Y_{n,h,c} - X_{n,T_{\text{ctx}}-1,c})^2
+}{
+SS_{\text{tot}}^{\text{pred}}
+}
 $$
 
 `ar1_r2` 对多步预测通常为负：对多步预测（如 15 步），AR(1) 基线（重复最后一帧）的累积误差通常超过均值基线，导致 `ar1_r2 < 0`，这是信号时序变化的预期结果，不是 bug。
@@ -274,22 +305,35 @@ $$
 
 #### 2.7.5 多步去相关技能分数（`decorr_{nt}`）
 
-**代码位置**：`validate()` 末尾，`decorr = (pred_r2_val - ar1_r2) / max(1e-3, 1.0 - ar1_r2)`，键名 `decorr_{node_type}`
+**代码位置**：`validate()` 末尾：
 
-气象预报领域的**技能分数（Skill Score）**，衡量模型相对于 AR(1) 基线的额外预测价值：
+```
+decorr = (pred_r2_val - ar1_r2) / max(1e-3, 1.0 - ar1_r2)
+```
+
+键名 `decorr_{node_type}`
+
+气象预报领域的 **Skill Score**，衡量模型相对于 AR(1) 基线的额外预测价值：
 
 $$
-\boxed{\text{decorr}_{nt} = \frac{\text{pred\_r2}_{nt} - \text{ar1\_r2}_{nt}}{\max(10^{-3},\; 1 - \text{ar1\_r2}_{nt})}}
+\text{decorr}_{nt}
+==================
+
+\frac{
+\text{pred_r2}*{nt} - \text{ar1_r2}*{nt}
+}{
+\max(10^{-3},; 1 - \text{ar1_r2}_{nt})
+}
 $$
 
 值域 $(-\infty, 1]$，代码用 $\max(10^{-3}, \cdot)$ 防除零：
 
-| 值 | 语义 |
-|----|------|
-| = 1 | 完美预测 |
-| > 0.15 | 清晰超越 AR(1) 基线，模型确实学到时序动态 |
-| = 0 | 与 AR(1) 基线持平（等价于"复制上一帧"） |
-| < 0 | 差于 AR(1) 基线；当 `ar1_r2 < 0`（长程预测）时 decorr < 0 含义需结合 horizon 分析 |
+| 值      | 语义                                                              |
+| ------ | --------------------------------------------------------------- |
+| = 1    | 完美预测                                                            |
+| > 0.15 | 清晰超越 AR(1) 基线，模型确实学到时序动态                                        |
+| = 0    | 与 AR(1) 基线持平（等价于“复制上一帧”）                                        |
+| < 0    | 差于 AR(1) 基线；当 `ar1_r2 < 0`（长程预测）时 `decorr < 0` 含义需结合 horizon 分析 |
 
 ---
 
@@ -297,17 +341,30 @@ $$
 
 **代码位置**：`validate()` → `pred_h1_ss_*` 累加器，键名 `pred_r2_h1_{node_type}`
 
-与 `pred_r2` 完全相同的流程，但**只取第 1 步**（$h = 1$）进行评估：
+与 `pred_r2` 完全相同的流程，但 **只取第 1 步**（$h = 1$）进行评估：
 
 $$
-SS_{\text{res}}^{\text{pred,h1}} \mathrel{+}= \sum_{n,c} \bigl(Y_{n,1,c} - \hat{Y}_{n,1,c}\bigr)^2
+SS_{\text{res}}^{\text{pred,h1}}
+\mathrel{+}=
+\sum_{n,c}
+\bigl(Y_{n,1,c} - \hat{Y}_{n,1,c}\bigr)^2
 $$
 
 $$
-\text{pred\_r2\_h1}_{nt} = 1 - \frac{SS_{\text{res}}^{\text{pred,h1}}}{SS_{\text{tot}}^{\text{pred,h1}}}
+\text{pred_r2_h1}_{nt}
+======================
+
+1 -
+\frac{SS_{\text{res}}^{\text{pred,h1}}}{SS_{\text{tot}}^{\text{pred,h1}}}
 $$
 
-其中 $SS_{\text{tot}}^{\text{pred,h1}}$ 使用 **仅 h=1 目标** 的独立统计量（$\sum y_{h=1}^2$，$\sum y_{h=1}$，$n_{h=1}$），确保与 NPI 的 3→1 预测直接可比。
+其中 $SS_{\text{tot}}^{\text{pred,h1}}$ 使用 **仅 h=1 目标** 的独立统计量：
+
+$$
+(\sum y_{h=1}^2,; \sum y_{h=1},; n_{h=1})
+$$
+
+确保与 NPI 的 **3→1 预测**直接可比。
 
 ---
 
@@ -318,21 +375,39 @@ $$
 仅对下一步（$h = 1$）的 AR(1) 常数外推：
 
 $$
-\hat{Y}_{n,1,c}^{\text{AR(1)}} = X_{n,\, T_{\text{ctx}}-1,\, c}
+\hat{Y}_{n,1,c}^{\text{AR(1)}}
+==============================
+
+X_{n,, T_{\text{ctx}}-1,, c}
 $$
 
 $$
-SS_{\text{res}}^{\text{AR(1),h1}} \mathrel{+}= \sum_{n,c} \bigl(Y_{n,1,c} - X_{n,\, T_{\text{ctx}}-1,\, c}\bigr)^2
+SS_{\text{res}}^{\text{AR(1),h1}}
+\mathrel{+}=
+\sum_{n,c}
+\bigl(
+Y_{n,1,c} -
+X_{n,T_{\text{ctx}}-1,c}
+\bigr)^2
 $$
 
-与 `pred_r2_h1` **共享** h=1 目标的统计量（$\sum y_{h=1}^2$，$\sum y_{h=1}$，$n_{h=1}$）：
+与 `pred_r2_h1` **共享** h=1 目标统计量：
 
 $$
-\text{ar1\_r2\_h1}_{nt} = 1 - \frac{SS_{\text{res}}^{\text{AR(1),h1}}}{SS_{\text{tot}}^{\text{pred,h1}}}
+\text{ar1_r2_h1}_{nt}
+=====================
+
+1 -
+\frac{SS_{\text{res}}^{\text{AR(1),h1}}}{SS_{\text{tot}}^{\text{pred,h1}}}
 $$
 
-对于高自相关信号（BOLD ρ ≈ 0.85–0.95）：$\text{ar1\_r2\_h1} \approx 2\rho - 1 \approx 0.7\text{–}0.9$，
-这是任何预测器在 h=1 可"免费"获得的 R²，反映数据自相关而非模型能力。
+对于高自相关信号（BOLD $\rho \approx 0.85\text{–}0.95$）：
+
+$$
+\text{ar1_r2_h1} \approx 2\rho - 1 \approx 0.7\text{–}0.9
+$$
+
+这是任何预测器在 $h=1$ 可“免费”获得的 R²，反映数据自相关而非模型能力。
 
 ---
 
@@ -341,12 +416,24 @@ $$
 **代码位置**：`validate()` 末尾，键名 `decorr_h1_{node_type}`
 
 $$
-\boxed{\text{decorr\_h1}_{nt} = \frac{\text{pred\_r2\_h1}_{nt} - \text{ar1\_r2\_h1}_{nt}}{\max(10^{-3},\; 1 - \text{ar1\_r2\_h1}_{nt})}}
+\text{decorr_h1}_{nt}
+=====================
+
+\frac{
+\text{pred_r2_h1}*{nt} -
+\text{ar1_r2_h1}*{nt}
+}{
+\max(10^{-3},; 1 - \text{ar1_r2_h1}_{nt})
+}
 $$
 
-与 NPI（Luo et al., *Nature Methods* 2025）的 3→1 预测直接可比：`decorr_h1 > 0` 表示 TwinBrain 单步预测超越纯自相关；`decorr_h1 < 0` 且 `decorr > 0` 是物理预期的梯度竞争（见 §2.7.11），非模型失败。
+与 **NPI（Luo et al., *Nature Methods* 2025）** 的 **3→1 预测**直接可比：
+
+* `decorr_h1 > 0` 表示 TwinBrain 单步预测 **超越纯自相关**
+* `decorr_h1 < 0` 且 `decorr > 0` 是 **物理预期的梯度竞争现象**（见 §2.7.11），不是模型失败
 
 ---
+
 
 #### 2.7.9 指标间关系一览
 
