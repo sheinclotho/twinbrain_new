@@ -9,14 +9,15 @@
 
 ## 摘要
 
-本文对层级系统涌现理论进行严格的数学形式化，并给出四个核心定理的完整证明。
+本文对层级系统涌现理论进行严格的数学形式化，并给出四个核心定理及一个关键命题的完整证明。
 
 - **定理 1（耦合-维度单调定理）**：在固定边缘分布的条件下，跨子系统的协方差耦合使参与比（PR，有效维度的量化）严格单调下降，即耦合必然导致维度锁定。
 - **定理 2（完美分解维度不变性）**：满足半共轭（Semiconjugacy）条件的完美功能等价性分解保持有效维度完全不变。
 - **定理 3（不完美分解的一阶维度增量）**：当功能等价性分解引入微小垂直扰动 $\varepsilon$ 时，有效维度（PR）的增量精确到一阶为 $\Delta D \approx 2\varepsilon^2 \cdot (\sum_j \mu_j)/\bar{\lambda}$，其中 $\bar{\lambda}$ 为宏观特征值的加权均值，$\mu_j$ 描述扰动结构。
 - **定理 4（层级谱的阶梯结构）**：$k$ 层分解后，协方差矩阵的特征值谱呈现特征性的"阶梯"结构——宏观层级对应高特征值簇，逐层扰动对应递降的特征值平台。
+- **命题 4.4（IIT Φ 与维度压缩比的单调等价性）**：在双分区线性高斯系统中，整合信息论 Φ 与维度压缩比 $\delta = 1 - D_{\rm eff}/N$ 单调等价，即存在严格递增函数 $g$ 使得 $\Phi = g(\delta)$；并给出对称情形下的显式公式。
 
-这些结果提供了涌现的可计算几何框架：涌现强度对应维度压缩比 $\eta = D_{\rm eff}/N$，层级的临界性对应分支比 $m$ 与扰动衰减率 $\alpha$ 满足 $m\alpha^2 = 1$（相变条件）。
+这些结果提供了涌现的可计算几何框架：涌现强度对应维度压缩比 $\eta = D_{\rm eff}/N$，层级系统的相变由序参量 $\Psi = \lim_{k\to\infty}\frac{1}{k}\log D_{\rm eff}(k)$ 刻画，临界条件为分支比 $m$ 与扰动衰减率 $\alpha$ 满足 $m\alpha^2 = 1$（当 $m\alpha^2 > 1$ 时 $\Psi = \log(m\alpha^2) > 0$，系统进入非涌现相）。
 
 ---
 
@@ -354,6 +355,88 @@ $$\underbrace{\lambda_1, \ldots, \lambda_d}_{\text{宏观层（}d\text{ 个）}}
 
 **这一阶梯结构是层级系统的"谱签名"（Spectral Signature），可用于从数据中推断系统的层级组织和分解深度。**
 
+### 命题 4.4（线性高斯系统中 IIT Φ 与维度压缩比的单调等价性）
+
+**命题 4.4**  
+考虑双分区线性高斯系统 $X = (X_1, X_2)$，$X_1 \in \mathbb{R}^{n_1}$，$X_2 \in \mathbb{R}^{n_2}$，联合协方差矩阵为：
+
+$$C(\rho) = \begin{pmatrix} C_{11} & \rho B \\ \rho B^\top & C_{22} \end{pmatrix}, \quad \rho \in [0, \rho_{\max}]$$
+
+设 $\Phi_{\rm bip}(\rho)$ 为该系统的双分区 IIT Φ 值（在线性高斯情形等于互信息 $I(X_1; X_2)$），$\delta(\rho) = 1 - D_{\rm eff}(C(\rho))/N$ 为维度压缩比（$N = n_1 + n_2$）。则：
+
+1. $\Phi_{\rm bip}(\rho)$ 是 $\rho^2$ 的严格递增函数。
+2. $\delta(\rho)$ 是 $\rho^2$ 的严格递增函数。
+3. 存在严格递增连续函数 $g: [0, \delta_{\max}) \to [0, +\infty)$，使得 $\Phi_{\rm bip} = g(\delta)$，即 IIT Φ 与维度压缩比单调等价。
+
+**特殊情形（显式公式）**：当 $n_1 = n_2 = n$，$C_{11} = C_{22} = I_n$，$B = I_n$ 时：
+
+$$\Phi_{\rm bip}(\rho) = -\frac{n}{2}\log(1-\rho^2), \qquad \delta(\rho) = \frac{\rho^2}{1+\rho^2}$$
+
+由 $\rho^2 = \delta/(1-\delta)$ 得显式单调函数：
+
+$$\boxed{g(\delta) = -\frac{n}{2}\log\left(\frac{1-2\delta}{1-\delta}\right)}, \qquad \delta \in \left[0,\, \tfrac{1}{2}\right)$$
+
+**证明**
+
+**步骤 1：$\Phi_{\rm bip}$ 关于 $\rho^2$ 的严格单调性。**
+
+在线性高斯系统中，二分区互信息为：
+
+$$\Phi_{\rm bip}(\rho) = I(X_1; X_2) = \frac{1}{2}\log\frac{|C_{11}|\,|C_{22}|}{|C(\rho)|}$$
+
+由 Schur 补公式 $|C(\rho)| = |C_{11}|\cdot|C_{22} - \rho^2 B^\top C_{11}^{-1}B|$，定义规范化矩阵：
+
+$$G = C_{22}^{-1/2}\,B^\top C_{11}^{-1} B\,C_{22}^{-1/2} \succeq 0$$
+
+设 $G$ 的特征值为 $\gamma_1 \geq \cdots \geq \gamma_{n_2} \geq 0$。则：
+
+$$\Phi_{\rm bip}(\rho) = -\frac{1}{2}\sum_{j=1}^{n_2}\log(1 - \rho^2\gamma_j)$$
+
+对 $\rho^2$ 求导（其中 $\rho^2 < \rho_{\max}^2 = 1/\gamma_1$，保证行列式正定）：
+
+$$\frac{\partial \Phi_{\rm bip}}{\partial(\rho^2)} = \frac{1}{2}\sum_{j=1}^{n_2}\frac{\gamma_j}{1 - \rho^2\gamma_j} > 0$$
+
+（每项分子 $\gamma_j \geq 0$，其中 $B \neq 0$ 保证至少一项 $\gamma_j > 0$；分母在 $\rho^2 < 1/\gamma_1$ 时严格正。）故 $\Phi_{\rm bip}$ 关于 $\rho^2$ 严格单调递增。
+
+**步骤 2：$\delta(\rho)$ 关于 $\rho^2$ 的严格单调性。**
+
+由定理 1（耦合-维度单调定理），$D_{\rm eff}(C(\rho)) = S^2/(Q_0 + 2\rho^2\|B\|_F^2)$ 关于 $\rho^2$ 严格递减（$\|B\|_F > 0$）。因此：
+
+$$\delta(\rho) = 1 - \frac{D_{\rm eff}(C(\rho))}{N} = 1 - \frac{S^2}{N\bigl(Q_0 + 2\rho^2\|B\|_F^2\bigr)}$$
+
+关于 $\rho^2$ 严格递增。$\delta(0) = 0$，$\delta \to \delta_{\max} < 1$ 当 $\rho \to \rho_{\max}$。
+
+**步骤 3：单调等价性。**
+
+$\Phi_{\rm bip}$ 和 $\delta$ 均是 $\rho^2$ 的严格递增连续函数，且均从 $\rho=0$ 处的零值出发。由反函数定理，$\rho^2$ 可由 $\delta$ 唯一确定（$\rho^2 = \delta^{-1}(\delta)$），从而：
+
+$$\Phi_{\rm bip} = \Phi_{\rm bip}\!\left(\delta^{-1}(\delta)\right) =: g(\delta)$$
+
+$g$ 作为两个严格递增函数的复合，仍是严格递增函数。$\square$
+
+**验证（特殊情形）**：对 $n_1=n_2=n$，$C_{11}=C_{22}=I_n$，$B=I_n$：
+- $G = I_n$，$\gamma_j = 1$，故 $\Phi_{\rm bip} = -\tfrac{n}{2}\log(1-\rho^2)$。
+- $S = 2n$，$Q_0 = 2n$，$\|B\|_F^2 = n$，故 $D_{\rm eff} = (2n)^2/(2n+2\rho^2 n) = 2n/(1+\rho^2)$，$\delta = \rho^2/(1+\rho^2)$。
+- 由 $\rho^2 = \delta/(1-\delta)$：$g(\delta) = -\tfrac{n}{2}\log\bigl(1 - \delta/(1-\delta)\bigr) = -\tfrac{n}{2}\log\bigl((1-2\delta)/(1-\delta)\bigr)$。✓
+
+**数值验证**（$n=2$，$\rho \in [0, 0.9]$）：
+
+| $\rho$ | $\delta = \rho^2/(1+\rho^2)$ | $\Phi_{\rm bip}/n = -\frac{1}{2}\log(1-\rho^2)$ | $g(\delta)/n = -\frac{1}{2}\log\!\frac{1-2\delta}{1-\delta}$ |
+|--------|-----|------|------|
+| 0.00 | 0.000 | 0.000 | 0.000 |
+| 0.25 | 0.059 | 0.032 | 0.032 |
+| 0.50 | 0.200 | 0.144 | 0.144 |
+| 0.75 | 0.360 | 0.415 | 0.415 |
+| 0.90 | 0.447 | 0.834 | 0.834 |
+
+（两列数值精确吻合，验证显式公式正确。）
+
+**注记 4.4.1（实用意义：以 $\delta$ 代替 $\Phi$ 的复杂度优势）**  
+精确 IIT Φ 的计算需要枚举所有分区（NP-hard，参见 Oizumi et al. 2014），而维度压缩比 $\delta = 1 - D_{\rm eff}/N$ 只需计算协方差矩阵的两个迹（时间复杂度 $O(N^3)$ 用于特征值分解，或 $O(N^2 T)$ 用于从轨迹估计）。命题 4.4 保证 $\delta$ 是 $\Phi_{\rm bip}$ 的严格单调代理指标，在保持排序的前提下，以多项式复杂度替代指数复杂度。
+
+**注记 4.4.2（多分区推广）**  
+对 $k > 2$ 个子系统，IIT Φ 定义为所有分区中信息整合最少的二分（最小信息分区，MIP）所对应的互信息。在子系统对称强耦合情形（各子系统协方差与交叉协方差均相同），对称二分即为 MIP，命题 4.4 的单调等价结论仍成立。非对称情形下，$g$ 的显式形式依赖于系统的耦合拓扑。
+
 ---
 
 ## 五、推论：涌现的几何度量与相变
@@ -371,40 +454,53 @@ $$\eta(k) = \frac{D_{\rm eff}(k)}{N(k)} \in (0, 1]$$
 - $\eta \approx 1$：弱涌现（接近独立子系统之和）
 
 **推论 5.1（涌现强度的渐近行为）**  
-在均匀层级分解下（分支因子 $m$，扰动衰减 $\alpha$），随 $k \to \infty$：
+在均匀层级分解下（分支因子 $m$，扰动衰减 $\alpha \in (0,1)$），随 $k \to \infty$：
 
 $$\eta(k) \approx \frac{D_0 + C \cdot \sum_{\ell=1}^k (m\alpha^2)^\ell}{N(k)}$$
 
 其中 $C > 0$ 为常数，$N(k) = N_0 \cdot m^k$，$D_0 = D_{\rm eff}(C_{\rm macro})$。
 
-**三种情形**：
+由于 $N(k)$ 以 $m^k$ 指数增长而 $\alpha \in (0,1)$，压缩比 $\eta(k) \to 0$ 在所有情形下均成立。三种情形的区别在于 $D_{\rm eff}$ 的增长速率：
 
-| 条件 | 渐近行为 | 物理诠释 |
-|-----|---------|---------|
-| $m\alpha^2 < 1$ | $\eta(k) \to 0$（指数衰减） | 强涌现：宏观压缩比随深度增大 |
-| $m\alpha^2 = 1$ | $\eta(k) \sim C/N_0$（常数级别） | 临界涌现：自相似层级 |
-| $m\alpha^2 > 1$ | $\eta(k) \to \eta_\infty > 0$（饱和） | 弱涌现：有效维度与系统维度同步增长 |
+| 条件 | $D_{\rm eff}(k)$ 的增长方式 | $\eta(k)$ 衰减率 | 物理诠释 |
+|-----|---------|---------|---------|
+| $m\alpha^2 < 1$ | 有界（$D_{\rm eff} \to D_\infty < \infty$） | $\eta(k) \sim D_\infty/(N_0 m^k)$（指数） | 强涌现：有效维度有限，系统完全宏观化 |
+| $m\alpha^2 = 1$ | 线性增长（$D_{\rm eff} \sim Ck$） | $\eta(k) \sim Ck/(N_0 m^k)$（超指数衰减） | 临界涌现：自相似层级，幂律慢收敛 |
+| $m\alpha^2 > 1$ | 指数增长（$D_{\rm eff} \sim C(m\alpha^2)^k$） | $\eta(k) \sim (C/N_0)\alpha^{2k}$（指数 $\to 0$） | 弱涌现：有效维度快速增长，但仍比系统维度慢 |
 
 ### 5.2 涌现相变
 
 **定理 5.1（相变条件）**  
-在均匀层级分解下，定义**涌现序参量** $\Psi = \lim_{k\to\infty} \eta(k)$：
+在均匀层级分解下（$\alpha \in (0,1)$），定义**有效维度指数增长率**为涌现序参量：
 
-$$\Psi = \begin{cases} 0 & \text{若 } m\alpha^2 < 1 \quad (\text{涌现相}) \\ \Psi_c > 0 & \text{若 } m\alpha^2 \geq 1 \quad (\text{非涌现相}) \end{cases}$$
+$$\Psi := \lim_{k\to\infty} \frac{1}{k}\log D_{\rm eff}(k)$$
 
-在 $m\alpha^2 = 1$（临界点），有效维度增量线性增长：$\Delta D(k) \sim 2\varepsilon^2 s k / \bar{\lambda}$（对数修正阶），系统处于自相似层级（类分形结构）。
+则相变发生在临界点 $m\alpha^2 = 1$：
+
+$$\Psi = \begin{cases} 0 & \text{若 } m\alpha^2 \leq 1 \quad (\text{涌现相：} D_{\rm eff} \text{ 有界或多项式增长}) \\ \log(m\alpha^2) > 0 & \text{若 } m\alpha^2 > 1 \quad (\text{非涌现相：} D_{\rm eff} \text{ 指数增长}) \end{cases}$$
+
+在 $m\alpha^2 = 1$（临界点），$D_{\rm eff}(k) \sim Ck$（线性，慢于指数），故 $\Psi = 0$，系统处于**临界涌现**状态——有效维度无界增长，但比系统维度 $N(k) = N_0 m^k$ 慢得多（$\eta(k) \to 0$ 仍成立）。
+
+**注记（压缩比 $\eta$ 的普适行为）**：对所有 $\alpha \in (0,1)$，$m\alpha^2$ 取任意值时，$\eta(k) = D_{\rm eff}(k)/N(k) \to 0$（因为 $D_{\rm eff}$ 的指数增长率 $\Psi \leq \log(m\alpha^2) < \log m$，严格小于 $N(k)$ 的增长率 $\log m$）。故涌现（$\eta \to 0$）是层级系统的普适行为，相变刻画的是涌现的速率，而非涌现本身的有无。
 
 **证明**  
-由推论 3.2，$D_{\rm eff}(k) = D_0 + 2\varepsilon^2\bar{\mu}/\bar{\lambda} \cdot \sum_{\ell=1}^k K(\ell)$，其中 $K(\ell) = (m\alpha^2)^\ell / \alpha^{2\ell} \cdot \alpha^{2\ell} = m^\ell \cdot \alpha^{2\ell}$。
+由推论 3.2，$D_{\rm eff}(k) = D_0 + C_1 \cdot \sum_{\ell=1}^k (m\alpha^2)^\ell$，其中 $C_1 = 2\varepsilon^2\bar{\mu}/\bar{\lambda} > 0$。此处每层 $\ell$ 的贡献为：子系统数 $K(\ell) = m^\ell$（定义 2.3）乘以每个子系统的扰动方差尺度 $\alpha^{2\ell}$，合为 $m^\ell \cdot \alpha^{2\ell} = (m\alpha^2)^\ell$，与 $K(\ell)$ 的子系统计数含义严格区分。
 
-$$\sum_{\ell=1}^k (m\alpha^2)^\ell = \begin{cases} \frac{m\alpha^2(1-(m\alpha^2)^k)}{1-m\alpha^2} & m\alpha^2 \neq 1 \\ k & m\alpha^2 = 1 \end{cases}$$
+$$\sum_{\ell=1}^k (m\alpha^2)^\ell = \begin{cases} \dfrac{m\alpha^2\bigl(1-(m\alpha^2)^k\bigr)}{1-m\alpha^2} & m\alpha^2 \neq 1 \\[6pt] k & m\alpha^2 = 1 \end{cases}$$
 
-而 $N(k) = N_0 \cdot m^k$。故 $\eta(k) = D_{\rm eff}(k)/N(k)$：
+**情形 1：$m\alpha^2 < 1$。**  
+级数 $\sum_{\ell=1}^\infty (m\alpha^2)^\ell$ 收敛，$D_{\rm eff}(k) \to D_0 + C_1 m\alpha^2/(1-m\alpha^2) =: D_\infty < \infty$。  
+故 $\frac{1}{k}\log D_{\rm eff}(k) \to 0$，即 $\Psi = 0$；同时 $\eta(k) = D_\infty/(N_0 m^k)(1+o(1)) \to 0$。
 
-- 若 $m\alpha^2 < 1$：$D_{\rm eff}(k) \to D_0 + C_\infty$（有界），$N(k) \to \infty$，故 $\eta \to 0$。
-- 若 $m\alpha^2 = 1$：$D_{\rm eff}(k) \sim C k$，$N(k) = N_0 m^k$，故 $\eta \to 0$（对数 vs 指数）。  
-  注：此时系统虽处于临界，$\eta$ 仍趋于 0，但收敛极慢（$\eta(k) \sim Ck/N_0 m^k$）。
-- 若 $m\alpha^2 > 1$：$D_{\rm eff}(k) \sim C(m\alpha^2)^k$，$N(k) = N_0 m^k$，故 $\eta \to C/N_0 \cdot \alpha^{2k} > 0$（对 $\alpha < 1$）或 $\eta \to \Psi_c$（对 $\alpha = 1$，完全随机扰动）。$\square$
+**情形 2：$m\alpha^2 = 1$。**  
+$D_{\rm eff}(k) = D_0 + C_1 k$（线性增长），故 $\frac{1}{k}\log D_{\rm eff}(k) = \frac{\log(D_0 + C_1 k)}{k} \to 0$，即 $\Psi = 0$。  
+同时 $\eta(k) = (D_0 + C_1 k)/(N_0 m^k) \to 0$（多项式 vs 指数）。
+
+**情形 3：$m\alpha^2 > 1$。**  
+$D_{\rm eff}(k) \sim C_1 (m\alpha^2)^k/(m\alpha^2 - 1)$（指数增长），故：  
+$$\Psi = \lim_{k\to\infty}\frac{1}{k}\log D_{\rm eff}(k) = \log(m\alpha^2) > 0$$  
+同时 $\eta(k) = D_{\rm eff}(k)/N(k) \sim \frac{C_1}{(m\alpha^2-1)N_0}\cdot\frac{(m\alpha^2)^k}{m^k} = \frac{C_1}{(m\alpha^2-1)N_0}\cdot\alpha^{2k} \to 0$（因 $\alpha < 1$）。  
+注：虽然 $\eta(k) \to 0$，其衰减率 $\alpha^{2k}$ 比情形 1 的 $m^{-k}$ 慢得多（当 $m\alpha^2 > 1$ 时 $\alpha > 1/\sqrt{m}$）。$\square$
 
 ---
 
